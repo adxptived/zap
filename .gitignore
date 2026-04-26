@@ -4,6 +4,10 @@
 __pycache__/
 .pytest_cache/
 /tmp-zap*-delete-check-*/
+/screenshot.png
+/assets/zap.ico
+/assets/zap.png
+/assets/*.manifest
 /node_modules
 package.json
 .pnpm-debug.log

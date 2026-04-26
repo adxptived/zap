@@ -128,7 +128,7 @@ function Package-Helpers {
         "--distpath", $PyInstallerDistDir,
         "--workpath", $BuildDir,
         "--specpath", $BuildDir,
-        "--icon", (Join-Path $Root "assets\zap.ico")
+        "--icon", (Join-Path $Root "assets\branding\zap.ico")
     )
 
     Invoke-Checked $PyInstaller @CommonArgs "--name" "register-context-menu" (Join-Path $DistDir "register-context-menu.py")
@@ -142,11 +142,11 @@ function Stage-Binaries {
     Copy-RequiredFile (Join-Path $OptimizedTargetDir "zap.exe") (Join-Path $BinDir "zap.exe")
     Copy-RequiredFile (Join-Path $OptimizedTargetDir "zapw.exe") (Join-Path $BinDir "zapw.exe")
     Copy-RequiredFile (Join-Path $OptimizedTargetDir "zapg.exe") (Join-Path $BinDir "zapg.exe")
-    Copy-RequiredFile (Join-Path $Root "assets\zapg.exe.manifest") (Join-Path $BinDir "zapg.exe.manifest")
-    Copy-RequiredFile (Join-Path $Root "assets\zapw.exe.manifest") (Join-Path $BinDir "zapw.exe.manifest")
+    Copy-RequiredFile (Join-Path $Root "assets\manifests\zapg.exe.manifest") (Join-Path $BinDir "zapg.exe.manifest")
+    Copy-RequiredFile (Join-Path $Root "assets\manifests\zapw.exe.manifest") (Join-Path $BinDir "zapw.exe.manifest")
     Copy-RequiredFile (Join-Path $PyInstallerDistDir "register-context-menu.exe") (Join-Path $BinDir "register-context-menu.exe")
     Copy-RequiredFile (Join-Path $PyInstallerDistDir "unregister-context-menu.exe") (Join-Path $BinDir "unregister-context-menu.exe")
-    Copy-RequiredFile (Join-Path $Root "assets\zap.ico") (Join-Path $BinDir "zap.ico")
+    Copy-RequiredFile (Join-Path $Root "assets\branding\zap.ico") (Join-Path $BinDir "zap.ico")
 }
 
 function Build-Installer {

@@ -1,5 +1,5 @@
 fn main() {
     println!("cargo:rerun-if-changed=app.rc");
-    println!("cargo:rerun-if-changed=assets/zap.ico");
+    println!("cargo:rerun-if-changed=assets/branding/zap.ico");
     let _ = embed_resource::compile("app.rc", embed_resource::NONE);
 }
