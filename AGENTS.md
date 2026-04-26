@@ -109,6 +109,14 @@ cargo test
 ```
 All three must succeed with zero errors.
 
+## Git Workflow
+
+- Commit locally when explicitly asked to commit.
+- Do **not** push to GitHub, create tags, or publish GitHub releases unless the
+  user explicitly asks for push/release/publish/upload.
+- If the user asks to "commit" without mentioning GitHub, stop after the local
+  commit and report the commit hash.
+
 ## CLI Flags
 
 The CLI requires `--yes` or `--force` to perform actual deletion; without it
@@ -150,5 +158,4 @@ script changes carefully before release.
 - **Symlinks on Windows** — creating symlinks may require Developer Mode or
   elevated privileges. Junctions (`mklink /J`) do not require elevation.
 - The `.cargo/config.toml` may contain target-specific linker settings.
-
 

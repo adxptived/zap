@@ -31,7 +31,7 @@ Download `Zap.exe` from the [latest GitHub release](https://github.com/adxptived
 or install with PowerShell:
 
 ```powershell
-iwr https://raw.githubusercontent.com/adxptived/zap/master/dist/install.ps1 -UseB | iex
+irm https://raw.githubusercontent.com/adxptived/zap/master/dist/install.ps1 | iex
 ```
 
 The installer adds the Zap submenu to Windows Explorer and installs:
@@ -187,7 +187,7 @@ dist/
 ## Release Artifact
 
 - Installer: `dist\output\Zap.exe`
-- SHA256: `B2F2B3AEBA1D9D564669896685436D408D3FED66207974E011EF271B00128D42`
+- SHA256: `01DE05E6F357BA1CF97AF0355E1D63556D3945F811E941EA0BF866DEACE91743`
 
 ## License
 

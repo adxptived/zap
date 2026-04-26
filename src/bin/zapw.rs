@@ -9,9 +9,9 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use zap::{cli, delete};
 
-const BATCH_POLL_INTERVAL: Duration = Duration::from_millis(25);
-const BATCH_QUIET_POLLS: usize = 4;
-const BATCH_MAX_POLLS: usize = 100;
+const BATCH_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const BATCH_QUIET_POLLS: usize = 10;
+const BATCH_MAX_POLLS: usize = 120;
 
 fn main() {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
@@ -102,12 +102,26 @@ fn write_batch_paths(paths_dir: &Path, paths: &[PathBuf]) -> std::io::Result<()>
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let file = paths_dir.join(format!("{}-{nanos}.txt", std::process::id()));
-    let mut file = OpenOptions::new().create_new(true).write(true).open(file)?;
-    for path in paths {
-        writeln!(file, "{}", path.display())?;
+    let pid = std::process::id();
+
+    for attempt in 0..100_u32 {
+        let file = paths_dir.join(format!("{nanos}-{pid}-{attempt}.txt"));
+        match OpenOptions::new().create_new(true).write(true).open(file) {
+            Ok(mut file) => {
+                for path in paths {
+                    writeln!(file, "{}", path.display())?;
+                }
+                return file.flush();
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err),
+        }
     }
-    file.flush()
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not create a unique batch path file",
+    ))
 }
 
 fn wait_for_batch_quiet(paths_dir: &Path) {

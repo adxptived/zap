@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.1] - 2026-04-26
+
+Maintenance release for the Explorer-first Zap workflow.
+
+### Changed
+
+- Bumped the Zap application and installer version to `0.1.1`.
+- Updated the README around the GUI-first Explorer workflow, where
+  **Delete...** is the default confirmation flow and **Zap Delete** is the
+  direct no-window action.
+- Switched the documented one-line installer command to the modern PowerShell
+  `irm ... | iex` form.
+- Added the GUI delete confirmation screenshot to the README.
+- Organized release assets into `assets/branding`, `assets/screenshots`, and
+  `assets/manifests`.
+
+### Release Artifact
+
+- Installer: `Zap.exe`
+- SHA256: `01DE05E6F357BA1CF97AF0355E1D63556D3945F811E941EA0BF866DEACE91743`
+
 ## [0.1.0] - 2026-04-26
 
 Initial public release of Zap, a fast Windows deletion tool with Explorer
