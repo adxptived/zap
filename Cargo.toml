@@ -1,0 +1,51 @@
+[package]
+name = "zap"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.87"
+description = "Fast Windows deletion app: parallel scan, multi-threaded delete, and Explorer integration."
+license = "Apache-2.0"
+repository = "https://github.com/adxptived/zap"
+readme = "README.md"
+keywords = ["delete", "rm", "windows", "parallel", "cli"]
+categories = ["command-line-utilities", "filesystem"]
+exclude = [
+    ".codex-target/**",
+    ".omg/**",
+    ".pytest_cache/**",
+    "build/**",
+    "target/**",
+    "target-*/**",
+]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[[bin]]
+name = "zap"
+path = "src/main.rs"
+
+[[bin]]
+name = "zapw"
+path = "src/bin/zapw.rs"
+
+[[bin]]
+name = "zapg"
+path = "src/bin/zapg.rs"
+
+[dependencies]
+jwalk = "0.8"
+indicatif = "0.17"
+owo-colors = "4"
+rayon = "1.10"
+eframe = "0.31"
+rfd = "0.15"
+image = { version = "0.25.9", features = ["png"] }
+
+[profile.release-optimized]
+inherits = "release"
+opt-level = 3
+lto = "fat"
+codegen-units = 1    # Reduce number of codegen units to increase optimizations.
+
+[build-dependencies]
+embed-resource = "3.0.9"
