@@ -1,9 +1,8 @@
+use crate::delete::DeleteOptions;
 use std::{collections::HashSet, ffi::OsString, io, path::PathBuf};
 
 use owo_colors::{AnsiColors, OwoColorize};
 
-/// Upper bound for `--threads`. Anything above this is almost certainly a typo
-/// and would just waste memory creating an oversized Rayon pool.
 const MAX_THREADS: usize = 1024;
 
 #[derive(Debug)]
@@ -13,6 +12,26 @@ pub struct CliOptions {
     pub paths: Vec<PathBuf>,
     pub batch: bool,
     pub silent: bool,
+}
+
+impl CliOptions {
+    pub fn to_delete_options(
+        &self,
+        use_current_pool: bool,
+        allow_dangerous: bool,
+    ) -> DeleteOptions {
+        let opts = if use_current_pool {
+            DeleteOptions::default()
+        } else {
+            DeleteOptions::default().with_threads(self.threads)
+        };
+        let opts = if self.silent { opts.silent() } else { opts };
+        if allow_dangerous {
+            opts.allow_dangerous()
+        } else {
+            opts
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -69,18 +88,13 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> io::Result<CliAct
         ));
     }
 
-    // Deduplicate paths preserving first-seen order. The deletion engine is
-    // idempotent on duplicates (second attempt fails with NotFound) but
-    // de-duping avoids spurious failure entries in the summary and saves
-    // unnecessary scan work.
     let mut seen: HashSet<PathBuf> = HashSet::with_capacity(paths.len());
     paths.retain(|p| seen.insert(p.clone()));
 
+    // If no --yes/--force and no --dry-run: auto-enable dry-run + prompt.
+    // The caller (main.rs) will handle the interactive confirm flow.
     if !dry_run && !force {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "refusing to delete without --yes or --force; use --dry-run to preview",
-        ));
+        dry_run = true;
     }
 
     Ok(CliAction::Run(CliOptions {
@@ -96,6 +110,8 @@ pub fn print_help() {
     println!("Usage: zap [--yes|--force] [--dry-run] [--silent] [--threads N] <path>...");
     println!("       zap --help");
     println!("       zap --version");
+    println!();
+    println!("Without --yes, zap shows a preview and asks for confirmation.");
 }
 
 pub fn print_version() {
@@ -115,19 +131,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_args_requires_force_for_delete() {
-        let result = parse_args([OsString::from("file.txt")]);
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("without --yes or --force"));
+    fn test_parse_args_auto_enables_dry_run() {
+        let result = parse_args([OsString::from("file.txt")]).unwrap();
+        match result {
+            CliAction::Run(options) => assert!(options.dry_run),
+            _ => panic!("expected run action"),
+        }
     }
 
     #[test]
     fn test_parse_args_accepts_force() {
         let result = parse_args([OsString::from("--yes"), OsString::from("file.txt")]).unwrap();
-
         match result {
             CliAction::Run(options) => {
                 assert!(!options.dry_run);
@@ -141,7 +155,6 @@ mod tests {
     #[test]
     fn test_parse_args_accepts_dry_run_without_force() {
         let result = parse_args([OsString::from("--dry-run"), OsString::from("file.txt")]).unwrap();
-
         match result {
             CliAction::Run(options) => {
                 assert!(options.dry_run);
@@ -160,13 +173,9 @@ mod tests {
             OsString::from("file.txt"),
         ])
         .unwrap();
-
         match result {
             CliAction::Run(options) => {
-                assert!(
-                    options.dry_run,
-                    "--dry-run should take precedence over --yes"
-                );
+                assert!(options.dry_run);
                 assert_eq!(options.threads, None);
             }
             _ => panic!("expected run action"),
@@ -182,7 +191,6 @@ mod tests {
             OsString::from("path3"),
         ])
         .unwrap();
-
         match result {
             CliAction::Run(options) => {
                 assert!(!options.dry_run);
@@ -211,7 +219,6 @@ mod tests {
             OsString::from("b"),
         ])
         .unwrap();
-
         match result {
             CliAction::Run(options) => {
                 assert_eq!(
@@ -232,7 +239,6 @@ mod tests {
             OsString::from("file.txt"),
         ])
         .unwrap();
-
         match result {
             CliAction::Run(options) => {
                 assert_eq!(options.threads, Some(2));
@@ -250,7 +256,6 @@ mod tests {
             OsString::from("0"),
             OsString::from("file.txt"),
         ]);
-
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("positive integer"));
     }
@@ -263,13 +268,9 @@ mod tests {
             OsString::from("100000"),
             OsString::from("file.txt"),
         ]);
-
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains(&format!("<= {MAX_THREADS}")),
-            "unexpected error message: {msg}"
-        );
+        assert!(msg.contains(&format!("<= {MAX_THREADS}")));
     }
 
     #[test]
@@ -281,7 +282,6 @@ mod tests {
             OsString::from("file.txt"),
         ])
         .unwrap();
-
         match result {
             CliAction::Run(options) => assert_eq!(options.threads, Some(MAX_THREADS)),
             _ => panic!("expected run action"),

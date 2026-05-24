@@ -1,6 +1,6 @@
 [package]
 name = "zap"
-version = "0.1.1"
+version = "1.1.0"
 edition = "2021"
 rust-version = "1.87"
 description = "Fast Windows deletion app: parallel scan, multi-threaded delete, and Explorer integration."
@@ -38,8 +38,8 @@ indicatif = "0.17"
 owo-colors = "4"
 rayon = "1.10"
 eframe = "0.31"
-rfd = "0.15"
 image = { version = "0.25.9", features = ["png"] }
+ctrlc = "3"
 
 [profile.release-optimized]
 inherits = "release"

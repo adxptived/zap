@@ -3,9 +3,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-/// Initial capacity hint for the flat files-and-symlinks vector. Most real
-/// directories have at least a few entries; pre-sizing avoids the early Vec
-/// reallocations (4 → 8 → 16 → …) that otherwise show up in scan profiles.
 const INITIAL_FILES_CAPACITY: usize = 1024;
 
 #[derive(Debug)]
@@ -57,7 +54,7 @@ impl ScanPlan {
 const SCAN_PROGRESS_UPDATE_INTERVAL: u64 = 32;
 
 pub fn scan_directory(path: &Path) -> io::Result<Vec<ScannedEntry>> {
-    scan_entries(path, None)
+    walk_entries(path, None)
 }
 
 #[cfg(test)]
@@ -65,7 +62,7 @@ fn scan_directory_with_bar(
     path: &Path,
     bar: &indicatif::ProgressBar,
 ) -> io::Result<Vec<ScannedEntry>> {
-    scan_entries(path, Some(bar))
+    walk_entries(path, Some(bar))
 }
 
 pub(crate) fn scan_directory_plan(path: &Path) -> io::Result<ScanPlan> {
@@ -79,22 +76,11 @@ pub(crate) fn scan_directory_plan_with_bar(
     scan_directory_plan_inner(path, Some(bar))
 }
 
-fn scan_entries(
-    path: &Path,
-    external_bar: Option<&indicatif::ProgressBar>,
-) -> io::Result<Vec<ScannedEntry>> {
-    let entries = walk_entries(path, external_bar)?;
-    Ok(entries)
-}
-
 fn scan_directory_plan_inner(
     path: &Path,
     external_bar: Option<&indicatif::ProgressBar>,
 ) -> io::Result<ScanPlan> {
     let mut files_and_links: Vec<ScannedEntry> = Vec::with_capacity(INITIAL_FILES_CAPACITY);
-    // Depth-indexed bucket array. Real-world depths are small and dense
-    // (typically < 50), so an indexable Vec out-performs BTreeMap on both
-    // insert (O(1) vs O(log n)) and final iteration (no tree traversal).
     let mut depth_buckets: Vec<Vec<ScannedEntry>> = Vec::new();
     let mut stats = ScanStats::default();
 
@@ -117,17 +103,6 @@ fn scan_directory_plan_inner(
         }
     })?;
 
-    Ok(finalize_scan_plan(files_and_links, depth_buckets, stats))
-}
-
-fn finalize_scan_plan(
-    files_and_links: Vec<ScannedEntry>,
-    depth_buckets: Vec<Vec<ScannedEntry>>,
-    stats: ScanStats,
-) -> ScanPlan {
-    // Walk depths from deepest to shallowest, dropping any empty buckets
-    // (shallower depths may have no dirs if the tree has "holes" — e.g. only
-    // depth-0 root and depth-3 leaves).
     let dirs_by_depth: Vec<DirBatch> = depth_buckets
         .into_iter()
         .enumerate()
@@ -136,11 +111,11 @@ fn finalize_scan_plan(
         .map(|(depth, entries)| DirBatch { depth, entries })
         .collect();
 
-    ScanPlan {
+    Ok(ScanPlan {
         files_and_links,
         dirs_by_depth,
         stats,
-    }
+    })
 }
 
 fn walk_entries(
@@ -157,8 +132,11 @@ fn walk_entries_with(
     external_bar: Option<&indicatif::ProgressBar>,
     mut on_entry: impl FnMut(ScannedEntry),
 ) -> io::Result<()> {
-    let local_bar = indicatif::ProgressBar::new_spinner();
-    if external_bar.is_none() {
+    let local_bar;
+    let bar = if let Some(ext) = external_bar {
+        ext
+    } else {
+        local_bar = indicatif::ProgressBar::new_spinner();
         local_bar.set_style(
             indicatif::ProgressStyle::default_spinner()
                 .template("{prefix} Scanning {pos} entries")
@@ -169,8 +147,8 @@ fn walk_entries_with(
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| path.to_string_lossy().to_string());
         local_bar.set_prefix(name);
-    }
-    let bar = external_bar.unwrap_or(&local_bar);
+        &local_bar
+    };
 
     let mut count: u64 = 0;
     for res in jwalk::WalkDir::new(path)
@@ -186,12 +164,6 @@ fn walk_entries_with(
         let kind = if ft.is_symlink() {
             EntryKind::Symlink
         } else if ft.is_dir() {
-            // On Windows, junctions (mklink /J) are reparse-points but jwalk
-            // reports them as plain directories. We MUST classify them as
-            // symlinks so the parallel deletion never traverses into the
-            // junction target. `winapi::is_reparse_point` is a single
-            // GetFileAttributesW syscall — much cheaper than the
-            // `symlink_metadata` open-query-close dance we used previously.
             #[cfg(windows)]
             {
                 match crate::winapi::is_reparse_point(&p) {
@@ -250,7 +222,6 @@ mod tests {
         let temp = create_test_dir();
         File::create(temp.join("file.txt")).unwrap();
         fs::create_dir(temp.join("subdir")).unwrap();
-
         let entries = scan_directory(&temp).unwrap();
         let files = entries
             .iter()
@@ -260,7 +231,6 @@ mod tests {
             .iter()
             .filter(|e| matches!(e.kind, EntryKind::Dir { .. }))
             .count();
-
         assert!(files >= 1);
         assert!(dirs >= 1);
         let _ = fs::remove_dir_all(&temp);
@@ -271,20 +241,12 @@ mod tests {
         let temp = create_test_dir();
         File::create(temp.join("file.txt")).unwrap();
         fs::create_dir(temp.join("subdir")).unwrap();
-
         let entries = scan_directory(&temp).unwrap();
-
-        // scan_directory includes the root directory at depth 0.
-        // delete_directory filters it out before deletion.
         let root_entries: Vec<_> = entries
             .iter()
             .filter(|e| matches!(e.kind, EntryKind::Dir { depth: 0 }))
             .collect();
-        assert_eq!(
-            root_entries.len(),
-            1,
-            "scan_directory should include exactly one root entry (depth 0)"
-        );
+        assert_eq!(root_entries.len(), 1);
         assert!(root_entries[0].path == temp);
         let _ = fs::remove_dir_all(&temp);
     }
@@ -294,20 +256,15 @@ mod tests {
         let temp = create_test_dir();
         let target = temp.join("target");
         fs::create_dir(&target).unwrap();
-
         let link = temp.join("link");
         #[cfg(windows)]
         std::os::windows::fs::symlink_dir(&target, &link).unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink(&target, &link).unwrap();
-
         let entries = scan_directory(&temp).unwrap();
         let link_entry = entries.iter().find(|e| e.path == link);
-        assert!(link_entry.is_some(), "symlink entry should be found");
-        assert!(
-            matches!(link_entry.unwrap().kind, EntryKind::Symlink),
-            "symlink should be classified as EntryKind::Symlink"
-        );
+        assert!(link_entry.is_some());
+        assert!(matches!(link_entry.unwrap().kind, EntryKind::Symlink));
         let _ = fs::remove_dir_all(&temp);
     }
 
@@ -317,9 +274,7 @@ mod tests {
         let temp = create_test_dir();
         let target = temp.join("target");
         fs::create_dir(&target).unwrap();
-
         let junction = temp.join("junction");
-        // Create a junction point using cmd.exe (junctions don't require admin)
         let status = std::process::Command::new("cmd")
             .args([
                 "/c",
@@ -330,19 +285,11 @@ mod tests {
             ])
             .output()
             .unwrap();
-        assert!(
-            status.status.success(),
-            "failed to create junction: {}",
-            String::from_utf8_lossy(&status.stderr)
-        );
-
+        assert!(status.status.success());
         let entries = scan_directory(&temp).unwrap();
         let junction_entry = entries.iter().find(|e| e.path == junction);
-        assert!(junction_entry.is_some(), "junction entry should be found");
-        assert!(
-            matches!(junction_entry.unwrap().kind, EntryKind::Symlink),
-            "junction should be classified as EntryKind::Symlink, not traversed as Dir"
-        );
+        assert!(junction_entry.is_some());
+        assert!(matches!(junction_entry.unwrap().kind, EntryKind::Symlink));
         let _ = fs::remove_dir_all(&temp);
     }
 
@@ -351,20 +298,15 @@ mod tests {
         let temp = create_test_dir();
         let target_file = temp.join("target.txt");
         File::create(&target_file).unwrap();
-
         let link = temp.join("link.txt");
         #[cfg(windows)]
         std::os::windows::fs::symlink_file(&target_file, &link).unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink(&target_file, &link).unwrap();
-
         let entries = scan_directory(&temp).unwrap();
         let link_entry = entries.iter().find(|e| e.path == link);
-        assert!(link_entry.is_some(), "file symlink entry should be found");
-        assert!(
-            matches!(link_entry.unwrap().kind, EntryKind::Symlink),
-            "file symlink should be classified as EntryKind::Symlink"
-        );
+        assert!(link_entry.is_some());
+        assert!(matches!(link_entry.unwrap().kind, EntryKind::Symlink));
         let _ = fs::remove_dir_all(&temp);
     }
 
@@ -374,11 +316,9 @@ mod tests {
         File::create(temp.join("a.txt")).unwrap();
         fs::create_dir(temp.join("sub")).unwrap();
         File::create(temp.join("sub/b.txt")).unwrap();
-
         let plain = scan_directory(&temp).unwrap();
         let bar = indicatif::ProgressBar::new_spinner();
         let with_bar = scan_directory_with_bar(&temp, &bar).unwrap();
-
         assert_eq!(plain.len(), with_bar.len());
         for (a, b) in plain.iter().zip(with_bar.iter()) {
             assert_eq!(a.path, b.path);
@@ -396,9 +336,7 @@ mod tests {
         fs::create_dir(&b).unwrap();
         File::create(temp.join("root.txt")).unwrap();
         File::create(b.join("nested.txt")).unwrap();
-
         let plan = scan_directory_plan(&temp).unwrap();
-
         assert_eq!(plan.stats.files, 2);
         assert_eq!(plan.stats.dirs, 2);
         assert_eq!(plan.stats.symlinks, 0);
@@ -413,7 +351,6 @@ mod tests {
             .entries
             .iter()
             .any(|entry| entry.path == a));
-
         let _ = fs::remove_dir_all(&temp);
     }
 }

@@ -16,7 +16,7 @@ use crate::protect::{is_protected_path, sanitize_path};
 use crate::scan::{scan_directory, scan_directory_plan, scan_directory_plan_with_bar, EntryKind};
 
 const MAX_REPORTED_FAILURES: usize = 20;
-const PROGRESS_CHUNK_SIZE: usize = 1024;
+const PROGRESS_CHUNK_SIZE: usize = 16384;
 
 #[cfg(test)]
 static TEST_REMOVE_FILE_FAILURE: Mutex<Option<PathBuf>> = Mutex::new(None);
@@ -32,13 +32,6 @@ struct DeletionFailure {
     error: String,
 }
 
-/// Lock the shared failure buffer, recovering from a poisoned mutex.
-///
-/// A panicking task in `par_chunks(...).for_each(...)` will poison the mutex
-/// guarding the failure buffer. Without recovery, every subsequent task would
-/// panic on `unwrap()`, masking the original failure and turning a partial
-/// deletion into a full process crash. Recovery preserves the contents and
-/// lets us still report what we managed to capture.
 fn lock_failures(
     failures: &Mutex<Vec<DeletionFailure>>,
 ) -> std::sync::MutexGuard<'_, Vec<DeletionFailure>> {
@@ -82,18 +75,16 @@ fn failure_summary(total_errors: u64, failures: &[DeletionFailure]) -> String {
 
 pub fn set_writable(path: &Path) -> io::Result<()> {
     let mut perms = std::fs::symlink_metadata(path)?.permissions();
-
     #[allow(clippy::permissions_set_readonly_false)]
     perms.set_readonly(false);
-
     std::fs::set_permissions(path, perms)
 }
 
-/// Last-resort delete via Win32 POSIX semantics. Handles files locked by
-/// other processes, sharing violations, and stubborn read-only attributes
-/// that `set_writable` can't clear (e.g. when the parent dir is non-writable).
-///
-/// On non-Windows targets this is a no-op returning the original error.
+#[inline]
+fn is_readonly(path: &Path) -> io::Result<bool> {
+    Ok(std::fs::symlink_metadata(path)?.permissions().readonly())
+}
+
 #[inline]
 fn try_force_delete(path: &Path, original: io::Error) -> io::Result<()> {
     #[cfg(windows)]
@@ -102,7 +93,7 @@ fn try_force_delete(path: &Path, original: io::Error) -> io::Result<()> {
             return Ok(());
         }
     }
-    let _ = path; // silence unused on non-Windows
+    let _ = path;
     Err(original)
 }
 
@@ -123,9 +114,7 @@ pub fn remove_file_with_retry(path: &Path) -> io::Result<()> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
-            // Try to clear readonly first; if that itself fails or remove
-            // still refuses, escalate to POSIX-semantics force delete.
-            if set_writable(path).is_ok() {
+            if is_readonly(path).unwrap_or(false) && set_writable(path).is_ok() {
                 if let Ok(()) = std::fs::remove_file(path) {
                     return Ok(());
                 }
@@ -140,8 +129,11 @@ pub fn remove_dir_with_retry(path: &Path) -> io::Result<()> {
     match std::fs::remove_dir(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
-            if let Ok(meta) = std::fs::symlink_metadata(path) {
-                let mut perms = meta.permissions();
+            // Only retry with set_writable if the dir is actually read-only.
+            // Use one metadata call for both the check and the permissions.
+            let meta = std::fs::symlink_metadata(path).ok();
+            if meta.as_ref().is_some_and(|m| m.permissions().readonly()) {
+                let mut perms = meta.unwrap().permissions();
                 #[allow(clippy::permissions_set_readonly_false)]
                 perms.set_readonly(false);
                 if std::fs::set_permissions(path, perms).is_ok() {
@@ -150,9 +142,6 @@ pub fn remove_dir_with_retry(path: &Path) -> io::Result<()> {
                     }
                 }
             }
-            // Force-delete works on empty directories too; we only call this
-            // function from depth-batched cleanup, so the dir IS empty by
-            // construction.
             try_force_delete(path, e)
         }
         Err(e) => Err(e),
@@ -179,10 +168,11 @@ pub fn delete_symlink(path: &Path) -> io::Result<()> {
     match remove_either(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
-            if set_writable(path).is_ok() {
-                if let Ok(()) = remove_either(path) {
-                    return Ok(());
-                }
+            if is_readonly(path).unwrap_or(false)
+                && set_writable(path).is_ok()
+                && remove_either(path).is_ok()
+            {
+                return Ok(());
             }
             try_force_delete(path, e)
         }
@@ -208,7 +198,6 @@ fn delete_directory_inner(
             .map_err(|err| io::Error::other(err.to_string()))?;
         return pool.install(|| delete_directory_pool_inner(path, silent, external_bar));
     }
-
     delete_directory_pool_inner(path, silent, external_bar)
 }
 
@@ -326,7 +315,6 @@ fn delete_directory_pool_inner(
         return Err(io::Error::other(failure_summary(total_errors, &failures)));
     }
 
-    // Remove the root directory itself
     if path.exists() {
         if let Some(ref b) = bar {
             b.set_message("Finalizing");
@@ -349,22 +337,11 @@ fn delete_directory_pool_inner(
     Ok(())
 }
 
-/// Options for [`delete_path`]. Replaces the old four-function surface
-/// (`delete_path` / `_with_bar` / `_silent` / `_in_current_pool`) with a
-/// single entry point and chainable setters.
 #[derive(Default)]
 pub struct DeleteOptions {
-    /// Number of Rayon worker threads. `None` reuses the current Rayon pool
-    /// (or the global one) — set this to `None` when calling from inside an
-    /// existing `pool.install(...)` scope to avoid creating a nested pool.
     pub threads: Option<usize>,
-    /// Suppress all progress output (used by `--silent` mode).
     pub silent: bool,
-    /// Optional pre-allocated progress bar. Used by `MultiProgress` callers
-    /// so several deletions can share one rendering surface.
     pub bar: Option<ProgressBar>,
-    /// Permit deletion of paths that normally require extra caller-side
-    /// confirmation, such as Windows and Program Files subtrees.
     pub allow_dangerous: bool,
 }
 
@@ -390,15 +367,6 @@ impl DeleteOptions {
     }
 }
 
-/// Delete a file, directory, or symlink at `path`.
-///
-/// Safety guards (in order):
-///
-/// 1. `symlink_metadata` (never follow symlinks at the surface layer).
-/// 2. Symlink fast-path: remove the link only, never the target.
-/// 3. `sanitize_path` (canonicalize + strip `\\?\`).
-/// 4. `is_protected_path` (refuses system / well-known profile dirs).
-/// 5. `parent().is_none()` guard against filesystem roots (`C:\`, `D:\`, …).
 pub fn delete_path(path: &Path, opts: DeleteOptions) -> io::Result<()> {
     delete_path_inner(
         path,
@@ -464,8 +432,6 @@ fn dry_run_path_inner(path: &Path, silent: bool) -> io::Result<()> {
     let metadata = std::fs::symlink_metadata(path)?;
 
     if metadata.file_type().is_symlink() {
-        // Only the symlink itself is removed, not its target.
-        // This is safe regardless of where the symlink points.
         if !silent {
             println!("Would delete symlink: {}", path.display());
         }
@@ -555,21 +521,15 @@ mod tests {
     fn test_set_writable_makes_readonly_file_writable() {
         let temp = create_test_dir();
         let file_path = temp.join("readonly.txt");
-
         let mut file = File::create(&file_path).unwrap();
         file.write_all(b"test").unwrap();
         drop(file);
-
         let mut perms = fs::metadata(&file_path).unwrap().permissions();
         perms.set_readonly(true);
         fs::set_permissions(&file_path, perms).unwrap();
-
         assert!(fs::metadata(&file_path).unwrap().permissions().readonly());
-
         set_writable(&file_path).unwrap();
-
         assert!(!fs::metadata(&file_path).unwrap().permissions().readonly());
-
         let _ = fs::remove_dir_all(&temp);
     }
 
@@ -577,12 +537,9 @@ mod tests {
     fn test_delete_file_removes_file() {
         let temp = create_test_dir();
         let file_path = temp.join("test.txt");
-
         File::create(&file_path).unwrap();
         assert!(file_path.exists());
-
         remove_file_with_retry(&file_path).unwrap();
-
         assert!(!file_path.exists());
         let _ = fs::remove_dir_all(&temp);
     }
@@ -591,13 +548,10 @@ mod tests {
     fn test_delete_directory_removes_nested_structure() {
         let temp = create_test_dir();
         let dirs = create_nested_dirs(&temp, 3);
-
         for dir in &dirs {
             File::create(dir.join("file.txt")).unwrap();
         }
-
         delete_directory(&temp, None).unwrap();
-
         assert!(!temp.exists());
     }
 
@@ -605,14 +559,11 @@ mod tests {
     fn test_delete_directory_with_readonly_files() {
         let temp = create_test_dir();
         let file = temp.join("readonly.txt");
-
         File::create(&file).unwrap();
         let mut perms = fs::metadata(&file).unwrap().permissions();
         perms.set_readonly(true);
         fs::set_permissions(&file, perms).unwrap();
-
         delete_directory(&temp, None).unwrap();
-
         assert!(!temp.exists());
     }
 
@@ -621,9 +572,7 @@ mod tests {
         let temp = create_test_dir();
         let file = temp.join("file.txt");
         File::create(&file).unwrap();
-
         delete_path(&file, DeleteOptions::default()).unwrap();
-
         assert!(!file.exists());
         let _ = fs::remove_dir_all(&temp);
     }
@@ -632,9 +581,7 @@ mod tests {
     fn test_delete_path_handles_directory() {
         let temp = create_test_dir();
         fs::create_dir(temp.join("subdir")).unwrap();
-
         delete_path(&temp, DeleteOptions::default()).unwrap();
-
         assert!(!temp.exists());
     }
 
@@ -643,17 +590,13 @@ mod tests {
         let temp = create_test_dir();
         let target = temp.join("target");
         fs::create_dir(&target).unwrap();
-
         let link = temp.join("link");
         #[cfg(windows)]
         std::os::windows::fs::symlink_dir(&target, &link).unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink(&target, &link).unwrap();
-
         assert!(link.exists());
-
         delete_symlink(&link).unwrap();
-
         assert!(!link.exists());
         assert!(target.exists());
         let _ = fs::remove_dir_all(&temp);
@@ -667,15 +610,12 @@ mod tests {
         fs::create_dir(&delete_root).unwrap();
         fs::create_dir(&external_target).unwrap();
         File::create(external_target.join("keep.txt")).unwrap();
-
         let link = delete_root.join("link");
         #[cfg(windows)]
         std::os::windows::fs::symlink_dir(&external_target, &link).unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink(&external_target, &link).unwrap();
-
         delete_directory(&delete_root, None).unwrap();
-
         assert!(!delete_root.exists());
         assert!(external_target.exists());
         assert!(external_target.join("keep.txt").exists());
@@ -686,10 +626,8 @@ mod tests {
     fn test_delete_directory_idempotent() {
         let temp = create_test_dir();
         File::create(temp.join("file.txt")).unwrap();
-
         delete_directory(&temp, None).unwrap();
         assert!(!temp.exists());
-
         let result = delete_directory(&temp, None);
         assert!(result.is_err());
     }
@@ -699,35 +637,25 @@ mod tests {
         let temp = create_test_dir();
         let empty = temp.join("empty");
         fs::create_dir(&empty).unwrap();
-
         delete_directory(&empty, None).unwrap();
-
         assert!(!empty.exists());
         let _ = fs::remove_dir_all(&temp);
     }
 
     #[test]
     fn test_delete_path_refuses_filesystem_root() {
-        // Path::parent() guards delete/dry-run against operating on the FS root.
         let root = Path::new("C:\\");
-        assert!(root.parent().is_none(), "sanity: C:\\ has no parent");
-
-        // Use dry-run so we never actually attempt to delete the root.
-        // We expect either InvalidInput (our guard) or PermissionDenied
-        // (protected-path check) — both are acceptable refusals.
+        assert!(root.parent().is_none());
         match dry_run_path_silent(root) {
             Ok(()) => panic!("dry_run_path on filesystem root must not succeed"),
             Err(e) => {
                 let kind = e.kind();
-                assert!(
-                    matches!(
-                        kind,
-                        io::ErrorKind::InvalidInput
-                            | io::ErrorKind::PermissionDenied
-                            | io::ErrorKind::NotFound
-                    ),
-                    "unexpected error kind for FS root: {kind:?} ({e})"
-                );
+                assert!(matches!(
+                    kind,
+                    io::ErrorKind::InvalidInput
+                        | io::ErrorKind::PermissionDenied
+                        | io::ErrorKind::NotFound
+                ));
             }
         }
     }
@@ -737,11 +665,9 @@ mod tests {
         let temp = create_test_dir();
         let file = temp.join("readonly.txt");
         File::create(&file).unwrap();
-
         let mut perms = fs::metadata(&file).unwrap().permissions();
         perms.set_readonly(true);
         fs::set_permissions(&file, perms).unwrap();
-
         remove_file_with_retry(&file).unwrap();
         assert!(!file.exists());
         let _ = fs::remove_dir_all(&temp);
@@ -752,9 +678,7 @@ mod tests {
         let temp = create_test_dir();
         let file = temp.join("file.txt");
         File::create(&file).unwrap();
-
         dry_run_path(&file).unwrap();
-
         assert!(file.exists());
         let _ = fs::remove_dir_all(&temp);
     }
@@ -765,26 +689,17 @@ mod tests {
         let subdir = temp.join("subdir");
         fs::create_dir(&subdir).unwrap();
         File::create(subdir.join("file.txt")).unwrap();
-
         dry_run_path(&subdir).unwrap();
-
         assert!(subdir.exists());
         let _ = fs::remove_dir_all(&temp);
     }
 
     #[test]
     fn test_delete_path_refuses_protected_path_integration() {
-        // Verify is_protected_path logic with string-only paths (no filesystem access).
-        // This avoids touching real C:\Windows which triggers AV and is slow.
-        assert!(
-            crate::protect::is_protected_path(Path::new(r"C:\Windows")),
-            "C:\\Windows should be protected (string check)"
-        );
-        assert!(
-            crate::protect::is_protected_path(Path::new(r"C:\Program Files")),
-            "C:\\Program Files should be protected (string check)"
-        );
-        // Verify a real temp path is NOT protected and can be deleted
+        assert!(crate::protect::is_protected_path(Path::new(r"C:\Windows")));
+        assert!(crate::protect::is_protected_path(Path::new(
+            r"C:\Program Files"
+        )));
         let temp = create_test_dir();
         let file = temp.join("file.txt");
         File::create(&file).unwrap();
@@ -798,19 +713,15 @@ mod tests {
         let temp = create_test_dir();
         let target_file = temp.join("target.txt");
         File::create(&target_file).unwrap();
-
         let link = temp.join("link.txt");
         #[cfg(windows)]
         std::os::windows::fs::symlink_file(&target_file, &link).unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink(&target_file, &link).unwrap();
-
         assert!(link.exists());
-
         delete_path(&link, DeleteOptions::default()).unwrap();
-
         assert!(!link.exists());
-        assert!(target_file.exists(), "target file should not be deleted");
+        assert!(target_file.exists());
         let _ = fs::remove_dir_all(&temp);
     }
 
@@ -819,17 +730,14 @@ mod tests {
         let temp = create_test_dir();
         let target = temp.join("target");
         fs::create_dir(&target).unwrap();
-
         let link = temp.join("link");
         #[cfg(windows)]
         std::os::windows::fs::symlink_dir(&target, &link).unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink(&target, &link).unwrap();
-
         dry_run_path(&link).unwrap();
-
-        assert!(link.exists(), "dry-run should not delete symlink");
-        assert!(target.exists(), "dry-run should not affect symlink target");
+        assert!(link.exists());
+        assert!(target.exists());
         let _ = fs::remove_dir_all(&temp);
     }
 
@@ -837,12 +745,8 @@ mod tests {
     fn test_delete_path_nonexistent_returns_error() {
         let temp = create_test_dir();
         let nonexistent = temp.join("does-not-exist");
-
-        let result = delete_path(&nonexistent, DeleteOptions::default());
-        assert!(result.is_err(), "deleting non-existent path should fail");
-
-        let result = dry_run_path(&nonexistent);
-        assert!(result.is_err(), "dry-run on non-existent path should fail");
+        assert!(delete_path(&nonexistent, DeleteOptions::default()).is_err());
+        assert!(dry_run_path(&nonexistent).is_err());
         let _ = fs::remove_dir_all(&temp);
     }
 
@@ -851,11 +755,9 @@ mod tests {
         let temp = create_test_dir();
         let readonly_dir = temp.join("readonly_dir");
         fs::create_dir(&readonly_dir).unwrap();
-
         let mut perms = fs::metadata(&readonly_dir).unwrap().permissions();
         perms.set_readonly(true);
         fs::set_permissions(&readonly_dir, perms).unwrap();
-
         remove_dir_with_retry(&readonly_dir).unwrap();
         assert!(!readonly_dir.exists());
         let _ = fs::remove_dir_all(&temp);
@@ -870,9 +772,7 @@ mod tests {
         fs::create_dir(&delete_root).unwrap();
         fs::create_dir(&external_target).unwrap();
         File::create(external_target.join("keep.txt")).unwrap();
-
         let junction = delete_root.join("junction");
-        // Create a junction point (doesn't require admin)
         let status = std::process::Command::new("cmd")
             .args([
                 "/c",
@@ -883,23 +783,11 @@ mod tests {
             ])
             .output()
             .unwrap();
-        assert!(
-            status.status.success(),
-            "failed to create junction: {}",
-            String::from_utf8_lossy(&status.stderr)
-        );
-
+        assert!(status.status.success());
         delete_directory(&delete_root, None).unwrap();
-
         assert!(!delete_root.exists());
-        assert!(
-            external_target.exists(),
-            "junction target should not be deleted"
-        );
-        assert!(
-            external_target.join("keep.txt").exists(),
-            "files inside junction target should not be deleted"
-        );
+        assert!(external_target.exists());
+        assert!(external_target.join("keep.txt").exists());
         let _ = fs::remove_dir_all(&temp);
     }
 
@@ -910,22 +798,14 @@ mod tests {
         let empty = temp.join("empty");
         File::create(&file).unwrap();
         fs::create_dir(&empty).unwrap();
-
         set_test_remove_file_failure(Some(file.clone()));
-
         let result = delete_directory(&temp, None);
-
         set_test_remove_file_failure(None);
-
         let err = result.unwrap_err();
         assert!(err.to_string().contains("blocked.txt"));
         assert!(err.to_string().contains("Close apps using these files"));
         assert!(temp.exists());
-        assert!(
-            !empty.exists(),
-            "deletion should still clean unrelated empty directories"
-        );
-
+        assert!(!empty.exists());
         let _ = fs::remove_dir_all(&temp);
     }
 
@@ -940,16 +820,14 @@ mod tests {
                 d
             })
             .collect();
-
         for d in &dirs {
             let bar = ProgressBar::hidden();
             delete_path(d, DeleteOptions::default().with_bar(bar)).unwrap();
         }
-
         for d in &dirs {
-            assert!(!d.exists(), "directory should be deleted");
+            assert!(!d.exists());
         }
-        assert!(base.exists(), "base dir should remain");
+        assert!(base.exists());
         let _ = fs::remove_dir_all(&base);
     }
 
@@ -959,36 +837,27 @@ mod tests {
         for i in 0..64 {
             File::create(temp.join(format!("file{i}.txt"))).unwrap();
         }
-
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(2)
             .build()
             .unwrap();
-
-        // threads=None inside pool.install(...) reuses the surrounding pool.
         pool.install(|| {
             delete_path(&temp, DeleteOptions::default().silent()).unwrap();
         });
-
         assert!(!temp.exists());
     }
 
     #[test]
     fn test_lock_failures_recovers_from_poisoned_mutex() {
-        // A2 regression: a panicking task inside a Rayon parallel pass would
-        // poison the failures mutex; subsequent tasks must still be able to
-        // record their errors instead of panicking on `unwrap()`.
         let failures: Mutex<Vec<DeletionFailure>> = Mutex::new(vec![DeletionFailure {
             path: PathBuf::from("kept"),
             error: "pre-existing".into(),
         }]);
-
         let _ = std::panic::catch_unwind(|| {
             let _guard = failures.lock().unwrap();
             panic!("simulate task panic while holding the failure buffer");
         });
         assert!(failures.is_poisoned());
-
         let guard = lock_failures(&failures);
         assert_eq!(guard.len(), 1);
         assert_eq!(guard[0].path, PathBuf::from("kept"));
@@ -996,18 +865,12 @@ mod tests {
 
     #[test]
     fn test_delete_path_empty_dir_uses_fast_path() {
-        // B3 regression: an empty directory must be removed without invoking
-        // the scan / rayon machinery. We can't observe the fast path directly,
-        // but we can verify functional equivalence: removal succeeds and the
-        // root is gone.
         let base = create_test_dir();
         let empty = base.join("empty-fast-path");
         fs::create_dir(&empty).unwrap();
-
         delete_path(&empty, DeleteOptions::default()).unwrap();
-
         assert!(!empty.exists());
-        assert!(base.exists(), "fast path should not affect siblings");
+        assert!(base.exists());
         let _ = fs::remove_dir_all(&base);
     }
 }
