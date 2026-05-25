@@ -44,8 +44,8 @@ Performance release — parallel scan, pipeline delete, and adaptive parallelism
 
 ### Release Artifact
 
-- Installer: `Zap.exe` (12.5 MB)
-- SHA256: `F6BED08622812E1E9A45E2926F8D401BFA0911BD6F1BD612102F474AE895E478`
+- Installer: `Zap.exe` (v1.2.0)
+- SHA256: `12464F2E2BAF63C4681D1A5BD4377B4A6C1E0AB6B1619BF6222ED9557D2C4A47`
 
 ## [0.1.1] - 2026-04-26
 
