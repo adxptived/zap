@@ -13,5 +13,5 @@ pub fn install_handler() {
 
 #[inline]
 pub fn is_stop_requested() -> bool {
-    STOP_REQUESTED.load(Ordering::Relaxed)
+    STOP_REQUESTED.load(Ordering::Acquire)
 }

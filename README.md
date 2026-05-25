@@ -24,6 +24,9 @@ then pick the safe GUI confirmation flow or the silent immediate-delete action.
 - **Fast deletion engine** — `jwalk` scans directories in parallel and `rayon` removes files concurrently.
 - **Safety guards** — filesystem roots are refused, protected paths are blocked, and symlinks/junctions are never traversed.
 - **Read-only recovery** — read-only attributes are cleared and deletion is retried when possible.
+- **Filter support** — glob pattern filtering, size filtering, and date-based filtering.
+- **Secure deletion** — overwrite files with random data before removing (`--shred`).
+- **Recycle Bin** — send to Recycle Bin instead of permanent delete (`--recycle`).
 
 ## Installation
 
@@ -69,7 +72,7 @@ The terminal interface is secondary. Use it for scripts, automation, or manual
 debugging.
 
 ```shell
-zap [--yes|--force] [--dry-run] [--threads N] <path>...
+zap [FLAGS] [OPTIONS] <path>...
 zap --help
 zap --version
 ```
@@ -81,6 +84,14 @@ zap --version
 | `--threads N`, `-j N` | Override the Rayon worker thread count. |
 | `--silent` | Suppress progress output. Used by `zapw.exe`. |
 | `--batch` | Internal Explorer multi-select coordination flag. |
+| `--shred` | Overwrite files with random data before deleting (3 passes). |
+| `--only-empty` | Only delete if the directory is empty. |
+| `--recycle` | Send to Recycle Bin instead of permanent delete. |
+| `--include GLOB` | Only delete paths matching glob pattern (repeatable). |
+| `--exclude GLOB` | Skip paths matching glob pattern (repeatable). |
+| `--min-size BYTES` | Only delete files larger than BYTES. |
+| `--newer-than RFC3339` | Only delete files newer than date/time. |
+| `--older-than RFC3339` | Only delete files older than date/time. |
 
 Examples:
 
@@ -88,6 +99,8 @@ Examples:
 zap --dry-run "C:\temp\build-output"
 zap --yes "C:\temp\build-output"
 zap --yes --threads 4 "C:\temp\huge-repo"
+zap --yes --shred "C:\temp\secret-files"
+zap --yes --exclude "*.log" --min-size 1048576 "C:\temp\project"
 ```
 
 ## Safety Model
@@ -99,6 +112,7 @@ Zap is destructive, so the deletion engine keeps several guardrails in place:
 - Symlinks and junctions are removed as links only; targets are not traversed.
 - Read-only files and directories are retried after clearing the read-only flag.
 - The GUI keeps the dialog open when deletion fails so the error remains visible.
+- `--recycle` is also subject to protection guards (cannot recycle system paths).
 
 Protected examples include:
 
@@ -168,6 +182,15 @@ src/
   delete.rs                Core deletion engine
   scan.rs                  Directory walking and entry classification
   protect.rs               Protected path checks
+  filter.rs                Glob pattern and metadata filtering
+  recycle.rs               Recycle Bin integration
+  shred.rs                 Secure deletion (overwrite with random data)
+  size.rs                  Directory size calculation
+  stop.rs                  Global graceful-stop signal
+  path_utils.rs            Path formatting and dedup helpers
+  batch.rs                 Multi-process Explorer batch coordination
+  treemap.rs               Treemap visualization for GUI
+  winapi.rs                Windows API helpers
   bin/
     zapg.rs                Explorer GUI confirmation dialog
     zapw.rs                Windowless immediate-delete binary

@@ -12,10 +12,19 @@ Source code is organized under `src/`:
 
 - `main.rs` — Entry point of the `zap` binary: arg parsing dispatch, timing, error summary, batch coordination (`run_batch`).
 - `cli.rs` — CLI argument parser (`parse_args`), help/version output, `CliOptions` / `CliAction` types.
-- `delete.rs` — Core deletion logic: parallel file/dir removal via Rayon, retry on `PermissionDenied` (files, dirs, and symlinks), dry-run, symlink handling.
-- `scan.rs` — Directory walking with `jwalk::WalkDir` and entry classification (`EntryKind`: `File`, `Dir { depth }`, `Symlink`).
+- `delete.rs` — Core deletion logic: parallel file/dir removal via Rayon, retry on `PermissionDenied` (files, dirs, and symlinks), dry-run, symlink handling, shred, only-empty, recycle dispatch.
+- `scan.rs` — Directory walking with `jwalk::WalkDir` and entry classification (`EntryKind`: `File`, `Dir { depth }`, `Symlink`). Caches metadata in `ScannedEntry`.
 - `protect.rs` — Protected-path checks (`is_protected_path`), path sanitization (`sanitize_path`), filesystem-root detection.
-- `bin/zapw.rs` — Entry point of the `zapw` (windowless) binary. Spawns the sibling `zap.exe` with `CREATE_NO_WINDOW` so the Explorer context menu does not flash a console.
+- `filter.rs` — Glob pattern filtering (`--include`/`--exclude`), min-size, newer-than/older-than metadata filtering.
+- `recycle.rs` — Windows Recycle Bin integration via `SHFileOperationW`.
+- `shred.rs` — Secure file deletion: overwrite with random data then remove.
+- `size.rs` — Directory size calculation (`dir_size_recursive` via jwalk, `dir_size_tree` for treemap).
+- `stop.rs` — Global Ctrl+C signal handler (`install_handler`, `is_stop_requested`).
+- `path_utils.rs` — Path formatting helpers (`progress_name`, `compact_path`, `dedup_paths`).
+- `batch.rs` — Shared batch-coordination infrastructure for multi-process Explorer integration.
+- `treemap.rs` — Squarified treemap layout for GUI visualization.
+- `winapi.rs` — Windows API helpers (reparse point detection, force delete).
+- `bin/zapw.rs` — Entry point of the `zapw` (windowless) binary. Silent deletion without console window.
 - `bin/zapg.rs` — Entry point of the `zapg` (GUI dialog) binary. Provides an egui confirmation dialog for the **Delete...** context menu item.
 
 The three binaries are declared explicitly in `Cargo.toml` (`[[bin]] name = "zap"` / `"zapw"` / `"zapg"`), so `cargo build` produces `zap.exe`, `zapw.exe`, and `zapg.exe` directly with no rename step.
@@ -87,6 +96,8 @@ Test coverage by module:
 - `delete.rs` — file/dir deletion, readonly retry, symlink handling, dry-run, error reporting, junction safety (`#[cfg(windows)]` only), idempotency.
 - `scan.rs` — entry classification (`File`/`Dir`/`Symlink`), symlink/junction detection, root depth=0 inclusion.
 - `protect.rs` — protected-path matching (Windows dirs, user profile dirs, well-known subdirs), filesystem-root detection, path sanitization, symlink-as-non-root.
+- `filter.rs` — glob matching, include/exclude, size and date filtering.
+- `shred.rs` — secure deletion, multiple passes, empty file handling.
 
 Tests use atomic counters (`AtomicU64`) for unique temp directories under
 `%TEMP%`. Some tests are gated with `#[cfg(windows)]` (junction, symlink_dir)
@@ -124,6 +135,9 @@ the command refuses. `--dry-run` previews without deleting and does not require
 `--yes`. `--threads N` / `-j N` overrides the Rayon thread pool size (must be ≥ 1).
 `--help` / `-h` and `--version` / `-V` print usage and version respectively.
 
+Additional flags: `--shred`, `--only-empty`, `--recycle`, `--include GLOB`,
+`--exclude GLOB`, `--min-size BYTES`, `--newer-than RFC3339`, `--older-than RFC3339`.
+
 ## Coding Style & Naming Conventions
 
 Use Rust 2021 idioms and `rustfmt` defaults. Prefer 4-space indentation, clear
@@ -145,6 +159,7 @@ The tool is destructive by default. Several guards are in place:
   links only, never traversed.
 - **Permission recovery** — `remove_file_with_retry` / `remove_dir_with_retry`
   clear the readonly flag and retry on `PermissionDenied`.
+- **Recycle safety** — `--recycle` is also subject to protection and root guards.
 
 When modifying deletion logic, preserve these guards. Avoid following untrusted
 paths, preserve explicit user intent for deletion targets, and validate installer
@@ -158,4 +173,3 @@ script changes carefully before release.
 - **Symlinks on Windows** — creating symlinks may require Developer Mode or
   elevated privileges. Junctions (`mklink /J`) do not require elevation.
 - The `.cargo/config.toml` may contain target-specific linker settings.
-

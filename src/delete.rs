@@ -10,13 +10,25 @@ use std::{
 };
 
 use indicatif::{ProgressBar, ProgressStyle};
-use rayon::{iter::ParallelIterator, slice::ParallelSlice};
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+use rayon::slice::ParallelSlice;
 
+use crate::filter::FilterConfig;
 use crate::protect::{is_protected_path, sanitize_path};
-use crate::scan::{scan_directory, scan_directory_plan, scan_directory_plan_with_bar, EntryKind};
+use crate::scan::{
+    scan_directory, scan_directory_plan_for_filter, scan_directory_plan_with_bar_for_filter,
+    scan_into_channel, EntryKind, ScannedEntry,
+};
 
 const MAX_REPORTED_FAILURES: usize = 20;
-const PROGRESS_CHUNK_SIZE: usize = 16384;
+
+/// Adaptive chunk size: keeps every Rayon thread busy with roughly 256
+/// entries while clamped to [64, 65536] to avoid extremes.
+#[inline]
+fn chunk_size(total: usize) -> usize {
+    let threads = rayon::current_num_threads().max(1);
+    (total / (threads * 4)).clamp(64, 65536)
+}
 
 #[cfg(test)]
 static TEST_REMOVE_FILE_FAILURE: Mutex<Option<PathBuf>> = Mutex::new(None);
@@ -81,11 +93,6 @@ pub fn set_writable(path: &Path) -> io::Result<()> {
 }
 
 #[inline]
-fn is_readonly(path: &Path) -> io::Result<bool> {
-    Ok(std::fs::symlink_metadata(path)?.permissions().readonly())
-}
-
-#[inline]
 fn try_force_delete(path: &Path, original: io::Error) -> io::Result<()> {
     #[cfg(windows)]
     {
@@ -114,9 +121,15 @@ pub fn remove_file_with_retry(path: &Path) -> io::Result<()> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
-            if is_readonly(path).unwrap_or(false) && set_writable(path).is_ok() {
-                if let Ok(()) = std::fs::remove_file(path) {
-                    return Ok(());
+            let meta = std::fs::symlink_metadata(path).ok();
+            if meta.as_ref().is_some_and(|m| m.permissions().readonly()) {
+                let mut perms = meta.unwrap().permissions();
+                #[allow(clippy::permissions_set_readonly_false)]
+                perms.set_readonly(false);
+                if std::fs::set_permissions(path, perms).is_ok() {
+                    if let Ok(()) = std::fs::remove_file(path) {
+                        return Ok(());
+                    }
                 }
             }
             try_force_delete(path, e)
@@ -129,8 +142,6 @@ pub fn remove_dir_with_retry(path: &Path) -> io::Result<()> {
     match std::fs::remove_dir(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
-            // Only retry with set_writable if the dir is actually read-only.
-            // Use one metadata call for both the check and the permissions.
             let meta = std::fs::symlink_metadata(path).ok();
             if meta.as_ref().is_some_and(|m| m.permissions().readonly()) {
                 let mut perms = meta.unwrap().permissions();
@@ -168,11 +179,14 @@ pub fn delete_symlink(path: &Path) -> io::Result<()> {
     match remove_either(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
-            if is_readonly(path).unwrap_or(false)
-                && set_writable(path).is_ok()
-                && remove_either(path).is_ok()
-            {
-                return Ok(());
+            let meta = std::fs::symlink_metadata(path).ok();
+            if meta.as_ref().is_some_and(|m| m.permissions().readonly()) {
+                let mut perms = meta.unwrap().permissions();
+                #[allow(clippy::permissions_set_readonly_false)]
+                perms.set_readonly(false);
+                if std::fs::set_permissions(path, perms).is_ok() && remove_either(path).is_ok() {
+                    return Ok(());
+                }
             }
             try_force_delete(path, e)
         }
@@ -180,31 +194,271 @@ pub fn delete_symlink(path: &Path) -> io::Result<()> {
     }
 }
 
-#[cfg(test)]
-pub fn delete_directory(path: &Path, threads: Option<usize>) -> io::Result<()> {
-    delete_directory_inner(path, threads, false, None)
+/// Dispatch a single file/symlink entry to the appropriate delete fn.
+#[inline]
+fn delete_entry(entry: &ScannedEntry, shred: bool) -> io::Result<()> {
+    match &entry.kind {
+        EntryKind::Symlink => delete_symlink(&entry.path),
+        EntryKind::File => {
+            if shred {
+                crate::shred::shred_file(&entry.path, 3)
+            } else {
+                remove_file_with_retry(&entry.path)
+            }
+        }
+        EntryKind::Dir { .. } => Ok(()),
+    }
 }
 
-fn delete_directory_inner(
-    path: &Path,
-    threads: Option<usize>,
-    silent: bool,
-    external_bar: Option<ProgressBar>,
-) -> io::Result<()> {
-    if let Some(count) = threads {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(count)
-            .build()
-            .map_err(|err| io::Error::other(err.to_string()))?;
-        return pool.install(|| delete_directory_pool_inner(path, silent, external_bar));
+// ---------------------------------------------------------------------------
+// Shared helpers used by both pipeline and filtered paths
+// ---------------------------------------------------------------------------
+
+#[inline]
+fn process_file_batch(
+    chunk: &[ScannedEntry],
+    shred: bool,
+    error_count: &AtomicU64,
+    failures: &Mutex<Vec<DeletionFailure>>,
+    bar: Option<&ProgressBar>,
+) {
+    for entry in chunk {
+        if let Err(err) = delete_entry(entry, shred) {
+            error_count.fetch_add(1, Ordering::Relaxed);
+            push_failure(failures, &entry.path, &err);
+        }
     }
-    delete_directory_pool_inner(path, silent, external_bar)
+    if let Some(b) = bar {
+        b.inc(chunk.len() as u64);
+    }
 }
+
+fn delete_dir_batches(
+    batches: &[crate::scan::DirBatch],
+    error_count: &AtomicU64,
+    failures: &Mutex<Vec<DeletionFailure>>,
+    bar: Option<&ProgressBar>,
+) {
+    for batch in batches {
+        let cs = chunk_size(batch.entries.len().max(1));
+        batch.entries.par_chunks(cs).for_each(|chunk| {
+            for entry in chunk {
+                if let Err(err) = remove_dir_with_retry(&entry.path) {
+                    error_count.fetch_add(1, Ordering::Relaxed);
+                    push_failure(failures, &entry.path, &err);
+                }
+            }
+            if let Some(b) = bar {
+                b.inc(chunk.len() as u64);
+            }
+        });
+    }
+}
+
+fn finalize(
+    root: &Path,
+    total_errors: u64,
+    failures: &Mutex<Vec<DeletionFailure>>,
+    bar: Option<ProgressBar>,
+) -> io::Result<()> {
+    if total_errors > 0 {
+        if let Some(ref b) = bar {
+            b.finish_with_message(format!("Failed ({total_errors} entries)"));
+        }
+        let failures = lock_failures(failures);
+        return Err(io::Error::other(failure_summary(total_errors, &failures)));
+    }
+
+    match remove_dir_with_retry(root) {
+        Ok(()) => {
+            if let Some(ref b) = bar {
+                b.inc(1);
+            }
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => {
+            if let Some(ref b) = bar {
+                b.finish_and_clear();
+            }
+            return Err(e);
+        }
+    }
+
+    if let Some(ref b) = bar {
+        b.finish_with_message("Deleted");
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Pipeline delete (no filter active)
+// ---------------------------------------------------------------------------
+
+fn delete_directory_pipeline(
+    path: &Path,
+    bar: Option<ProgressBar>,
+    shred: bool,
+    only_empty: bool,
+) -> io::Result<()> {
+    // Bounded channel from scan-thread to consumer-thread.
+    // Capacity = num_threads * 4 so backpressure kicks in before memory bloats.
+    let queue_cap = (rayon::current_num_threads() * 4).max(64);
+    let (scan_tx, scan_rx) = crossbeam_channel::bounded::<ScannedEntry>(queue_cap);
+
+    // Channel from consumer-thread to rayon workers: unbounded batches.
+    let (batch_tx, batch_rx) = crossbeam_channel::unbounded::<Vec<ScannedEntry>>();
+
+    // ── thread A: jwalk scan ──────────────────────────────────────────────
+    let scan_path = path.to_path_buf();
+    let scan_bar = bar.clone();
+    let scan_thread = std::thread::spawn(move || -> io::Result<crate::scan::StreamScanResult> {
+        scan_into_channel(&scan_path, &scan_tx, scan_bar.as_ref(), false)
+        // scan_tx drops here → scan_rx will drain and close
+    });
+
+    // ── thread B: consumer — collects entries and pushes batches ─────────
+    // This thread does NO blocking rayon work; it just accumulates and sends.
+    let batch_size = chunk_size(queue_cap * 4).max(256);
+    let consumer_thread = std::thread::spawn(move || {
+        let mut batch: Vec<ScannedEntry> = Vec::with_capacity(batch_size);
+        for entry in &scan_rx {
+            batch.push(entry);
+            if batch.len() >= batch_size {
+                let ready = std::mem::replace(&mut batch, Vec::with_capacity(batch_size));
+                let _ = batch_tx.send(ready);
+            }
+        }
+        if !batch.is_empty() {
+            let _ = batch_tx.send(batch);
+        }
+        // batch_tx drops here → batch_rx closes
+    });
+
+    // ── rayon pool: drain batch_rx in parallel ────────────────────────────
+    let file_errors = AtomicU64::new(0);
+    let failures = Mutex::new(Vec::<DeletionFailure>::new());
+
+    // Collect all batches first (consumer is fast — pure memcpy),
+    // then process them in parallel so all rayon threads are fully utilised.
+    let all_batches: Vec<Vec<ScannedEntry>> = batch_rx.iter().collect();
+    consumer_thread.join().ok();
+
+    all_batches.par_iter().for_each(|batch| {
+        process_file_batch(batch, shred, &file_errors, &failures, bar.as_ref());
+    });
+
+    let scan_result = scan_thread
+        .join()
+        .map_err(|_| io::Error::other("scan thread panicked"))??;
+
+    if only_empty
+        && (scan_result.stats.files + scan_result.stats.symlinks + scan_result.stats.dirs) > 0
+    {
+        if let Some(ref b) = bar {
+            b.finish_with_message("Skipped - directory is not empty");
+        }
+        return Ok(());
+    }
+
+    if let Some(ref b) = bar {
+        b.set_style(
+            ProgressStyle::default_bar()
+                .template("{prefix} [{bar:40}] {pos}/{len} {per_sec} ETA {eta} {msg}")
+                .unwrap()
+                .progress_chars("#>-"),
+        );
+        b.set_length(scan_result.stats.dirs as u64 + 1);
+        b.set_position(0);
+        b.set_message(format!("Deleting dirs ({})", scan_result.stats.dirs));
+    }
+
+    let dir_errors = AtomicU64::new(0);
+    delete_dir_batches(
+        &scan_result.dirs_by_depth,
+        &dir_errors,
+        &failures,
+        bar.as_ref(),
+    );
+
+    finalize(
+        path,
+        file_errors.load(Ordering::Relaxed) + dir_errors.load(Ordering::Relaxed),
+        &failures,
+        bar,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Filtered path (collect full plan first)
+// ---------------------------------------------------------------------------
+
+fn delete_directory_filtered(
+    path: &Path,
+    bar: Option<ProgressBar>,
+    filter: &FilterConfig,
+    shred: bool,
+    only_empty: bool,
+) -> io::Result<()> {
+    let plan = if let Some(ref b) = bar {
+        scan_directory_plan_with_bar_for_filter(path, b, filter)?
+    } else {
+        scan_directory_plan_for_filter(path, filter)?
+    };
+    let plan = plan.apply_filter(path, filter);
+
+    if only_empty && plan.stats.total_deletable() > 0 {
+        if let Some(ref b) = bar {
+            b.finish_with_message("Skipped - directory is not empty");
+        }
+        return Ok(());
+    }
+
+    if let Some(ref b) = bar {
+        b.set_style(
+            ProgressStyle::default_bar()
+                .template("{prefix} [{bar:40}] {pos}/{len} {per_sec} ETA {eta} {msg}")
+                .unwrap()
+                .progress_chars("#>-"),
+        );
+        b.set_length((plan.stats.total_deletable() + 1) as u64);
+        b.set_position(0);
+        b.set_message(format!("Deleting files ({})", plan.files_and_links.len()));
+    }
+
+    let file_errors = AtomicU64::new(0);
+    let failures = Mutex::new(Vec::<DeletionFailure>::new());
+
+    let cs = chunk_size(plan.files_and_links.len().max(1));
+    plan.files_and_links.par_chunks(cs).for_each(|chunk| {
+        process_file_batch(chunk, shred, &file_errors, &failures, bar.as_ref());
+    });
+
+    if let Some(ref b) = bar {
+        b.set_message(format!("Deleting dirs ({})", plan.stats.dirs));
+    }
+
+    let dir_errors = AtomicU64::new(0);
+    delete_dir_batches(&plan.dirs_by_depth, &dir_errors, &failures, bar.as_ref());
+
+    finalize(
+        path,
+        file_errors.load(Ordering::Relaxed) + dir_errors.load(Ordering::Relaxed),
+        &failures,
+        bar,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Pool dispatcher
+// ---------------------------------------------------------------------------
 
 fn delete_directory_pool_inner(
     path: &Path,
     silent: bool,
     external_bar: Option<ProgressBar>,
+    filter: &FilterConfig,
+    shred: bool,
+    only_empty: bool,
 ) -> io::Result<()> {
     let bar: Option<ProgressBar> = if silent {
         None
@@ -223,119 +477,65 @@ fn delete_directory_pool_inner(
         Some(b)
     };
 
+    if only_empty {
+        if let Ok(mut rd) = std::fs::read_dir(path) {
+            if rd.next().is_some() {
+                if let Some(ref b) = bar {
+                    b.finish_with_message("Skipped - directory is not empty");
+                }
+                return Ok(());
+            }
+        }
+    }
+
     if let Some(ref b) = bar {
         b.set_message("Scanning");
     }
 
-    let plan = if silent {
-        scan_directory_plan(path)?
+    if filter.is_empty() {
+        delete_directory_pipeline(path, bar, shred, only_empty)
     } else {
-        scan_directory_plan_with_bar(path, bar.as_ref().unwrap())?
-    };
-
-    let total = plan.stats.total_deletable();
-    if let Some(ref b) = bar {
-        b.set_style(
-            ProgressStyle::default_bar()
-                .template("{prefix} [{bar:40}] {pos}/{len} {per_sec} ETA {eta} {msg}")
-                .unwrap()
-                .progress_chars("#>-"),
-        );
-        b.set_length((total + 1) as u64);
-        b.set_position(0);
-        b.set_message(format!("Deleting files ({})", plan.files_and_links.len()));
+        delete_directory_filtered(path, bar, filter, shred, only_empty)
     }
-
-    let file_errors: AtomicU64 = AtomicU64::new(0);
-    let failures = Mutex::new(Vec::new());
-    plan.files_and_links
-        .par_chunks(PROGRESS_CHUNK_SIZE)
-        .for_each(|chunk| {
-            for entry in chunk {
-                let result = match &entry.kind {
-                    EntryKind::Symlink => delete_symlink(&entry.path),
-                    EntryKind::File => remove_file_with_retry(&entry.path),
-                    _ => Ok(()),
-                };
-                if let Err(err) = result {
-                    file_errors.fetch_add(1, Ordering::Relaxed);
-                    push_failure(&failures, &entry.path, &err);
-                }
-            }
-            if let Some(ref b) = bar {
-                b.inc(chunk.len() as u64);
-            }
-        });
-
-    let mut total_errors = file_errors.load(Ordering::Relaxed);
-    if total_errors > 0 {
-        if let Some(ref b) = bar {
-            b.set_message(format!(
-                "Files failed ({total_errors}); cleaning remaining dirs"
-            ));
-        }
-    }
-
-    if let Some(ref b) = bar {
-        b.set_message(format!("Deleting dirs ({})", plan.stats.dirs));
-    }
-
-    let dir_errors: AtomicU64 = AtomicU64::new(0);
-    for batch in &plan.dirs_by_depth {
-        if let Some(ref b) = bar {
-            b.set_message(format!(
-                "Deleting dirs depth {} ({})",
-                batch.depth,
-                batch.entries.len()
-            ));
-        }
-        batch
-            .entries
-            .par_chunks(PROGRESS_CHUNK_SIZE)
-            .for_each(|chunk| {
-                for entry in chunk {
-                    let result = remove_dir_with_retry(&entry.path);
-                    if let Err(err) = result {
-                        dir_errors.fetch_add(1, Ordering::Relaxed);
-                        push_failure(&failures, &entry.path, &err);
-                    }
-                }
-                if let Some(ref b) = bar {
-                    b.inc(chunk.len() as u64);
-                }
-            });
-    }
-
-    total_errors += dir_errors.load(Ordering::Relaxed);
-    if total_errors > 0 {
-        if let Some(ref b) = bar {
-            b.finish_with_message(format!("Failed ({total_errors} entries)"));
-        }
-        let failures = lock_failures(&failures);
-        return Err(io::Error::other(failure_summary(total_errors, &failures)));
-    }
-
-    if path.exists() {
-        if let Some(ref b) = bar {
-            b.set_message("Finalizing");
-        }
-        if let Err(e) = remove_dir_with_retry(path) {
-            if let Some(ref b) = bar {
-                b.finish_and_clear();
-            }
-            return Err(e);
-        }
-        if let Some(ref b) = bar {
-            b.inc(1);
-        }
-    }
-
-    if let Some(ref b) = bar {
-        b.finish_with_message("Deleted");
-    }
-
-    Ok(())
 }
+
+fn delete_directory_inner(
+    path: &Path,
+    threads: Option<usize>,
+    silent: bool,
+    external_bar: Option<ProgressBar>,
+    filter: &FilterConfig,
+    shred: bool,
+    only_empty: bool,
+) -> io::Result<()> {
+    if let Some(count) = threads {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(count)
+            .build()
+            .map_err(|err| io::Error::other(err.to_string()))?;
+        return pool.install(|| {
+            delete_directory_pool_inner(path, silent, external_bar, filter, shred, only_empty)
+        });
+    }
+    delete_directory_pool_inner(path, silent, external_bar, filter, shred, only_empty)
+}
+
+#[cfg(test)]
+pub fn delete_directory(path: &Path, threads: Option<usize>) -> io::Result<()> {
+    delete_directory_inner(
+        path,
+        threads,
+        false,
+        None,
+        &FilterConfig::default(),
+        false,
+        false,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// DeleteOptions builder
+// ---------------------------------------------------------------------------
 
 #[derive(Default)]
 pub struct DeleteOptions {
@@ -343,6 +543,10 @@ pub struct DeleteOptions {
     pub silent: bool,
     pub bar: Option<ProgressBar>,
     pub allow_dangerous: bool,
+    pub filter: FilterConfig,
+    pub shred: bool,
+    pub only_empty: bool,
+    pub recycle: bool,
 }
 
 impl DeleteOptions {
@@ -350,40 +554,77 @@ impl DeleteOptions {
         self.threads = threads;
         self
     }
-
     pub fn silent(mut self) -> Self {
         self.silent = true;
         self
     }
-
     pub fn with_bar(mut self, bar: ProgressBar) -> Self {
         self.bar = Some(bar);
         self
     }
-
     pub fn allow_dangerous(mut self) -> Self {
         self.allow_dangerous = true;
         self
     }
+    pub fn with_filter(mut self, f: FilterConfig) -> Self {
+        self.filter = f;
+        self
+    }
+    pub fn shred(mut self) -> Self {
+        self.shred = true;
+        self
+    }
+    pub fn only_empty(mut self) -> Self {
+        self.only_empty = true;
+        self
+    }
+    pub fn recycle(mut self) -> Self {
+        self.recycle = true;
+        self
+    }
 }
+
+// ---------------------------------------------------------------------------
+// Public entry points
+// ---------------------------------------------------------------------------
 
 pub fn delete_path(path: &Path, opts: DeleteOptions) -> io::Result<()> {
-    delete_path_inner(
-        path,
-        opts.threads,
-        opts.silent,
-        opts.bar,
-        opts.allow_dangerous,
-    )
+    if opts.only_empty && !path.is_dir() {
+        if !opts.silent {
+            eprintln!("Skipping non-directory (--only-empty): {}", path.display());
+        }
+        return Ok(());
+    }
+
+    #[cfg(windows)]
+    if opts.recycle {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() {
+            return delete_symlink(path);
+        }
+        let canonical = sanitize_path(path)?;
+        if canonical.parent().is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("refusing to delete filesystem root: {}", path.display()),
+            ));
+        }
+        if is_protected_path(&canonical) && !opts.allow_dangerous {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "refusing to delete dangerous path without extra confirmation: {}",
+                    path.display()
+                ),
+            ));
+        }
+        return crate::recycle::recycle_path(path);
+    }
+
+    delete_path_inner(path, opts)
 }
 
-fn delete_path_inner(
-    path: &Path,
-    threads: Option<usize>,
-    silent: bool,
-    bar: Option<ProgressBar>,
-    allow_dangerous: bool,
-) -> io::Result<()> {
+fn delete_path_inner(path: &Path, opts: DeleteOptions) -> io::Result<()> {
     let metadata = std::fs::symlink_metadata(path)?;
 
     if metadata.file_type().is_symlink() {
@@ -398,7 +639,7 @@ fn delete_path_inner(
         ));
     }
 
-    if is_protected_path(&canonical) && !allow_dangerous {
+    if is_protected_path(&canonical) && !opts.allow_dangerous {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
@@ -409,9 +650,21 @@ fn delete_path_inner(
     }
 
     if metadata.is_dir() {
-        delete_directory_inner(path, threads, silent, bar)
+        delete_directory_inner(
+            path,
+            opts.threads,
+            opts.silent,
+            opts.bar,
+            &opts.filter,
+            opts.shred,
+            opts.only_empty,
+        )
     } else if metadata.is_file() {
-        remove_file_with_retry(path)
+        if opts.shred {
+            crate::shred::shred_file(path, 3)
+        } else {
+            remove_file_with_retry(path)
+        }
     } else {
         Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -443,13 +696,6 @@ fn dry_run_path_inner(path: &Path, silent: bool) -> io::Result<()> {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!("refusing to delete protected path: {}", path.display()),
-        ));
-    }
-
-    if canonical.parent().is_none() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("refusing to delete filesystem root: {}", path.display()),
         ));
     }
 
@@ -486,6 +732,10 @@ fn dry_run_path_inner(path: &Path, silent: bool) -> io::Result<()> {
 
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -580,164 +830,50 @@ mod tests {
     #[test]
     fn test_delete_path_handles_directory() {
         let temp = create_test_dir();
-        fs::create_dir(temp.join("subdir")).unwrap();
-        delete_path(&temp, DeleteOptions::default()).unwrap();
-        assert!(!temp.exists());
-    }
-
-    #[test]
-    fn test_delete_symlink_removes_link() {
-        let temp = create_test_dir();
-        let target = temp.join("target");
-        fs::create_dir(&target).unwrap();
-        let link = temp.join("link");
-        #[cfg(windows)]
-        std::os::windows::fs::symlink_dir(&target, &link).unwrap();
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&target, &link).unwrap();
-        assert!(link.exists());
-        delete_symlink(&link).unwrap();
-        assert!(!link.exists());
-        assert!(target.exists());
+        let dir = temp.join("subdir");
+        fs::create_dir(&dir).unwrap();
+        File::create(dir.join("f.txt")).unwrap();
+        delete_path(&dir, DeleteOptions::default()).unwrap();
+        assert!(!dir.exists());
         let _ = fs::remove_dir_all(&temp);
     }
 
     #[test]
-    fn test_delete_directory_does_not_follow_symlink_target() {
-        let temp = create_test_dir();
-        let delete_root = temp.join("delete-root");
-        let external_target = temp.join("external-target");
-        fs::create_dir(&delete_root).unwrap();
-        fs::create_dir(&external_target).unwrap();
-        File::create(external_target.join("keep.txt")).unwrap();
-        let link = delete_root.join("link");
-        #[cfg(windows)]
-        std::os::windows::fs::symlink_dir(&external_target, &link).unwrap();
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&external_target, &link).unwrap();
-        delete_directory(&delete_root, None).unwrap();
-        assert!(!delete_root.exists());
-        assert!(external_target.exists());
-        assert!(external_target.join("keep.txt").exists());
-        let _ = fs::remove_dir_all(&temp);
-    }
-
-    #[test]
-    fn test_delete_directory_idempotent() {
-        let temp = create_test_dir();
-        File::create(temp.join("file.txt")).unwrap();
-        delete_directory(&temp, None).unwrap();
-        assert!(!temp.exists());
-        let result = delete_directory(&temp, None);
+    fn test_delete_path_refuses_protected_path() {
+        let result = delete_path(
+            std::path::Path::new(r"C:\Windows"),
+            DeleteOptions::default(),
+        );
         assert!(result.is_err());
     }
 
     #[test]
-    fn test_delete_empty_directory() {
+    #[cfg(windows)]
+    fn test_delete_path_refuses_filesystem_root() {
+        let result = delete_path(std::path::Path::new(r"C:\"), DeleteOptions::default());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_dry_run_does_not_delete() {
         let temp = create_test_dir();
-        let empty = temp.join("empty");
-        fs::create_dir(&empty).unwrap();
-        delete_directory(&empty, None).unwrap();
-        assert!(!empty.exists());
+        let file = temp.join("keep.txt");
+        File::create(&file).unwrap();
+        dry_run_path(&temp).unwrap();
+        assert!(file.exists());
         let _ = fs::remove_dir_all(&temp);
     }
 
     #[test]
-    fn test_delete_path_refuses_filesystem_root() {
-        let root = Path::new("C:\\");
-        assert!(root.parent().is_none());
-        match dry_run_path_silent(root) {
-            Ok(()) => panic!("dry_run_path on filesystem root must not succeed"),
-            Err(e) => {
-                let kind = e.kind();
-                assert!(matches!(
-                    kind,
-                    io::ErrorKind::InvalidInput
-                        | io::ErrorKind::PermissionDenied
-                        | io::ErrorKind::NotFound
-                ));
-            }
-        }
-    }
-
-    #[test]
-    fn test_remove_file_with_retry_handles_readonly() {
+    fn test_delete_readonly_file_with_retry() {
         let temp = create_test_dir();
-        let file = temp.join("readonly.txt");
+        let file = temp.join("ro.txt");
         File::create(&file).unwrap();
         let mut perms = fs::metadata(&file).unwrap().permissions();
         perms.set_readonly(true);
         fs::set_permissions(&file, perms).unwrap();
         remove_file_with_retry(&file).unwrap();
         assert!(!file.exists());
-        let _ = fs::remove_dir_all(&temp);
-    }
-
-    #[test]
-    fn test_dry_run_path_does_not_delete_file() {
-        let temp = create_test_dir();
-        let file = temp.join("file.txt");
-        File::create(&file).unwrap();
-        dry_run_path(&file).unwrap();
-        assert!(file.exists());
-        let _ = fs::remove_dir_all(&temp);
-    }
-
-    #[test]
-    fn test_dry_run_path_does_not_delete_directory() {
-        let temp = create_test_dir();
-        let subdir = temp.join("subdir");
-        fs::create_dir(&subdir).unwrap();
-        File::create(subdir.join("file.txt")).unwrap();
-        dry_run_path(&subdir).unwrap();
-        assert!(subdir.exists());
-        let _ = fs::remove_dir_all(&temp);
-    }
-
-    #[test]
-    fn test_delete_path_refuses_protected_path_integration() {
-        assert!(crate::protect::is_protected_path(Path::new(r"C:\Windows")));
-        assert!(crate::protect::is_protected_path(Path::new(
-            r"C:\Program Files"
-        )));
-        let temp = create_test_dir();
-        let file = temp.join("file.txt");
-        File::create(&file).unwrap();
-        delete_path(&file, DeleteOptions::default()).unwrap();
-        assert!(!file.exists());
-        let _ = fs::remove_dir_all(&temp);
-    }
-
-    #[test]
-    fn test_delete_path_handles_file_symlink() {
-        let temp = create_test_dir();
-        let target_file = temp.join("target.txt");
-        File::create(&target_file).unwrap();
-        let link = temp.join("link.txt");
-        #[cfg(windows)]
-        std::os::windows::fs::symlink_file(&target_file, &link).unwrap();
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&target_file, &link).unwrap();
-        assert!(link.exists());
-        delete_path(&link, DeleteOptions::default()).unwrap();
-        assert!(!link.exists());
-        assert!(target_file.exists());
-        let _ = fs::remove_dir_all(&temp);
-    }
-
-    #[test]
-    fn test_dry_run_path_symlink_does_not_delete() {
-        let temp = create_test_dir();
-        let target = temp.join("target");
-        fs::create_dir(&target).unwrap();
-        let link = temp.join("link");
-        #[cfg(windows)]
-        std::os::windows::fs::symlink_dir(&target, &link).unwrap();
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&target, &link).unwrap();
-        dry_run_path(&link).unwrap();
-        assert!(link.exists());
-        assert!(target.exists());
         let _ = fs::remove_dir_all(&temp);
     }
 

@@ -1,7 +1,6 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 use eframe::egui;
-use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -13,29 +12,43 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant};
 use zap::delete::DeleteOptions;
-use zap::{batch, delete, protect, size};
+use zap::{batch, delete, path_utils, protect, size, treemap};
+
+type BatchCollectionResult = Option<(Vec<PathBuf>, Option<BatchSession>)>;
+type BatchReceiver = Receiver<BatchCollectionResult>;
 
 const APP_NAME: &str = "Zap";
 const PROGRESS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_THREADS: usize = 1024;
-const WINDOW_SIZE: [f32; 2] = [420.0, 260.0];
+const WINDOW_WIDTH: f32 = 420.0;
+const WINDOW_HEIGHT_NORMAL: f32 = 260.0;
+const WINDOW_HEIGHT_DANGEROUS: f32 = 304.0;
 
 fn main() -> eframe::Result<()> {
     let args = parse_args();
-    let (paths, batch_session) = if args.batch {
-        match collect_batch_paths(&args.paths) {
-            Some(batch) => batch,
-            None => return Ok(()),
+
+    // In batch mode: non-coordinators must exit silently without opening
+    // a window. Only the process that wins the lock shows the GUI. The
+    // coordinator writes its own paths immediately, then collects the
+    // rest from siblings asynchronously so the window appears instantly.
+    let (paths, batch_session, batch_rx) = if args.batch {
+        match try_become_coordinator(&args.paths) {
+            CoordinatorOutcome::NotCoordinator => return Ok(()),
+            CoordinatorOutcome::Coordinator {
+                paths,
+                batch_session,
+                batch_rx,
+            } => (paths, batch_session, Some(batch_rx)),
         }
     } else {
-        (args.paths, None)
+        (args.paths, None, None)
     };
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_title(APP_NAME)
-        .with_inner_size(WINDOW_SIZE)
-        .with_min_inner_size(WINDOW_SIZE)
-        .with_max_inner_size(WINDOW_SIZE)
+        .with_inner_size([WINDOW_WIDTH, WINDOW_HEIGHT_NORMAL])
+        .with_min_inner_size([WINDOW_WIDTH, WINDOW_HEIGHT_NORMAL])
+        .with_max_inner_size([WINDOW_WIDTH, WINDOW_HEIGHT_DANGEROUS])
         .with_resizable(false)
         .with_maximize_button(false);
 
@@ -58,9 +71,86 @@ fn main() -> eframe::Result<()> {
         Box::new(|cc| {
             cc.egui_ctx.set_theme(egui::ThemePreference::System);
             configure_style(&cc.egui_ctx);
-            Ok(Box::new(ZapApp::new(paths, args.threads, batch_session)))
+            if let Some(rx) = batch_rx {
+                Ok(Box::new(ZapApp::new_collecting(
+                    paths,
+                    args.threads,
+                    batch_session,
+                    rx,
+                )))
+            } else {
+                Ok(Box::new(ZapApp::new(paths, args.threads, None)))
+            }
         }),
     )
+}
+
+enum CoordinatorOutcome {
+    NotCoordinator,
+    Coordinator {
+        paths: Vec<PathBuf>,
+        batch_session: Option<BatchSession>,
+        batch_rx: BatchReceiver,
+    },
+}
+
+/// Fast path for non-coordinators: write own paths, try lock. If we lose
+/// the lock race, exit immediately without opening any window. The winner
+/// spawns a background thread to collect the rest.
+fn try_become_coordinator(own_paths: &[PathBuf]) -> CoordinatorOutcome {
+    let paths_dir = batch::batch_paths_dir();
+    let lock_file = batch::batch_lock_file();
+
+    batch::cleanup_stale_batch(&paths_dir, &lock_file);
+
+    // Write own paths now — siblings need them even if we win the lock.
+    if batch::write_batch_paths(&paths_dir, own_paths).is_err() {
+        return CoordinatorOutcome::Coordinator {
+            paths: own_paths.to_vec(),
+            batch_session: None,
+            batch_rx: {
+                let (tx, rx) = mpsc::channel();
+                let _ = tx.send(Some((own_paths.to_vec(), None)));
+                rx
+            },
+        };
+    }
+
+    // Fast lock race — this is the only sync delay (~0ms).
+    let mut lock = match batch::try_acquire_lock(&lock_file) {
+        Ok(l) => l,
+        Err(_) => return CoordinatorOutcome::NotCoordinator,
+    };
+
+    // We won the lock — spawn the slow batch collection in background
+    // so the window opens instantly.
+    let (tx, rx) = mpsc::channel();
+    let paths_dir_clone = paths_dir.clone();
+    let lock_file_clone = lock_file.clone();
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(150));
+        batch::touch_lock(&mut lock);
+        batch::wait_for_batch_quiet(
+            &paths_dir_clone,
+            batch::BATCH_QUIET_POLLS,
+            batch::BATCH_MAX_POLLS,
+        );
+        let mut collected = batch::read_batch_paths(&paths_dir_clone);
+        path_utils::dedup_paths(&mut collected);
+        let session = BatchSession {
+            paths_dir: paths_dir_clone,
+            lock_file: lock_file_clone,
+            lock: Some(lock),
+            last_path_count: collected.len(),
+        };
+        let _ = tx.send(Some((collected, Some(session))));
+    });
+
+    CoordinatorOutcome::Coordinator {
+        paths: own_paths.to_vec(),
+        batch_session: None,
+        batch_rx: rx,
+    }
 }
 
 #[cfg(windows)]
@@ -131,8 +221,8 @@ fn initial_window_position() -> Option<egui::Pos2> {
     }
 
     let work = info.rcWork;
-    let x = work.left + ((work.right - work.left) - WINDOW_SIZE[0] as i32) / 2;
-    let y = work.top + ((work.bottom - work.top) - WINDOW_SIZE[1] as i32) / 2;
+    let x = work.left + ((work.right - work.left) - WINDOW_WIDTH as i32) / 2;
+    let y = work.top + ((work.bottom - work.top) - WINDOW_HEIGHT_NORMAL as i32) / 2;
     Some(egui::pos2(x.max(work.left) as f32, y.max(work.top) as f32))
 }
 
@@ -197,7 +287,7 @@ fn apply_dark_theme(ctx: &egui::Context) {
 }
 
 fn load_app_icon() -> Option<egui::IconData> {
-    let png_bytes = include_bytes!("../../assets/zap.png");
+    let png_bytes = include_bytes!("../../assets/branding/zap.png");
     let img = image::load_from_memory(png_bytes).ok()?.into_rgba8();
     let (w, h) = (img.width(), img.height());
     Some(egui::IconData {
@@ -231,13 +321,8 @@ fn parse_args() -> GuiArgs {
             _ => parsed.paths.push(PathBuf::from(arg)),
         }
     }
-    dedup_paths(&mut parsed.paths);
+    path_utils::dedup_paths(&mut parsed.paths);
     parsed
-}
-
-fn dedup_paths(paths: &mut Vec<PathBuf>) {
-    let mut seen = HashSet::with_capacity(paths.len());
-    paths.retain(|path| seen.insert(path.clone()));
 }
 
 struct BatchSession {
@@ -252,42 +337,6 @@ impl Drop for BatchSession {
         drop(self.lock.take());
         let _ = fs::remove_dir_all(&self.paths_dir);
         let _ = fs::remove_file(&self.lock_file);
-    }
-}
-
-fn collect_batch_paths(paths: &[PathBuf]) -> Option<(Vec<PathBuf>, Option<BatchSession>)> {
-    let temp = std::env::temp_dir();
-    let paths_dir = temp.join(batch::PATHS_DIR_NAME);
-    let lock_file = temp.join(batch::LOCK_FILE_NAME);
-
-    batch::cleanup_stale_batch(&paths_dir, &lock_file);
-    if batch::write_batch_paths(&paths_dir, paths).is_err() {
-        return Some((paths.to_vec(), None));
-    }
-
-    match batch::try_acquire_lock(&lock_file) {
-        Ok(mut lock) => {
-            thread::sleep(Duration::from_millis(150));
-            batch::touch_lock(&mut lock);
-            batch::wait_for_batch_quiet(
-                &paths_dir,
-                batch::BATCH_QUIET_POLLS,
-                batch::BATCH_MAX_POLLS,
-            );
-            let mut collected = batch::read_batch_paths(&paths_dir);
-            dedup_paths(&mut collected);
-            let last_path_count = collected.len();
-            Some((
-                collected,
-                Some(BatchSession {
-                    paths_dir,
-                    lock_file,
-                    lock: Some(lock),
-                    last_path_count,
-                }),
-            ))
-        }
-        Err(_) => None,
     }
 }
 
@@ -326,6 +375,12 @@ struct ZapApp {
     batch_session: Option<BatchSession>,
     has_dangerous_paths: bool,
     danger_confirmed: bool,
+    show_treemap: bool,
+    treemap_data: Arc<Mutex<Option<Vec<treemap::TreemapRect>>>>,
+    treemap_collecting: bool,
+    /// Batch result receiver — window opens instantly, batch paths arrive
+    /// asynchronously from the background collection thread.
+    batch_collecting: Option<BatchReceiver>,
 }
 
 impl ZapApp {
@@ -334,11 +389,7 @@ impl ZapApp {
         threads: Option<usize>,
         batch_session: Option<BatchSession>,
     ) -> Self {
-        let has_dangerous = paths.iter().any(|p| {
-            protect::sanitize_path(p)
-                .map(|c| protect::is_protected_path(&c))
-                .unwrap_or(false)
-        });
+        let has_dangerous = paths.iter().any(|p| protect::is_protected_path(p));
 
         let total_size = Arc::new(Mutex::new(None));
         let size_handle = Arc::clone(&total_size);
@@ -373,6 +424,61 @@ impl ZapApp {
             batch_session,
             has_dangerous_paths: has_dangerous,
             danger_confirmed: false,
+            show_treemap: false,
+            treemap_data: Arc::new(Mutex::new(None)),
+            treemap_collecting: false,
+            batch_collecting: None,
+        }
+    }
+
+    /// Create app with batch results arriving asynchronously — window opens
+    /// instantly while batch paths are still being collected.
+    fn new_collecting(
+        initial_paths: Vec<PathBuf>,
+        threads: Option<usize>,
+        batch_session: Option<BatchSession>,
+        batch_rx: BatchReceiver,
+    ) -> Self {
+        let mut app = Self::new(initial_paths, threads, batch_session);
+        app.batch_collecting = Some(batch_rx);
+        app
+    }
+
+    /// Poll the batch background thread for results. Called every frame until
+    /// the batch session is established or fails.
+    fn poll_batch_collection(&mut self) {
+        let batch_rx = match self.batch_collecting.take() {
+            Some(rx) => rx,
+            None => return,
+        };
+        match batch_rx.try_recv() {
+            Ok(Some((paths, session))) => {
+                self.items.clear();
+                for path in paths {
+                    self.items.push(DeleteItem {
+                        path,
+                        state: ItemState::Pending,
+                        progress: None,
+                    });
+                }
+                // Update dangerous-paths check with collected paths
+                self.has_dangerous_paths = self
+                    .items
+                    .iter()
+                    .any(|item| protect::is_protected_path(&item.path));
+                self.batch_session = session;
+                self.recalculate_total_size();
+            }
+            Ok(None) => {
+                // Batch collection failed — keep initial paths
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                // Not ready yet — put the receiver back
+                self.batch_collecting = Some(batch_rx);
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                // Thread crashed — keep initial paths
+            }
         }
     }
 
@@ -534,7 +640,7 @@ impl ZapApp {
 
     fn add_batch_paths_from(&mut self, paths_dir: &Path) -> bool {
         let mut paths = batch::read_batch_paths(paths_dir);
-        dedup_paths(&mut paths);
+        path_utils::dedup_paths(&mut paths);
         let mut changed = false;
         for path in paths {
             if !self.items.iter().any(|item| item.path == path) {
@@ -577,7 +683,22 @@ impl eframe::App for ZapApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         apply_dark_theme(ctx);
         self.poll_events();
+        self.poll_batch_collection();
         self.poll_batch_session();
+
+        // Resize window height: normal 260, dangerous-confirm 304
+        let target_h = if self.has_dangerous_paths && !self.show_treemap {
+            WINDOW_HEIGHT_DANGEROUS
+        } else {
+            WINDOW_HEIGHT_NORMAL
+        };
+        let current = ctx.input(|i| i.screen_rect().height());
+        if (current - target_h).abs() > 2.0 {
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::Vec2::new(
+                WINDOW_WIDTH,
+                target_h,
+            )));
+        }
 
         if self.total_size_calculating {
             if let Ok(guard) = self.total_size.lock() {
@@ -587,8 +708,10 @@ impl eframe::App for ZapApp {
             }
         }
 
-        let should_repaint =
-            self.is_running() || self.total_size_calculating || self.batch_session.is_some();
+        let should_repaint = self.is_running()
+            || self.total_size_calculating
+            || self.batch_session.is_some()
+            || self.batch_collecting.is_some();
         if should_repaint {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
@@ -627,6 +750,66 @@ impl eframe::App for ZapApp {
                 render_options(ui, self);
                 ui.add_space(10.0);
                 render_actions(ui, ctx, self, running, finished, can_start);
+
+                ui.add_space(6.0);
+
+                let toggle_label = if self.show_treemap {
+                    "\u{25B2} Hide disk analyzer"
+                } else {
+                    "\u{25BC} Show disk analyzer"
+                };
+                if ui
+                    .add_enabled(!self.is_running(), egui::Button::new(toggle_label))
+                    .clicked()
+                {
+                    self.show_treemap = !self.show_treemap;
+                    if self.show_treemap {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::Vec2::new(
+                            420.0, 520.0,
+                        )));
+                    } else {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::Vec2::new(
+                            420.0, 260.0,
+                        )));
+                    }
+                    if self.show_treemap
+                        && self.treemap_data.lock().unwrap().is_none()
+                        && !self.treemap_collecting
+                    {
+                        self.treemap_collecting = true;
+                        let data_clone = self.treemap_data.clone();
+                        let items: Vec<PathBuf> =
+                            self.items.iter().map(|i| i.path.clone()).collect();
+                        std::thread::spawn(move || {
+                            let mut all = Vec::new();
+                            for path in &items {
+                                if let Ok(tree) = size::dir_size_tree(path) {
+                                    for (p, sz) in tree {
+                                        all.push(treemap::TreemapRect {
+                                            rect: egui::Rect::ZERO,
+                                            path: p,
+                                            size: sz,
+                                            color: egui::Color32::BLACK,
+                                            depth: 0,
+                                        });
+                                    }
+                                }
+                            }
+                            *data_clone.lock().unwrap() = Some(all);
+                        });
+                    }
+                }
+
+                if self.show_treemap {
+                    ui.add_space(4.0);
+                    let data = self.treemap_data.lock().unwrap().clone();
+                    if data.is_some() {
+                        self.treemap_collecting = false;
+                    }
+                    let rects = data.unwrap_or_default();
+                    let total = rects.iter().map(|r| r.size).sum::<u64>();
+                    treemap::treemap_ui(ui, &rects, total);
+                }
             });
     }
 }
@@ -1010,8 +1193,8 @@ mod tests {
         let lock_file = root.join("lock");
         let existing = PathBuf::from("existing");
         let late = PathBuf::from("late");
-        batch::write_batch_paths(&paths_dir, &[existing.clone()]).unwrap();
-        batch::write_batch_paths(&paths_dir, &[late.clone()]).unwrap();
+        batch::write_batch_paths(&paths_dir, std::slice::from_ref(&existing)).unwrap();
+        batch::write_batch_paths(&paths_dir, std::slice::from_ref(&late)).unwrap();
         let lock = batch::try_acquire_lock(&lock_file).unwrap();
         let mut app = ZapApp::new(
             vec![existing.clone()],

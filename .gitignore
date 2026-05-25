@@ -20,3 +20,9 @@ pnpm-lock.yaml
 .codex-target-*/
 pytest-cache-files-*/
 .omg
+# Codex/AI session artifacts
+/.antigravitycli/
+/write_delete.py
+/AUDIT_*.md
+/docs/superpowers/
+/.codex-targetf5l4Um/

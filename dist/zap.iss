@@ -4,9 +4,9 @@
 
 #define MyAppName "Zap"
 #ifndef MyAppVersion
-  #define MyAppVersion "0.1.1"
+  #define MyAppVersion "1.2.0"
 #endif
-#define MyAppPublisher "XtremeDevX"
+#define MyAppPublisher "adxptived"
 
 [Setup]
 ; NOTE: The value of AppId uniquely identifies this application.

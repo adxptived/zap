@@ -1,6 +1,6 @@
 [package]
 name = "zap"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2021"
 rust-version = "1.87"
 description = "Fast Windows deletion app: parallel scan, multi-threaded delete, and Explorer integration."
@@ -38,14 +38,20 @@ indicatif = "0.17"
 owo-colors = "4"
 rayon = "1.10"
 eframe = "0.31"
+egui = "0.31"
 image = { version = "0.25.9", features = ["png"] }
 ctrlc = "3"
+glob = "0.3"
+humantime = "2"
+rand = "0.8"
+crossbeam-channel = "0.5"
 
 [profile.release-optimized]
 inherits = "release"
 opt-level = 3
 lto = "fat"
 codegen-units = 1    # Reduce number of codegen units to increase optimizations.
+panic = "abort"
 
 [build-dependencies]
 embed-resource = "3.0.9"

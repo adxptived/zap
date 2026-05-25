@@ -1,6 +1,6 @@
 $ErrorActionPreference = "Stop"
 
-$expectedHash = "01DE05E6F357BA1CF97AF0355E1D63556D3945F811E941EA0BF866DEACE91743"
+$expectedHash = "F0CF6954D5C3CC7D2B583D9265148891EBB868AD8162F8D9EDD286FEBA10B494"
 $installerUrl = "https://github.com/adxptived/zap/releases/latest/download/Zap.exe"
 
 $installerPath = Join-Path $env:TEMP 'Zap.exe'

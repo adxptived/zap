@@ -1,5 +1,6 @@
 use indicatif::MultiProgress;
 use owo_colors::{AnsiColors, OwoColorize};
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -81,6 +82,13 @@ fn report_error(path: &Path, err: &std::io::Error) {
 }
 
 fn confirm_interactive(paths: &[PathBuf], dry_run: bool) -> io::Result<bool> {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "interactive confirmation requires a terminal (use --yes to skip)",
+        ));
+    }
     eprintln!();
     eprintln!(
         "{} {}",
@@ -125,7 +133,9 @@ fn confirm_interactive(paths: &[PathBuf], dry_run: bool) -> io::Result<bool> {
 }
 
 fn guard_self_deletion(options: &cli::CliOptions) -> io::Result<()> {
-    let exe = std::env::current_exe().ok();
+    let exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| protect::sanitize_path(&p).ok());
     for path in &options.paths {
         if let Ok(canon) = protect::sanitize_path(path) {
             if let Some(ref exe_path) = exe {
@@ -141,14 +151,20 @@ fn guard_self_deletion(options: &cli::CliOptions) -> io::Result<()> {
     Ok(())
 }
 
-fn collect_dangerous_paths(paths: &[PathBuf]) -> io::Result<Vec<PathBuf>> {
+fn collect_dangerous_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
     let mut dangerous = Vec::new();
     for path in paths {
-        let metadata = fs::symlink_metadata(path)?;
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
         if metadata.file_type().is_symlink() {
             continue;
         }
-        let canonical = protect::sanitize_path(path)?;
+        let canonical = match protect::sanitize_path(path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
         if canonical.parent().is_none() {
             continue;
         }
@@ -158,14 +174,14 @@ fn collect_dangerous_paths(paths: &[PathBuf]) -> io::Result<Vec<PathBuf>> {
     }
     dangerous.sort();
     dangerous.dedup();
-    Ok(dangerous)
+    dangerous
 }
 
 fn confirm_dangerous_deletion(options: &cli::CliOptions) -> io::Result<bool> {
     if options.dry_run {
         return Ok(false);
     }
-    let dangerous = collect_dangerous_paths(&options.paths)?;
+    let dangerous = collect_dangerous_paths(&options.paths);
     if dangerous.is_empty() {
         return Ok(false);
     }
@@ -217,6 +233,10 @@ fn run_delete(options: &cli::CliOptions, start: Instant) -> bool {
                     paths: options.paths.clone(),
                     batch: false,
                     silent: options.silent,
+                    filter: options.filter.clone(),
+                    shred: options.shred,
+                    only_empty: options.only_empty,
+                    recycle: options.recycle,
                 };
                 return run_delete(&real_options, start);
             }
@@ -364,9 +384,8 @@ fn alloc_console() {
 }
 
 fn run_batch(options: &cli::CliOptions, start: Instant) -> bool {
-    let temp = std::env::temp_dir();
-    let paths_dir = temp.join(batch::PATHS_DIR_NAME);
-    let lock_file = temp.join(batch::LOCK_FILE_NAME);
+    let paths_dir = batch::batch_paths_dir();
+    let lock_file = batch::batch_lock_file();
 
     #[cfg(windows)]
     free_console();
@@ -384,7 +403,6 @@ fn run_batch(options: &cli::CliOptions, start: Instant) -> bool {
             batch::wait_for_batch_quiet(&paths_dir, BATCH_INITIAL_QUIET_POLLS, BATCH_MAX_POLLS);
 
             let all_paths = batch::read_batch_paths(&paths_dir);
-            let total = all_paths.len();
 
             #[cfg(windows)]
             if !CONSOLE_ALLOCATED.load(Ordering::SeqCst) {
@@ -397,6 +415,10 @@ fn run_batch(options: &cli::CliOptions, start: Instant) -> bool {
                 threads: options.threads,
                 batch: false,
                 silent: options.silent,
+                filter: options.filter.clone(),
+                shred: options.shred,
+                only_empty: options.only_empty,
+                recycle: options.recycle,
             };
 
             let success = run_delete(&merged, start);
@@ -404,8 +426,12 @@ fn run_batch(options: &cli::CliOptions, start: Instant) -> bool {
             // Drain any late arrivals
             batch::touch_lock(&mut lock);
             batch::wait_for_batch_quiet(&paths_dir, BATCH_FINAL_QUIET_POLLS, BATCH_MAX_POLLS);
+            let processed: HashSet<&PathBuf> = merged.paths.iter().collect();
             let late_paths = batch::read_batch_paths(&paths_dir);
-            let pending: Vec<PathBuf> = late_paths.iter().skip(total).cloned().collect();
+            let pending: Vec<PathBuf> = late_paths
+                .into_iter()
+                .filter(|p| !processed.contains(p))
+                .collect();
             if !pending.is_empty() {
                 #[cfg(windows)]
                 if !options.silent && !CONSOLE_ALLOCATED.load(Ordering::SeqCst) {
@@ -417,6 +443,10 @@ fn run_batch(options: &cli::CliOptions, start: Instant) -> bool {
                     threads: options.threads,
                     batch: false,
                     silent: options.silent,
+                    filter: options.filter.clone(),
+                    shred: options.shred,
+                    only_empty: options.only_empty,
+                    recycle: options.recycle,
                 };
                 let _ = run_delete(&late_merged, start);
             }

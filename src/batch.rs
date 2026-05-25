@@ -17,6 +17,24 @@ pub const BATCH_MAX_POLLS: usize = 120;
 pub const LOCK_FILE_NAME: &str = "zap-batch.lock";
 pub const PATHS_DIR_NAME: &str = "zap-batch-paths.d";
 
+/// Returns the batch coordination root. Respects `ZAP_BATCH_ROOT` for
+/// test isolation; defaults to `%TEMP%` when the env var is unset.
+pub fn batch_root() -> PathBuf {
+    std::env::var("ZAP_BATCH_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir())
+}
+
+/// Returns the batch paths directory within the batch root.
+pub fn batch_paths_dir() -> PathBuf {
+    batch_root().join(PATHS_DIR_NAME)
+}
+
+/// Returns the batch lock file path within the batch root.
+pub fn batch_lock_file() -> PathBuf {
+    batch_root().join(LOCK_FILE_NAME)
+}
+
 fn hex_encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for &b in bytes {
@@ -121,17 +139,19 @@ pub fn write_batch_paths(paths_dir: &Path, paths: &[PathBuf]) -> io::Result<()> 
 }
 
 pub fn read_batch_paths(paths_dir: &Path) -> Vec<PathBuf> {
-    let mut files: Vec<_> = fs::read_dir(paths_dir)
+    let files: Vec<_> = fs::read_dir(paths_dir)
         .into_iter()
         .flat_map(|entries| entries.flatten())
         .filter_map(|entry| {
-            let metadata = entry.metadata().ok()?;
-            metadata.is_file().then(|| entry.path())
+            let path = entry.path();
+            // Only accept .txt files; ignore .txt.tmp partial writes,
+            // directories, and unrelated files. This avoids a metadata
+            // syscall per entry.
+            path.extension()
+                .is_some_and(|ext| ext == "txt")
+                .then_some(path)
         })
         .collect();
-    // Ignore .tmp suffix files — writers use rename(tmp→txt) to make
-    // the file appear atomically after flush.
-    files.retain(|p| !p.to_string_lossy().ends_with(".tmp"));
 
     files
         .into_iter()
@@ -140,7 +160,7 @@ pub fn read_batch_paths(paths_dir: &Path) -> Vec<PathBuf> {
                 Ok(c) => c,
                 Err(_) => {
                     // File may have been deleted between read_dir and now;
-                    // silently skip it — the writer has already moved on.
+                    // silently skip it -- the writer has already moved on.
                     return vec![];
                 }
             };
@@ -149,14 +169,16 @@ pub fn read_batch_paths(paths_dir: &Path) -> Vec<PathBuf> {
                 .filter(|line| !line.is_empty())
                 .filter_map(|line| {
                     let bytes = hex_decode(line)?;
-                    // SAFETY: hex_decode produces arbitrary bytes from hex.
-                    // OsString::from_encoded_bytes_unchecked is safe here
-                    // because the original path bytes were valid OS strings,
-                    // and hex roundtrip preserves exact byte content.
-                    unsafe {
-                        Some(PathBuf::from(
-                            std::ffi::OsString::from_encoded_bytes_unchecked(bytes),
-                        ))
+                    // Validate by checking that encoding back produces identical bytes.
+                    // from_encoded_bytes_unchecked is safe because the original path
+                    // bytes were valid OS strings, and hex roundtrip preserves exact
+                    // byte content. The roundtrip check catches corruption.
+                    let os_str =
+                        unsafe { std::ffi::OsString::from_encoded_bytes_unchecked(bytes.clone()) };
+                    if os_str.as_encoded_bytes() == bytes {
+                        Some(PathBuf::from(os_str))
+                    } else {
+                        None
                     }
                 })
                 .collect::<Vec<_>>()
@@ -221,6 +243,27 @@ pub fn touch_lock(lock: &mut File) {
     let _ = lock.flush();
 }
 
+/// Reopen `lock_file`, truncate, and write the current PID + timestamp.
+/// This allows a background worker to adopt ownership of a lock that was
+/// created by a short-lived launcher process, keeping mtime fresh so that
+/// `cleanup_stale_batch` does not treat an active batch as abandoned.
+pub fn refresh_lock_owner(lock_file: &Path) -> io::Result<File> {
+    let mut lock = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(lock_file)?;
+    let pid = std::process::id();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    writeln!(lock, "{pid}")?;
+    writeln!(lock, "{nanos}")?;
+    lock.flush()?;
+    Ok(lock)
+}
+
 #[cfg(windows)]
 fn is_pid_alive(pid: u32) -> bool {
     use std::ffi::c_void;
@@ -250,4 +293,107 @@ fn is_pid_alive(_pid: u32) -> bool {
     // Non-Windows: we don't have batch-mode Explorer integration, so
     // this code path is unreachable. Default to false (stale).
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_dir() -> PathBuf {
+        let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("zap-batch-test-{id}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn test_read_batch_paths_ignores_non_txt_entries_without_metadata_dependency() {
+        let dir = temp_dir();
+        let wanted = PathBuf::from(r"C:\Users\example\wanted.txt");
+        write_batch_paths(&dir, std::slice::from_ref(&wanted)).unwrap();
+        fs::write(dir.join("partial.txt.tmp"), "43415c746d70\n").unwrap();
+        fs::write(dir.join("notes.log"), "43415c6c6f67\n").unwrap();
+        fs::create_dir(dir.join("nested.txt")).unwrap();
+
+        let paths = read_batch_paths(&dir);
+        assert_eq!(paths, vec![wanted]);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_batch_paths_dir_respects_env_override() {
+        let custom = std::env::temp_dir().join(format!("zap-batch-custom-{}", std::process::id()));
+        std::env::set_var("ZAP_BATCH_ROOT", &custom);
+        // batch_root and derived functions must pick up env at call time
+        assert!(batch_paths_dir().starts_with(&custom));
+        assert!(batch_lock_file().starts_with(&custom));
+        std::env::remove_var("ZAP_BATCH_ROOT");
+    }
+
+    #[test]
+    fn test_refresh_lock_owner_rewrites_lock_with_current_pid() {
+        let dir = temp_dir();
+        let lock_file = dir.join("lock");
+        // Simulate an old lock from another PID
+        fs::write(&lock_file, "99999\n1000\n").unwrap();
+        let lock = refresh_lock_owner(&lock_file).unwrap();
+        drop(lock);
+
+        let content = fs::read_to_string(&lock_file).unwrap();
+        let first_line = content.lines().next().unwrap();
+        let pid: u32 = first_line.parse().unwrap();
+        // The refresh must have written our PID, not the old one
+        assert_eq!(pid, std::process::id());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_read_batch_paths_handles_partial_write_rename() {
+        let dir = temp_dir();
+        let path1 = PathBuf::from(r"C:\Users\example\file1.txt");
+        let path2 = PathBuf::from(r"C:\Users\example\file2.txt");
+
+        write_batch_paths(&dir, &[path1.clone(), path2.clone()]).unwrap();
+        let paths = read_batch_paths(&dir);
+        assert_eq!(paths, vec![path1, path2]);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_refresh_lock_owner_truncates_old_tick_lines() {
+        let dir = temp_dir();
+        let lock_file = dir.join("lock");
+        fs::write(&lock_file, "11111\n100\n").unwrap();
+
+        // Open and add tick lines
+        let mut lock = OpenOptions::new().append(true).open(&lock_file).unwrap();
+        writeln!(lock, "tick:200").unwrap();
+        writeln!(lock, "tick:300").unwrap();
+        lock.flush().unwrap();
+        drop(lock);
+
+        // Now refresh — should truncate to just PID + nanos
+        let lock = refresh_lock_owner(&lock_file).unwrap();
+        drop(lock);
+
+        let content = fs::read_to_string(&lock_file).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 2, "should have exactly PID + nanos lines");
+        assert!(
+            !lines[0].starts_with("tick:"),
+            "no tick lines after refresh"
+        );
+        let pid: u32 = lines[0].parse().unwrap();
+        assert_eq!(pid, std::process::id());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
