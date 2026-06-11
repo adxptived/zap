@@ -210,8 +210,13 @@ pub(crate) fn scan_into_channel(
                 "cancelled by user",
             ));
         }
-        let entry: jwalk::DirEntry<((), ())> =
-            res.map_err(|e: jwalk::Error| io::Error::other(e.to_string()))?;
+        // An unreadable entry (permissions, vanished mid-walk) must not abort
+        // the whole run: skip it. If it matters, the parent directory removal
+        // will fail later and be reported in the failure summary.
+        let entry: jwalk::DirEntry<((), ())> = match res {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
         let p = entry.path();
         let ft = entry.file_type();
         let cached_meta = collect_metadata.then(|| entry.metadata().ok()).flatten();
@@ -400,8 +405,12 @@ fn walk_entries_with(
                 "cancelled by user",
             ));
         }
-        let entry: jwalk::DirEntry<((), ())> =
-            res.map_err(|err: jwalk::Error| io::Error::other(err.to_string()))?;
+        // Skip unreadable entries instead of aborting the scan (see
+        // scan_into_channel for rationale).
+        let entry: jwalk::DirEntry<((), ())> = match res {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
         let p = entry.path();
         let ft = entry.file_type();
         let cached_meta = collect_metadata.then(|| entry.metadata().ok()).flatten();

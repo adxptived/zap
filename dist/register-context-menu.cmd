@@ -55,6 +55,15 @@ if errorlevel 1 exit /b 1
 reg add "%ROOT%\shell\delete-dialog\command" /f /ve /t REG_SZ /d "\"%ZAPG_EXE%\" --batch \"%TARGET%\"" >nul
 if errorlevel 1 exit /b 1
 
+reg add "%ROOT%\shell\recycle" /f /v "MUIVerb" /t REG_SZ /d "Move to Recycle Bin" >nul
+if errorlevel 1 exit /b 1
+reg add "%ROOT%\shell\recycle" /f /v "MultiSelectModel" /t REG_SZ /d "Document" >nul
+if errorlevel 1 exit /b 1
+reg add "%ROOT%\shell\recycle" /f /v "Icon" /t REG_SZ /d "\"%ICON%\"" >nul
+if errorlevel 1 exit /b 1
+reg add "%ROOT%\shell\recycle\command" /f /ve /t REG_SZ /d "\"%ZAPW_EXE%\" --batch --silent --yes --recycle \"%TARGET%\"" >nul
+if errorlevel 1 exit /b 1
+
 reg add "%ROOT%\shell\zap-delete" /f /v "MUIVerb" /t REG_SZ /d "Zap Delete" >nul
 if errorlevel 1 exit /b 1
 reg add "%ROOT%\shell\zap-delete" /f /v "MultiSelectModel" /t REG_SZ /d "Document" >nul

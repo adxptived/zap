@@ -1,45 +1,88 @@
-# Zap v1.1.0 Changelog
+# Аудит и код-ревью zap v1.3.0
 
-## Bug Fixes
-- **O(n/chunk_size) performance degradation** — removed MAX_PARALLEL_DELETES chunking, all paths dispatch in single rayon::scope
-- **Follower process linger** — followers now exit immediately via process::exit(0)
-- **zapg lock held entire GUI lifetime** — lock released in finalize_batch_session, process-alive stale check added
-- **Triple code duplication** — batch infrastructure extracted to src/batch.rs with unified lock files
-- **Busy repaint during recalculation** — explicit total_size_calculating flag
-- **Unicode path corruption** — hex-encode batch paths via as_encoded_bytes
-- **Double symlink_metadata** — single call reused in remove_dir_with_retry permission check
-- **Batch leader silent mode** — console now always allocated for dangerous-path errors
-- **Dead dependency** — rfd removed from Cargo.toml
+Дата: 2026-06-11. Объём: все модули (`src/`, 3 бинарника, dist-скрипты), ~6 700 строк Rust.
+Методика: ручное ревью каждого модуля + статический анализ (clippy, 0 предупреждений) + 101 тест + проверка компиляции под Linux и `x86_64-pc-windows-gnu`.
 
-## Performance Improvements
-- **is_readonly guard** — skips set_writable (3 syscalls) for files locked by other processes
-- **PROGRESS_CHUNK_SIZE 1024→16384** — fewer rayon tasks, less Mutex contention
-- **scan progress bar** — only allocates local_bar when no external_bar provided
-- **batch state count-only** — removed useless file-size syscalls
+## Итог
 
-## New Features
-- **Graceful Ctrl+C** — stop.rs module, ctrlc handler, checked in deletion loops
-- **--dry-run default** — auto-enables when --yes/--force absent, shows sizes + interactive confirm
-- **Self-deletion guard** — refuses to delete the running executable
-- **Colored timing** — green <5s, yellow <30s, red >30s
-- **Error log** — failed paths written to %TEMP%\zap-errors.log
-- **Size display** — dir_size_recursive in dry-run preview and GUI
-- **has_dangerous_paths warning** — extra confirmation checkbox in zapg GUI
-- **--batch hidden from help** — no longer listed in public usage
+Проект в хорошем состоянии: продуманная защита системных путей, корректная
+batch-координация между процессами Explorer, аккуратный FFI. В ходе аудита
+найдено и **исправлено 4 проблемы** (1 высокой, 2 средней, 1 низкой
+важности) и зафиксировано 3 рекомендации без изменения кода.
 
-## Code Quality
-- **to_delete_options() factory** — single option-builder on CliOptions
-- **path_utils.rs** — shared progress_name/compact_path
-- **size.rs** — shared dir_size_recursive/format_size
-- **Atomic write_batch_paths** — .tmp rename to avoid partial reads
-- **Atomic touch_lock** — append semantics, no truncation window
-- **batch_state count-only** — streamlined wait_for_batch_quiet
-- **Preallocated errors Vec** — Vec::with_capacity in run_delete_parallel
-- **inline scan_entries** — removed dead one-liner wrapper
-- **print_help updated** — explains default dry-run behavior
-- **read_batch_paths** — explicit error handling instead of unwrap_or_default
+---
 
-## Audit
-- Full codebase audit: 7 bugs, 3 security notes, 3 dead code, 3 perf, 4 style, 4 edge cases
-- All critical findings resolved
-- 54 tests pass, clippy clean
+## Исправлено в ходе аудита
+
+### [HIGH] `--recycle --only-empty` отправлял в корзину НЕпустую папку
+`delete_path` обрабатывал recycle-ветку до проверки `only_empty`: флаг
+молча игнорировался, и вся папка с содержимым уезжала в корзину.
+**Фикс:** флаги объявлены взаимоисключающими с понятной ошибкой (у пустой
+папки нет содержимого, которое имело бы смысл восстанавливать). + тест.
+
+### [MEDIUM] `--recycle` молча игнорировал фильтры
+`--include/--exclude/--min-size/--newer-than/--older-than` не действовали в
+режиме корзины: пользователь мог думать, что в корзину уходят только
+`*.log`, а перемещалось всё дерево целиком.
+**Фикс:** комбинация отклоняется с явной ошибкой («recycle всегда переносит
+элемент целиком»). + тест.
+
+### [MEDIUM] Один нечитаемый файл прерывал всю операцию
+В обоих сканерах (`scan_into_channel`, `scan_directory_plan_inner`) ошибка
+чтения одной записи (access denied, файл исчез во время сканирования)
+прерывала весь прогон через `?`. На больших деревьях с одной проблемной
+подпапкой это останавливало удаление целиком.
+**Фикс:** запись пропускается, обход продолжается; реальная проблема всё
+равно всплывёт в итоговом отчёте об ошибках (родительская папка не удалится).
+
+### [LOW] Подтверждение «Delete permanently?» при `--recycle`
+Интерактивный промпт пугал необратимым удалением, хотя операция обратима.
+**Фикс:** при `--recycle` промпт теперь «Move to Recycle Bin? [y/N]».
+
+---
+
+## Рекомендации (без изменения кода)
+
+### [INFO] Ограничения `--shred` задокументированы
+Перезапись содержимого не уничтожает: имя файла в MFT (нет rename-проходов),
+alternate data streams NTFS, копии в снапшотах, а на SSD wear-leveling делает
+перезапись best-effort. Добавлено примечание в README. Для параноидального
+режима стоит добавить rename-проход + усечение до 0.
+
+### [LOW] Предсказуемые имена batch-координации в %TEMP%
+`zap-batch.lock` / `zap-batch-paths.d` — процесс того же пользователя может
+подбросить пути в активное окно batch-удаления (zapw работает с `--yes
+--silent`). Граница доверия — один пользователь (такой процесс и сам может
+удалять файлы), поэтому severity низкий. Усиление: случайный per-batch
+подкаталог + проверка владельца.
+
+### [PERF] Recycle по одному вызову на элемент
+N выделенных элементов = N вызовов `SHFileOperationW`. Один вызов со списком
+путей (double-null-terminated) быстрее и даёт одно «Отменить» в Explorer.
+
+---
+
+## Что проверено и признано надёжным
+
+- **Защита системных путей** (`protect.rs`): SystemRoot / Program Files /
+  ProgramData / Users (со спец-логикой профилей) / SVI / Recovery; сравнение
+  ASCII-case-insensitive корректно для этих путей; `\\?\`-префикс
+  канонизации срезается перед сравнением; отказ от корней дисков через
+  `canonical.parent().is_none()`; guard от самоудаления бинарника.
+- **Batch-координация** (`batch.rs`): лок через `create_new` (атомарно),
+  PID + mtime-проверка устаревших локов, hex-кодирование путей
+  (Unicode-safe), tick-обновления лока с усечением.
+- **FFI** (`winapi.rs`, `recycle.rs`): корректные сигнатуры, обработка
+  `INVALID_HANDLE_VALUE`/`GetLastError`, POSIX-семантика удаления
+  (Win10 1709+) как last-resort fallback, `FOF_ALLOWUNDO|FOF_NOCONFIRMATION`
+  для корзины, закрытие хэндлов во всех ветках.
+- **Конвейер удаления** (`delete.rs`): scan и delete перекрываются
+  (`par_bridge`), удаление каталогов строго от глубоких к мелким,
+  retry-цепочка readonly → transient-lock (10/50 мс) → force-delete,
+  Ctrl-C проверяется между батчами, отчёт об ошибках ограничен 20 записями
+  с хинтом.
+- **GUI** (`zapg`): обнаружение смерти воркера (нет вечного спиннера),
+  однопроходный сбор treemap-данных без двойного счёта, лимит 150 элементов
+  раскладки, координатор-выборы для мультивыбора Explorer.
+- **Тесты:** 101 проходит, clippy 0 предупреждений, сборка Linux +
+  windows-gnu чистая.

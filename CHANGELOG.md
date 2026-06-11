@@ -2,6 +2,123 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Added
+
+- **Stop button in the GUI** — the Cancel button becomes a working *Stop*
+  during a run: it raises the graceful-stop flag, the in-flight item aborts
+  and everything not yet started is marked "cancelled by user".
+- **Drag & drop in the GUI** — drop files/folders onto the zapg window to
+  add them to the list (with a drop-hint overlay); duplicates are skipped
+  and the size badge / system-folder warning refresh automatically.
+- **Humane age filters** — `--newer-than` / `--older-than` now accept ages
+  like `12h`, `30d`, `90min` in addition to RFC 3339 timestamps.
+
+- **GitHub Actions CI** (`.github/workflows/ci.yml`): fmt + clippy (deny
+  warnings) + tests on Linux and Windows + release build with uploaded
+  Windows binaries on every push/PR.
+- **Shred in the GUI** — new "Shred (overwrite data, unrecoverable)"
+  checkbox in zapg; mutually exclusive with Recycle Bin mode, with its own
+  button color-independent label and warning hint.
+- **Taskbar progress (Windows)** — the zapg taskbar button now mirrors run
+  progress via `ITaskbarList3` (green fill while running, red on failures),
+  implemented with raw COM FFI, no new dependencies.
+
+### Changed
+
+- **Batched Recycle Bin moves** — recycling several items now issues a
+  *single* `SHFileOperationW` call (one shell roundtrip, one Explorer
+  "Undo" entry) in zap, zapw and the batch context-menu flow.
+
+### Fixed
+
+- Recycle Bin moves now always pass absolute paths to the shell and reject
+  paths beyond the shell's `MAX_PATH` limit with a clear error instead of a
+  cryptic shell code.
+
+- **Critical:** zapw (the windowless context-menu worker) dropped the
+  `--recycle`, `--shred`, `--only-empty` and filter flags by constructing
+  `DeleteOptions` manually — the "Move to Recycle Bin" context-menu entry
+  deleted permanently. Now built via `to_delete_options` + regression test.
+
+## [1.3.0] - 2026-06-12
+
+Correctness and refactor release — pipeline fixes, safer flags, GUI cleanup.
+
+### Fixed
+
+- **Scan + delete pipeline restored**: file batches were collected into a
+  vector and only deleted after the full scan finished, silently disabling
+  the 1.2.0 pipeline overlap. Batches are now processed as they arrive via
+  `par_bridge`, so deletion overlaps scanning again.
+- **`--only-empty` race**: emptiness was checked with a separate read before
+  deleting, which raced with concurrent file creation. Now relies on atomic
+  `remove_dir` semantics (`DirectoryNotEmpty` → skip), and non-empty
+  directories are reported instead of failing the run.
+- **Top-level file roots now respect filters**: passing a file directly with
+  `--include`/`--exclude`/`--min-size`/date filters previously deleted it
+  unconditionally; filters are now applied.
+- **`--shred` durability**: each overwrite pass now calls `sync_data` so
+  passes actually reach the disk instead of being coalesced by the OS cache.
+- **Ctrl-C responsiveness**: the stop flag is now honored between file
+  batches, directory batches, and before the final root removal; cancelled
+  runs report "Cancelled" instead of finishing silently.
+- **Treemap layout**: row orientation no longer disagrees with the
+  remaining-bounds bookkeeping (rectangles could overlap or leave gaps);
+  layout is iterative (no stack overflow on huge trees) and capped at the
+  150 largest entries.
+- **Treemap sizes double-counted**: the GUI summed every directory *and* the
+  files inside it; it now uses each root's immediate children, so the total
+  matches the real selection size.
+- Tests that assert Windows protected paths are now gated to Windows
+  instead of failing on other platforms.
+
+### Added
+
+- **Recycle Bin integration in Explorer and GUI**: new "Move to Recycle Bin"
+  context-menu entry (windowless, instant, recoverable) and a
+  "Move to Recycle Bin" checkbox in the `zapg` confirmation dialog (amber
+  *Recycle* button, adjusted hints).
+- `--min-size` accepts human-readable sizes: `10k`, `5mb`, `1.5g`, `2tb`
+  (binary multiples), in addition to plain bytes.
+- `--` end-of-flags separator for deleting paths that start with `-`.
+- Unknown short flags are rejected with a hint instead of being treated as
+  paths to delete.
+- `--shred` and `--recycle` are now mutually exclusive (previously shredded
+  files were *not* recycled despite the flag).
+- GUI: scrollable per-item status list for multi-select runs, with per-path
+  success/failure indicators.
+- GUI: per-rectangle colors in the disk-usage treemap.
+
+### Stability
+
+- One unreadable entry (access denied, file vanished mid-scan) no longer
+  aborts the whole scan+delete run — it is skipped and any real failure is
+  reported via the failure summary.
+- `--recycle` is now rejected when combined with `--only-empty` or with
+  filters: previously `--only-empty`/filters were silently ignored and the
+  *entire* item was moved to the Recycle Bin.
+- Interactive confirmation now says "Move to Recycle Bin?" instead of
+  "Delete permanently?" when `--recycle` is active.
+
+- GUI no longer hangs forever if the delete worker thread dies unexpectedly —
+  remaining items are marked failed and the dialog finishes.
+- Transient file locks (antivirus/indexer) are retried briefly (10/50 ms)
+  before falling back to force-delete, so fewer spurious failures.
+
+### Internal
+
+- `zapg` god-object split into `main.rs` / `app.rs` / `ui.rs` modules.
+- Deduplicated read-only-retry logic in `delete.rs`; `only_empty` no longer
+  threads through every pipeline function signature.
+- `CliOptions` derives `Clone`; option rebuilding boilerplate removed in
+  `main.rs` and `zapw.rs`.
+- GUI preview size calculation parallelised; treemap data no longer cloned
+  every frame.
+- 20+ new unit tests (parser, treemap geometry, only-empty/filter edge
+  cases, treemap data collection); suite: 98 tests, clippy-clean.
+
 ## [1.2.0] - 2026-05-25
 
 Performance release — parallel scan, pipeline delete, and adaptive parallelism.

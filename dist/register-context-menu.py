@@ -112,6 +112,13 @@ def register_context_menu(menu_root, target_placeholder):
     )
     add_menu_item(
         menu_root,
+        "recycle",
+        "Move to Recycle Bin",
+        f'"{ZAPW_PATH}" --batch --silent --yes --recycle "{target_placeholder}"',
+        f'"{ICON_PATH}"',
+    )
+    add_menu_item(
+        menu_root,
         "zap-delete",
         "Zap Delete",
         f'"{ZAPW_PATH}" --batch --silent --yes "{target_placeholder}"',

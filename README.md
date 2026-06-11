@@ -25,8 +25,8 @@ then pick the safe GUI confirmation flow or the silent immediate-delete action.
 - **Safety guards** — filesystem roots are refused, protected paths are blocked, and symlinks/junctions are never traversed.
 - **Read-only recovery** — read-only attributes are cleared and deletion is retried when possible.
 - **Filter support** — glob pattern filtering, size filtering, and date-based filtering.
-- **Secure deletion** — overwrite files with random data before removing (`--shred`).
-- **Recycle Bin** — send to Recycle Bin instead of permanent delete (`--recycle`).
+- **Secure deletion** — overwrite files with random data before removing (`--shred`), also available as a checkbox in the GUI.
+- **Recycle Bin** — send to Recycle Bin instead of permanent delete (`--recycle`). Multiple items are moved with a single shell call — one Explorer "Undo" restores everything.
 
 ## Installation
 
@@ -84,14 +84,15 @@ zap --version
 | `--threads N`, `-j N` | Override the Rayon worker thread count. |
 | `--silent` | Suppress progress output. Used by `zapw.exe`. |
 | `--batch` | Internal Explorer multi-select coordination flag. |
-| `--shred` | Overwrite files with random data before deleting (3 passes). |
+| `--shred` | Overwrite files with random data before deleting (3 passes). Note: file names/MFT records are not wiped, and on SSDs wear-leveling means overwrites are best-effort. |
 | `--only-empty` | Only delete if the directory is empty. |
-| `--recycle` | Send to Recycle Bin instead of permanent delete. |
+| `--recycle` | Send to Recycle Bin instead of permanent delete (also a checkbox in the GUI dialog and an Explorer context-menu entry). Batched: one shell call / one Undo for the whole selection. |
 | `--include GLOB` | Only delete paths matching glob pattern (repeatable). |
 | `--exclude GLOB` | Skip paths matching glob pattern (repeatable). |
-| `--min-size BYTES` | Only delete files larger than BYTES. |
-| `--newer-than RFC3339` | Only delete files newer than date/time. |
-| `--older-than RFC3339` | Only delete files older than date/time. |
+| `--min-size SIZE` | Only delete files larger than SIZE (bytes, or `10k`, `5mb`, `1.5g`, `2tb`). |
+| `--newer-than WHEN` | Only delete files newer than a date/time (RFC 3339) or age (e.g. `12h`, `30d`). |
+| `--older-than WHEN` | Only delete files older than a date/time (RFC 3339) or age (e.g. `12h`, `30d`). |
+| `--` | Treat every following argument as a path (for names starting with `-`). |
 
 Examples:
 
@@ -100,7 +101,8 @@ zap --dry-run "C:\temp\build-output"
 zap --yes "C:\temp\build-output"
 zap --yes --threads 4 "C:\temp\huge-repo"
 zap --yes --shred "C:\temp\secret-files"
-zap --yes --exclude "*.log" --min-size 1048576 "C:\temp\project"
+zap --yes --exclude "*.log" --min-size 10mb "C:\temp\project"
+zap --yes -- "-weird-folder-name"
 ```
 
 ## Safety Model
@@ -192,7 +194,10 @@ src/
   treemap.rs               Treemap visualization for GUI
   winapi.rs                Windows API helpers
   bin/
-    zapg.rs                Explorer GUI confirmation dialog
+    zapg/                  Explorer GUI confirmation dialog
+      main.rs              Entry point, args, batch coordinator election
+      app.rs               Dialog state and background workers
+      ui.rs                Theme and rendering
     zapw.rs                Windowless immediate-delete binary
 
 assets/

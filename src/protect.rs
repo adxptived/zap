@@ -190,6 +190,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)] // exercises Windows drive paths; is_protected_path is a no-op elsewhere
     fn test_is_filesystem_root_detects_root() {
         let root = Path::new("C:\\");
         assert!(is_filesystem_root(root).unwrap());
@@ -227,6 +228,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)] // exercises Windows drive paths; is_protected_path is a no-op elsewhere
     fn test_is_protected_path_windows_dirs() {
         assert!(is_protected_path(Path::new(r"C:\Windows")));
         assert!(is_protected_path(Path::new(r"C:\Program Files")));
@@ -234,6 +236,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)] // exercises Windows drive paths; is_protected_path is a no-op elsewhere
     fn test_is_protected_path_blocks_user_profile_dirs() {
         assert!(is_protected_path(Path::new(r"C:\Users\test\AppData")));
         assert!(is_protected_path(Path::new(r"C:\Users\test\AppData\Local")));
@@ -281,6 +284,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)] // exercises Windows drive paths; is_protected_path is a no-op elsewhere
     fn test_is_protected_path_blocks_users_root() {
         assert!(is_protected_path(Path::new(r"C:\Users")));
     }
@@ -293,6 +297,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)] // exercises Windows drive paths; is_protected_path is a no-op elsewhere
     fn test_delete_path_refuses_protected_path() {
         let canonical = PathBuf::from(r"C:\Windows");
         assert!(is_protected_path(&canonical));

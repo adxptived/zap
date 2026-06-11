@@ -10,7 +10,7 @@ use std::{
 };
 
 use indicatif::{ProgressBar, ProgressStyle};
-use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+use rayon::iter::{ParallelBridge, ParallelIterator};
 use rayon::slice::ParallelSlice;
 
 use crate::filter::FilterConfig;
@@ -104,6 +104,37 @@ fn try_force_delete(path: &Path, original: io::Error) -> io::Result<()> {
     Err(original)
 }
 
+/// Shared recovery path for `PermissionDenied` failures: clear the
+/// read-only attribute and retry `op`, then fall back to the Win32
+/// force-delete. Any other error kind is returned unchanged.
+fn retry_after_clearing_readonly(
+    path: &Path,
+    original: io::Error,
+    op: impl Fn(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    if original.kind() != io::ErrorKind::PermissionDenied {
+        return Err(original);
+    }
+    let meta = std::fs::symlink_metadata(path).ok();
+    if meta.as_ref().is_some_and(|m| m.permissions().readonly()) {
+        let mut perms = meta.unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        if std::fs::set_permissions(path, perms).is_ok() && op(path).is_ok() {
+            return Ok(());
+        }
+    }
+    // Transient locks (antivirus scanners, indexers) usually clear within
+    // milliseconds — retry briefly before the expensive force-delete fallback.
+    for delay_ms in [10u64, 50] {
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        if op(path).is_ok() {
+            return Ok(());
+        }
+    }
+    try_force_delete(path, original)
+}
+
 pub fn remove_file_with_retry(path: &Path) -> io::Result<()> {
     #[cfg(test)]
     if TEST_REMOVE_FILE_FAILURE
@@ -120,42 +151,14 @@ pub fn remove_file_with_retry(path: &Path) -> io::Result<()> {
 
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
-        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
-            let meta = std::fs::symlink_metadata(path).ok();
-            if meta.as_ref().is_some_and(|m| m.permissions().readonly()) {
-                let mut perms = meta.unwrap().permissions();
-                #[allow(clippy::permissions_set_readonly_false)]
-                perms.set_readonly(false);
-                if std::fs::set_permissions(path, perms).is_ok() {
-                    if let Ok(()) = std::fs::remove_file(path) {
-                        return Ok(());
-                    }
-                }
-            }
-            try_force_delete(path, e)
-        }
-        Err(e) => Err(e),
+        Err(e) => retry_after_clearing_readonly(path, e, |p| std::fs::remove_file(p)),
     }
 }
 
 pub fn remove_dir_with_retry(path: &Path) -> io::Result<()> {
     match std::fs::remove_dir(path) {
         Ok(()) => Ok(()),
-        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
-            let meta = std::fs::symlink_metadata(path).ok();
-            if meta.as_ref().is_some_and(|m| m.permissions().readonly()) {
-                let mut perms = meta.unwrap().permissions();
-                #[allow(clippy::permissions_set_readonly_false)]
-                perms.set_readonly(false);
-                if std::fs::set_permissions(path, perms).is_ok() {
-                    if let Ok(()) = std::fs::remove_dir(path) {
-                        return Ok(());
-                    }
-                }
-            }
-            try_force_delete(path, e)
-        }
-        Err(e) => Err(e),
+        Err(e) => retry_after_clearing_readonly(path, e, |p| std::fs::remove_dir(p)),
     }
 }
 
@@ -178,19 +181,7 @@ pub fn delete_symlink(path: &Path) -> io::Result<()> {
 
     match remove_either(path) {
         Ok(()) => Ok(()),
-        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
-            let meta = std::fs::symlink_metadata(path).ok();
-            if meta.as_ref().is_some_and(|m| m.permissions().readonly()) {
-                let mut perms = meta.unwrap().permissions();
-                #[allow(clippy::permissions_set_readonly_false)]
-                perms.set_readonly(false);
-                if std::fs::set_permissions(path, perms).is_ok() && remove_either(path).is_ok() {
-                    return Ok(());
-                }
-            }
-            try_force_delete(path, e)
-        }
-        Err(e) => Err(e),
+        Err(e) => retry_after_clearing_readonly(path, e, remove_either),
     }
 }
 
@@ -222,6 +213,10 @@ fn process_file_batch(
     failures: &Mutex<Vec<DeletionFailure>>,
     bar: Option<&ProgressBar>,
 ) {
+    // Honour Ctrl+C between batches so huge deletions stop promptly.
+    if crate::stop::is_stop_requested() {
+        return;
+    }
     for entry in chunk {
         if let Err(err) = delete_entry(entry, shred) {
             error_count.fetch_add(1, Ordering::Relaxed);
@@ -240,8 +235,14 @@ fn delete_dir_batches(
     bar: Option<&ProgressBar>,
 ) {
     for batch in batches {
+        if crate::stop::is_stop_requested() {
+            return;
+        }
         let cs = chunk_size(batch.entries.len().max(1));
         batch.entries.par_chunks(cs).for_each(|chunk| {
+            if crate::stop::is_stop_requested() {
+                return;
+            }
             for entry in chunk {
                 if let Err(err) = remove_dir_with_retry(&entry.path) {
                     error_count.fetch_add(1, Ordering::Relaxed);
@@ -269,6 +270,16 @@ fn finalize(
         return Err(io::Error::other(failure_summary(total_errors, &failures)));
     }
 
+    if crate::stop::is_stop_requested() {
+        if let Some(ref b) = bar {
+            b.finish_with_message("Cancelled");
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "cancelled by user",
+        ));
+    }
+
     match remove_dir_with_retry(root) {
         Ok(()) => {
             if let Some(ref b) = bar {
@@ -294,12 +305,7 @@ fn finalize(
 // Pipeline delete (no filter active)
 // ---------------------------------------------------------------------------
 
-fn delete_directory_pipeline(
-    path: &Path,
-    bar: Option<ProgressBar>,
-    shred: bool,
-    only_empty: bool,
-) -> io::Result<()> {
+fn delete_directory_pipeline(path: &Path, bar: Option<ProgressBar>, shred: bool) -> io::Result<()> {
     // Bounded channel from scan-thread to consumer-thread.
     // Capacity = num_threads * 4 so backpressure kicks in before memory bloats.
     let queue_cap = (rayon::current_num_threads() * 4).max(64);
@@ -338,27 +344,19 @@ fn delete_directory_pipeline(
     let file_errors = AtomicU64::new(0);
     let failures = Mutex::new(Vec::<DeletionFailure>::new());
 
-    // Collect all batches first (consumer is fast — pure memcpy),
-    // then process them in parallel so all rayon threads are fully utilised.
-    let all_batches: Vec<Vec<ScannedEntry>> = batch_rx.iter().collect();
-    consumer_thread.join().ok();
-
-    all_batches.par_iter().for_each(|batch| {
-        process_file_batch(batch, shred, &file_errors, &failures, bar.as_ref());
+    // Stream batches into the rayon pool as they arrive so file deletion
+    // overlaps with the scan (true pipelining). `par_bridge` keeps all
+    // workers busy while the scan thread is still producing entries.
+    batch_rx.into_iter().par_bridge().for_each(|batch| {
+        // Files are deleted while the scan bar is still active, so don't
+        // touch the bar here — its position tracks scanned entries.
+        process_file_batch(&batch, shred, &file_errors, &failures, None);
     });
+    consumer_thread.join().ok();
 
     let scan_result = scan_thread
         .join()
         .map_err(|_| io::Error::other("scan thread panicked"))??;
-
-    if only_empty
-        && (scan_result.stats.files + scan_result.stats.symlinks + scan_result.stats.dirs) > 0
-    {
-        if let Some(ref b) = bar {
-            b.finish_with_message("Skipped - directory is not empty");
-        }
-        return Ok(());
-    }
 
     if let Some(ref b) = bar {
         b.set_style(
@@ -397,7 +395,6 @@ fn delete_directory_filtered(
     bar: Option<ProgressBar>,
     filter: &FilterConfig,
     shred: bool,
-    only_empty: bool,
 ) -> io::Result<()> {
     let plan = if let Some(ref b) = bar {
         scan_directory_plan_with_bar_for_filter(path, b, filter)?
@@ -405,13 +402,6 @@ fn delete_directory_filtered(
         scan_directory_plan_for_filter(path, filter)?
     };
     let plan = plan.apply_filter(path, filter);
-
-    if only_empty && plan.stats.total_deletable() > 0 {
-        if let Some(ref b) = bar {
-            b.finish_with_message("Skipped - directory is not empty");
-        }
-        return Ok(());
-    }
 
     if let Some(ref b) = bar {
         b.set_style(
@@ -458,7 +448,6 @@ fn delete_directory_pool_inner(
     external_bar: Option<ProgressBar>,
     filter: &FilterConfig,
     shred: bool,
-    only_empty: bool,
 ) -> io::Result<()> {
     let bar: Option<ProgressBar> = if silent {
         None
@@ -477,25 +466,14 @@ fn delete_directory_pool_inner(
         Some(b)
     };
 
-    if only_empty {
-        if let Ok(mut rd) = std::fs::read_dir(path) {
-            if rd.next().is_some() {
-                if let Some(ref b) = bar {
-                    b.finish_with_message("Skipped - directory is not empty");
-                }
-                return Ok(());
-            }
-        }
-    }
-
     if let Some(ref b) = bar {
         b.set_message("Scanning");
     }
 
     if filter.is_empty() {
-        delete_directory_pipeline(path, bar, shred, only_empty)
+        delete_directory_pipeline(path, bar, shred)
     } else {
-        delete_directory_filtered(path, bar, filter, shred, only_empty)
+        delete_directory_filtered(path, bar, filter, shred)
     }
 }
 
@@ -506,31 +484,21 @@ fn delete_directory_inner(
     external_bar: Option<ProgressBar>,
     filter: &FilterConfig,
     shred: bool,
-    only_empty: bool,
 ) -> io::Result<()> {
     if let Some(count) = threads {
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(count)
             .build()
             .map_err(|err| io::Error::other(err.to_string()))?;
-        return pool.install(|| {
-            delete_directory_pool_inner(path, silent, external_bar, filter, shred, only_empty)
-        });
+        return pool
+            .install(|| delete_directory_pool_inner(path, silent, external_bar, filter, shred));
     }
-    delete_directory_pool_inner(path, silent, external_bar, filter, shred, only_empty)
+    delete_directory_pool_inner(path, silent, external_bar, filter, shred)
 }
 
 #[cfg(test)]
 pub fn delete_directory(path: &Path, threads: Option<usize>) -> io::Result<()> {
-    delete_directory_inner(
-        path,
-        threads,
-        false,
-        None,
-        &FilterConfig::default(),
-        false,
-        false,
-    )
+    delete_directory_inner(path, threads, false, None, &FilterConfig::default(), false)
 }
 
 // ---------------------------------------------------------------------------
@@ -587,6 +555,85 @@ impl DeleteOptions {
 // ---------------------------------------------------------------------------
 // Public entry points
 // ---------------------------------------------------------------------------
+
+/// Move several top-level paths to the Recycle Bin in a single shell call.
+///
+/// Each path goes through the same validation as `delete_path` (symlinks are
+/// unlinked directly, filesystem roots and protected paths are refused).
+/// Valid paths are then recycled with one `SHFileOperationW` call so Explorer
+/// shows a single "Undo" entry. If the batched call fails, falls back to
+/// per-path recycling so errors are attributed to the right path.
+#[cfg(windows)]
+pub fn recycle_paths_validated(
+    paths: &[std::path::PathBuf],
+    allow_dangerous: bool,
+) -> Vec<(std::path::PathBuf, io::Error)> {
+    let mut errors: Vec<(std::path::PathBuf, io::Error)> = Vec::new();
+    let mut to_recycle: Vec<&std::path::PathBuf> = Vec::with_capacity(paths.len());
+
+    for path in paths {
+        let metadata = match std::fs::symlink_metadata(path) {
+            Ok(m) => m,
+            Err(err) => {
+                errors.push((path.clone(), err));
+                continue;
+            }
+        };
+        if metadata.file_type().is_symlink() {
+            if let Err(err) = delete_symlink(path) {
+                errors.push((path.clone(), err));
+            }
+            continue;
+        }
+        let canonical = match sanitize_path(path) {
+            Ok(c) => c,
+            Err(err) => {
+                errors.push((path.clone(), err));
+                continue;
+            }
+        };
+        if canonical.parent().is_none() {
+            errors.push((
+                path.clone(),
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("refusing to delete filesystem root: {}", path.display()),
+                ),
+            ));
+            continue;
+        }
+        if is_protected_path(&canonical) && !allow_dangerous {
+            errors.push((
+                path.clone(),
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "refusing to delete dangerous path without extra confirmation: {}",
+                        path.display()
+                    ),
+                ),
+            ));
+            continue;
+        }
+        to_recycle.push(path);
+    }
+
+    if to_recycle.is_empty() {
+        return errors;
+    }
+
+    if crate::recycle::recycle_paths(&to_recycle).is_err() {
+        // Batched call failed: retry one-by-one so each error lands on the
+        // correct path instead of blaming the whole batch.
+        for path in to_recycle {
+            if let Err(err) = crate::recycle::recycle_path(path) {
+                errors.push((path.clone(), err));
+            }
+        }
+    }
+
+    errors
+}
 
 pub fn delete_path(path: &Path, opts: DeleteOptions) -> io::Result<()> {
     if opts.only_empty && !path.is_dir() {
@@ -650,6 +697,28 @@ fn delete_path_inner(path: &Path, opts: DeleteOptions) -> io::Result<()> {
     }
 
     if metadata.is_dir() {
+        if opts.only_empty {
+            // Use `remove_dir` semantics: it only succeeds on empty
+            // directories, atomically. Checking emptiness separately and
+            // then deleting would race with concurrent file creation.
+            return match remove_dir_with_retry(path) {
+                Ok(()) => {
+                    if let Some(ref b) = opts.bar {
+                        b.finish_with_message("Deleted");
+                    }
+                    Ok(())
+                }
+                Err(e) if e.kind() == io::ErrorKind::DirectoryNotEmpty => {
+                    if let Some(ref b) = opts.bar {
+                        b.finish_with_message("Skipped - directory is not empty");
+                    } else if !opts.silent {
+                        eprintln!("Skipping non-empty directory: {}", path.display());
+                    }
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            };
+        }
         delete_directory_inner(
             path,
             opts.threads,
@@ -657,9 +726,28 @@ fn delete_path_inner(path: &Path, opts: DeleteOptions) -> io::Result<()> {
             opts.bar,
             &opts.filter,
             opts.shred,
-            opts.only_empty,
         )
     } else if metadata.is_file() {
+        // Top-level file roots must respect --include/--exclude/--min-size
+        // filters just like files found inside directory roots.
+        if !opts.filter.is_empty() {
+            let base = path.parent().unwrap_or_else(|| Path::new(""));
+            let matches = opts.filter.matches_relative(
+                path,
+                base,
+                true,
+                Some(metadata.len()),
+                metadata.modified().ok(),
+            );
+            if !matches {
+                if let Some(ref b) = opts.bar {
+                    b.finish_with_message("Skipped - excluded by filter");
+                } else if !opts.silent {
+                    eprintln!("Skipping (excluded by filter): {}", path.display());
+                }
+                return Ok(());
+            }
+        }
         if opts.shred {
             crate::shred::shred_file(path, 3)
         } else {
@@ -1008,5 +1096,57 @@ mod tests {
         assert!(!empty.exists());
         assert!(base.exists());
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_only_empty_removes_empty_dir_via_delete_path() {
+        let temp = create_test_dir();
+        let empty = temp.join("empty");
+        fs::create_dir(&empty).unwrap();
+        delete_path(&empty, DeleteOptions::default().only_empty().silent()).unwrap();
+        assert!(!empty.exists());
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_only_empty_keeps_non_empty_dir_and_contents() {
+        let temp = create_test_dir();
+        let dir = temp.join("full");
+        fs::create_dir(&dir).unwrap();
+        let file = dir.join("keep.txt");
+        fs::write(&file, b"data").unwrap();
+        // Must succeed (skip) without touching the directory contents.
+        delete_path(&dir, DeleteOptions::default().only_empty().silent()).unwrap();
+        assert!(dir.exists());
+        assert!(file.exists());
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_top_level_file_skipped_when_filter_excludes_it() {
+        let temp = create_test_dir();
+        let file = temp.join("small.bin");
+        fs::write(&file, vec![0u8; 10]).unwrap();
+        let filter = FilterConfig {
+            min_size: Some(100),
+            ..Default::default()
+        };
+        delete_path(&file, DeleteOptions::default().with_filter(filter).silent()).unwrap();
+        assert!(file.exists(), "file below --min-size must be kept");
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_top_level_file_deleted_when_filter_matches() {
+        let temp = create_test_dir();
+        let file = temp.join("big.bin");
+        fs::write(&file, vec![0u8; 200]).unwrap();
+        let filter = FilterConfig {
+            min_size: Some(100),
+            ..Default::default()
+        };
+        delete_path(&file, DeleteOptions::default().with_filter(filter).silent()).unwrap();
+        assert!(!file.exists(), "file matching --min-size must be deleted");
+        let _ = fs::remove_dir_all(&temp);
     }
 }

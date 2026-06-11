@@ -7,7 +7,7 @@ use owo_colors::{AnsiColors, OwoColorize};
 
 const MAX_THREADS: usize = 1024;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CliOptions {
     pub dry_run: bool,
     pub threads: Option<usize>,
@@ -55,6 +55,43 @@ pub enum CliAction {
     PrintVersion,
 }
 
+/// Parse a byte count that optionally carries a binary unit suffix
+/// (`k`/`kb`, `m`/`mb`, `g`/`gb`, `t`/`tb`, case-insensitive). Plain
+/// integers are interpreted as bytes; fractional values are allowed
+/// with a suffix (e.g. `1.5gb`).
+fn parse_byte_size(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let lower = s.to_ascii_lowercase();
+    let (number, multiplier): (&str, u64) =
+        if let Some(n) = lower.strip_suffix("kb").or_else(|| lower.strip_suffix('k')) {
+            (n, 1024)
+        } else if let Some(n) = lower.strip_suffix("mb").or_else(|| lower.strip_suffix('m')) {
+            (n, 1024 * 1024)
+        } else if let Some(n) = lower.strip_suffix("gb").or_else(|| lower.strip_suffix('g')) {
+            (n, 1024 * 1024 * 1024)
+        } else if let Some(n) = lower.strip_suffix("tb").or_else(|| lower.strip_suffix('t')) {
+            (n, 1024_u64.pow(4))
+        } else {
+            return lower.parse::<u64>().ok();
+        };
+    let number = number.trim();
+    if multiplier == 1 {
+        return number.parse::<u64>().ok();
+    }
+    let value = number.parse::<f64>().ok()?;
+    if !value.is_finite() || value < 0.0 {
+        return None;
+    }
+    let bytes = value * multiplier as f64;
+    if bytes > u64::MAX as f64 {
+        return None;
+    }
+    Some(bytes as u64)
+}
+
 pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> io::Result<CliAction> {
     let mut dry_run = false;
     let mut force = false;
@@ -71,9 +108,15 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> io::Result<CliAct
     let mut newer_than: Option<std::time::SystemTime> = None;
     let mut older_than: Option<std::time::SystemTime> = None;
     let mut iter = args.into_iter();
+    let mut flags_done = false;
 
     while let Some(arg) = iter.next() {
+        if flags_done {
+            paths.push(PathBuf::from(arg));
+            continue;
+        }
         match arg.to_str() {
+            Some("--") => flags_done = true,
             Some("--dry-run") => dry_run = true,
             Some("--batch") => batch = true,
             Some("--silent") => silent = true,
@@ -157,10 +200,10 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> io::Result<CliAct
                         "--min-size must be valid UTF-8",
                     )
                 })?;
-                min_size = Some(s.parse::<u64>().map_err(|_| {
+                min_size = Some(parse_byte_size(s).ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::InvalidInput,
-                        format!("--min-size must be a positive integer, got '{s}'"),
+                        format!("--min-size must be a byte count like 1048576, 512KB, or 1.5GB, got '{s}'"),
                     )
                 })?);
             }
@@ -168,7 +211,7 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> io::Result<CliAct
                 let value = iter.next().ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::InvalidInput,
-                        "--newer-than requires an RFC 3339 date/time",
+                        "--newer-than requires a date/time or age (e.g. 30d)",
                     )
                 })?;
                 let s = value.to_str().ok_or_else(|| {
@@ -177,19 +220,14 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> io::Result<CliAct
                         "--newer-than must be valid UTF-8",
                     )
                 })?;
-                let dt = humantime::parse_rfc3339(s).map_err(|e| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("invalid date/time: {e}"),
-                    )
-                })?;
+                let dt = parse_time_spec(s)?;
                 newer_than = Some(dt);
             }
             Some("--older-than") => {
                 let value = iter.next().ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::InvalidInput,
-                        "--older-than requires an RFC 3339 date/time",
+                        "--older-than requires a date/time or age (e.g. 30d)",
                     )
                 })?;
                 let s = value.to_str().ok_or_else(|| {
@@ -198,19 +236,22 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> io::Result<CliAct
                         "--older-than must be valid UTF-8",
                     )
                 })?;
-                let dt = humantime::parse_rfc3339(s).map_err(|e| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("invalid date/time: {e}"),
-                    )
-                })?;
+                let dt = parse_time_spec(s)?;
                 older_than = Some(dt);
             }
             _ => {
-                if arg.to_str().is_some_and(|s| s.starts_with("--")) {
+                // Reject anything that looks like a flag (long or short).
+                // Paths that genuinely start with '-' can be passed after `--`.
+                if arg
+                    .to_str()
+                    .is_some_and(|s| s.len() > 1 && s.starts_with('-'))
+                {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
-                        format!("unknown flag: {}", arg.to_string_lossy()),
+                        format!(
+                            "unknown flag: {} (use `--` before paths that start with '-')",
+                            arg.to_string_lossy()
+                        ),
                     ));
                 }
                 paths.push(PathBuf::from(arg))
@@ -222,6 +263,33 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> io::Result<CliAct
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "please provide one or more paths",
+        ));
+    }
+
+    if shred && recycle {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--shred and --recycle are mutually exclusive (shredded files cannot be restored from the Recycle Bin)",
+        ));
+    }
+
+    if recycle && only_empty {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--recycle and --only-empty are mutually exclusive (an empty directory has no content to recover)",
+        ));
+    }
+
+    if recycle
+        && (!filter_includes.is_empty()
+            || !filter_excludes.is_empty()
+            || min_size.is_some()
+            || newer_than.is_some()
+            || older_than.is_some())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--recycle cannot be combined with filters (--include/--exclude/--min-size/--newer-than/--older-than): the Recycle Bin move always takes the whole item",
         ));
     }
 
@@ -253,6 +321,24 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> io::Result<CliAct
     }))
 }
 
+/// Parse a point in time given either as RFC 3339 ("2026-01-01T00:00:00Z")
+/// or as a humane "age" duration ("30d", "12h", "90min") meaning that long
+/// before now. Used by --newer-than / --older-than.
+fn parse_time_spec(s: &str) -> io::Result<std::time::SystemTime> {
+    if let Ok(dt) = humantime::parse_rfc3339(s) {
+        return Ok(dt);
+    }
+    match humantime::parse_duration(s) {
+        Ok(age) => std::time::SystemTime::now()
+            .checked_sub(age)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "duration too large")),
+        Err(e) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid date/time or duration: {e} (expected RFC 3339 like 2026-01-01T00:00:00Z or an age like 30d, 12h)"),
+        )),
+    }
+}
+
 pub fn print_help() {
     println!("Usage: zap [FLAGS] [OPTIONS] <path>...");
     println!("       zap --help");
@@ -275,14 +361,17 @@ pub fn print_help() {
     );
     println!("  --include GLOB      Only delete paths matching glob pattern (repeatable)");
     println!("  --exclude GLOB      Skip paths matching glob pattern (repeatable)");
-    println!("  --min-size BYTES    Only delete files larger than BYTES");
-    println!("  --newer-than RFC3339 Only delete files newer than date/time");
-    println!("  --older-than RFC3339 Only delete files older than date/time");
+    println!(
+        "  --min-size SIZE     Only delete files of at least SIZE (bytes, or 512KB/10MB/1.5GB)"
+    );
+    println!("  --newer-than WHEN    Only delete files newer than date/time (RFC 3339) or age (e.g. 12h, 30d)");
+    println!("  --older-than WHEN    Only delete files older than date/time (RFC 3339) or age (e.g. 12h, 30d)");
+    println!("  --                  Treat all remaining arguments as paths");
     println!();
     println!("Examples:");
     println!("  zap --dry-run ./node_modules");
     println!("  zap --yes --threads 8 ./build ./dist");
-    println!("  zap --yes --exclude '*.log' --min-size 1048576 ./project");
+    println!("  zap --yes --exclude '*.log' --min-size 10MB ./project");
     println!("  zap --yes --shred ./secret-files");
     println!("  zap --only-empty ./cache");
 }
@@ -302,6 +391,26 @@ pub fn print_error(err: &io::Error) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_time_spec_accepts_rfc3339() {
+        let dt = parse_time_spec("2026-01-01T00:00:00Z").unwrap();
+        assert!(dt < std::time::SystemTime::now());
+    }
+
+    #[test]
+    fn test_parse_time_spec_accepts_age_duration() {
+        let dt = parse_time_spec("30d").unwrap();
+        let expected =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 24 * 3600);
+        let diff = expected.duration_since(dt).unwrap_or_else(|e| e.duration());
+        assert!(diff < std::time::Duration::from_secs(5), "diff {diff:?}");
+    }
+
+    #[test]
+    fn test_parse_time_spec_rejects_garbage() {
+        assert!(parse_time_spec("yesterday-ish").is_err());
+    }
 
     #[test]
     fn test_parse_args_auto_enables_dry_run() {
@@ -444,6 +553,115 @@ mod tests {
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains(&format!("<= {MAX_THREADS}")));
+    }
+
+    #[test]
+    fn test_parse_args_double_dash_treats_rest_as_paths() {
+        let result = parse_args([
+            OsString::from("--yes"),
+            OsString::from("--"),
+            OsString::from("--weird-name"),
+            OsString::from("-x"),
+        ])
+        .unwrap();
+        match result {
+            CliAction::Run(options) => {
+                assert_eq!(
+                    options.paths,
+                    vec![PathBuf::from("--weird-name"), PathBuf::from("-x")]
+                );
+            }
+            _ => panic!("expected run action"),
+        }
+    }
+
+    #[test]
+    fn test_parse_args_rejects_unknown_short_flag() {
+        let result = parse_args([OsString::from("-x"), OsString::from("file.txt")]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("unknown flag"));
+    }
+
+    #[test]
+    fn test_parse_args_rejects_recycle_with_only_empty() {
+        let args = vec![
+            OsString::from("--recycle"),
+            OsString::from("--only-empty"),
+            OsString::from("some-path"),
+        ];
+        assert!(parse_args(args.into_iter()).is_err());
+    }
+
+    #[test]
+    fn test_parse_args_rejects_recycle_with_filters() {
+        let args = vec![
+            OsString::from("--recycle"),
+            OsString::from("--min-size"),
+            OsString::from("1mb"),
+            OsString::from("some-path"),
+        ];
+        assert!(parse_args(args.into_iter()).is_err());
+    }
+
+    #[test]
+    fn test_parse_args_rejects_shred_with_recycle() {
+        let result = parse_args([
+            OsString::from("--yes"),
+            OsString::from("--shred"),
+            OsString::from("--recycle"),
+            OsString::from("file.txt"),
+        ]);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("mutually exclusive"));
+    }
+
+    #[test]
+    fn test_parse_byte_size_plain_bytes() {
+        assert_eq!(parse_byte_size("0"), Some(0));
+        assert_eq!(parse_byte_size("1048576"), Some(1048576));
+    }
+
+    #[test]
+    fn test_parse_byte_size_with_suffixes() {
+        assert_eq!(parse_byte_size("1k"), Some(1024));
+        assert_eq!(parse_byte_size("512KB"), Some(512 * 1024));
+        assert_eq!(parse_byte_size("10MB"), Some(10 * 1024 * 1024));
+        assert_eq!(parse_byte_size("1g"), Some(1024 * 1024 * 1024));
+        assert_eq!(parse_byte_size("1TB"), Some(1024_u64.pow(4)));
+        assert_eq!(
+            parse_byte_size("1.5GB"),
+            Some((1.5 * 1024.0 * 1024.0 * 1024.0) as u64)
+        );
+    }
+
+    #[test]
+    fn test_parse_byte_size_rejects_garbage() {
+        assert_eq!(parse_byte_size(""), None);
+        assert_eq!(parse_byte_size("abc"), None);
+        assert_eq!(parse_byte_size("-5"), None);
+        assert_eq!(parse_byte_size("-1kb"), None);
+        assert_eq!(parse_byte_size("kb"), None);
+        assert_eq!(parse_byte_size("1.5"), None); // fractional bytes need a unit
+    }
+
+    #[test]
+    fn test_parse_args_min_size_accepts_human_units() {
+        let result = parse_args([
+            OsString::from("--yes"),
+            OsString::from("--min-size"),
+            OsString::from("10MB"),
+            OsString::from("file.txt"),
+        ])
+        .unwrap();
+        match result {
+            CliAction::Run(options) => {
+                assert_eq!(options.filter.min_size, Some(10 * 1024 * 1024));
+            }
+            _ => panic!("expected run action"),
+        }
     }
 
     #[test]

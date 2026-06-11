@@ -4,10 +4,13 @@ use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use zap::{batch, cli, delete, path_utils, protect, size, stop};
 
+#[cfg(windows)]
+use std::sync::atomic::{AtomicBool, Ordering};
+
+#[cfg(windows)]
 static CONSOLE_ALLOCATED: AtomicBool = AtomicBool::new(false);
 
 fn main() {
@@ -81,7 +84,7 @@ fn report_error(path: &Path, err: &std::io::Error) {
     );
 }
 
-fn confirm_interactive(paths: &[PathBuf], dry_run: bool) -> io::Result<bool> {
+fn confirm_interactive(paths: &[PathBuf], dry_run: bool, recycle: bool) -> io::Result<bool> {
     use std::io::IsTerminal;
     if !std::io::stdin().is_terminal() {
         return Err(io::Error::new(
@@ -101,8 +104,16 @@ fn confirm_interactive(paths: &[PathBuf], dry_run: bool) -> io::Result<bool> {
         .bright_white()
     );
 
-    for path in paths.iter().take(20) {
-        let total = size::dir_size_recursive(path);
+    // Compute sizes for the previewed paths in parallel — sequential
+    // dir_size_recursive calls can take seconds each on large trees.
+    use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+    let preview: Vec<&PathBuf> = paths.iter().take(20).collect();
+    let sizes: Vec<u64> = preview
+        .par_iter()
+        .map(|path| size::dir_size_recursive(path))
+        .collect();
+
+    for (path, total) in preview.iter().zip(sizes) {
         if total > 0 {
             eprintln!(
                 "  {}  {}",
@@ -121,7 +132,11 @@ fn confirm_interactive(paths: &[PathBuf], dry_run: bool) -> io::Result<bool> {
         return Ok(false);
     }
 
-    eprint!("\nDelete permanently? [y/N]: ");
+    if recycle {
+        eprint!("\nMove to Recycle Bin? [y/N]: ");
+    } else {
+        eprint!("\nDelete permanently? [y/N]: ");
+    }
     std::io::stderr().flush()?;
     let mut answer = String::new();
     std::io::stdin().read_line(&mut answer)?;
@@ -225,19 +240,11 @@ fn run_delete(options: &cli::CliOptions, start: Instant) -> bool {
     // If no --yes/--force and no --dry-run: show preview with sizes, then
     // ask for interactive confirmation.
     if options.dry_run && !options.batch {
-        match confirm_interactive(&options.paths, options.dry_run) {
+        match confirm_interactive(&options.paths, options.dry_run, options.recycle) {
             Ok(true) => {
-                let real_options = cli::CliOptions {
-                    dry_run: false,
-                    threads: options.threads,
-                    paths: options.paths.clone(),
-                    batch: false,
-                    silent: options.silent,
-                    filter: options.filter.clone(),
-                    shred: options.shred,
-                    only_empty: options.only_empty,
-                    recycle: options.recycle,
-                };
+                let mut real_options = options.clone();
+                real_options.dry_run = false;
+                real_options.batch = false;
                 return run_delete(&real_options, start);
             }
             Ok(false) => return true,
@@ -312,6 +319,19 @@ fn run_delete_parallel(
     use_current_pool: bool,
     allow_dangerous: bool,
 ) -> Vec<(PathBuf, std::io::Error)> {
+    // Recycle mode: one SHFileOperationW call for the whole selection — a
+    // single shell roundtrip and a single Explorer "Undo" entry. Validation
+    // (roots, protected paths, symlinks) happens per path inside.
+    #[cfg(windows)]
+    if options.recycle {
+        let errors = delete::recycle_paths_validated(&options.paths, allow_dangerous);
+        for (path, err) in &errors {
+            report_error(path, err);
+        }
+        let _ = use_current_pool;
+        return errors;
+    }
+
     let errors: std::sync::Mutex<Vec<(PathBuf, std::io::Error)>> =
         std::sync::Mutex::new(Vec::with_capacity(options.paths.len()));
 
@@ -409,17 +429,9 @@ fn run_batch(options: &cli::CliOptions, start: Instant) -> bool {
                 alloc_console();
             }
 
-            let merged = cli::CliOptions {
-                paths: all_paths,
-                dry_run: options.dry_run,
-                threads: options.threads,
-                batch: false,
-                silent: options.silent,
-                filter: options.filter.clone(),
-                shred: options.shred,
-                only_empty: options.only_empty,
-                recycle: options.recycle,
-            };
+            let mut merged = options.clone();
+            merged.paths = all_paths;
+            merged.batch = false;
 
             let success = run_delete(&merged, start);
 
@@ -437,17 +449,9 @@ fn run_batch(options: &cli::CliOptions, start: Instant) -> bool {
                 if !options.silent && !CONSOLE_ALLOCATED.load(Ordering::SeqCst) {
                     alloc_console();
                 }
-                let late_merged = cli::CliOptions {
-                    paths: pending,
-                    dry_run: options.dry_run,
-                    threads: options.threads,
-                    batch: false,
-                    silent: options.silent,
-                    filter: options.filter.clone(),
-                    shred: options.shred,
-                    only_empty: options.only_empty,
-                    recycle: options.recycle,
-                };
+                let mut late_merged = options.clone();
+                late_merged.paths = pending;
+                late_merged.batch = false;
                 let _ = run_delete(&late_merged, start);
             }
 

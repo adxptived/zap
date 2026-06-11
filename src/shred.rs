@@ -48,6 +48,10 @@ pub fn shred_file(path: &Path, passes: usize) -> io::Result<()> {
             written += chunk as u64;
         }
         file.flush()?;
+        // `flush` only empties userspace buffers; force each pass onto the
+        // physical device, otherwise the OS may coalesce all passes into a
+        // single write and the overwrite guarantee is lost.
+        file.sync_data()?;
     }
     drop(file);
 

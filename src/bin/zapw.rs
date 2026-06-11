@@ -153,16 +153,22 @@ fn should_parallelize_top_level(options: &cli::CliOptions) -> bool {
 }
 
 fn run_silent_delete(options: &cli::CliOptions) -> bool {
+    // Recycle mode: one SHFileOperationW call for the whole batch — single
+    // shell roundtrip and a single Explorer "Undo" entry.
+    #[cfg(windows)]
+    if options.recycle && !options.dry_run {
+        return delete::recycle_paths_validated(&options.paths, false).is_empty();
+    }
+
     let delete_one = |path: &Path| {
         if options.dry_run {
             delete::dry_run_path_silent(path)
         } else {
-            delete::delete_path(
-                path,
-                delete::DeleteOptions::default()
-                    .with_threads(options.threads)
-                    .silent(),
-            )
+            // Build options via `to_delete_options` so recycle/shred/
+            // only-empty/filters survive: constructing DeleteOptions
+            // manually here used to drop them, which made the context-menu
+            // "Move to Recycle Bin" entry delete permanently.
+            delete::delete_path(path, options.to_delete_options(false, false).silent())
         }
     };
 
@@ -259,17 +265,9 @@ fn drain_late_batch_paths(options: &cli::CliOptions, run: BatchRun) {
             break;
         }
 
-        let late_options = cli::CliOptions {
-            paths: pending.clone(),
-            dry_run: options.dry_run,
-            threads: options.threads,
-            batch: false,
-            silent: options.silent,
-            filter: options.filter.clone(),
-            shred: options.shred,
-            only_empty: options.only_empty,
-            recycle: options.recycle,
-        };
+        let mut late_options = options.clone();
+        late_options.paths = pending.clone();
+        late_options.batch = false;
         let _ = run_silent_delete(&late_options);
         processed.extend(pending);
     }
@@ -352,6 +350,37 @@ mod tests {
         file_options.threads = Some(2);
         assert!(!should_parallelize_top_level(&file_options));
 
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_run_silent_delete_honors_filters() {
+        let root = std::env::temp_dir().join(format!(
+            "zapw-filter-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("keep.txt"), b"keep").unwrap();
+        fs::write(root.join("drop.log"), b"drop").unwrap();
+
+        let mut options = test_options(vec![root.clone()]);
+        options.filter = FilterConfig {
+            includes: vec![glob::Pattern::new("*.log").unwrap()],
+            ..FilterConfig::default()
+        };
+        let _ = run_silent_delete(&options);
+
+        // Regression: zapw used to drop the filter (and recycle/shred flags)
+        // by building DeleteOptions manually instead of via to_delete_options.
+        assert!(
+            root.join("keep.txt").exists(),
+            "filtered-out file must survive"
+        );
+        assert!(!root.join("drop.log").exists(), "matching file is deleted");
         let _ = fs::remove_dir_all(&root);
     }
 

@@ -32,12 +32,45 @@ extern "system" {
 
 /// Move a file or directory to the Windows Recycle Bin.
 pub fn recycle_path(path: &Path) -> io::Result<()> {
-    let wide_path: Vec<u16> = path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .chain(std::iter::once(0))
-        .collect();
+    recycle_many(std::slice::from_ref(&path))
+}
+
+/// Move several paths to the Recycle Bin with a *single* `SHFileOperationW`
+/// call. `pFrom` is a double-null-terminated list of null-terminated paths,
+/// so Explorer treats the whole batch as one operation: one shell roundtrip
+/// and a single "Undo" entry instead of one per item.
+pub fn recycle_paths<P: AsRef<Path>>(paths: &[P]) -> io::Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let refs: Vec<&Path> = paths.iter().map(|p| p.as_ref()).collect();
+    recycle_many(&refs)
+}
+
+/// `SHFileOperationW` rejects paths at or beyond the classic `MAX_PATH`
+/// limit and does not understand `\\?\` verbatim prefixes.
+const SHELL_MAX_PATH: usize = 260;
+
+fn recycle_many(paths: &[&Path]) -> io::Result<()> {
+    let mut wide_path: Vec<u16> = Vec::new();
+    for path in paths {
+        // The shell resolves relative paths against an unpredictable working
+        // directory — always hand it absolute paths.
+        let abs = std::path::absolute(path)?;
+        let wide: Vec<u16> = abs.as_os_str().encode_wide().collect();
+        if wide.len() + 1 >= SHELL_MAX_PATH {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidFilename,
+                format!(
+                    "path is too long for the Recycle Bin shell API (>= {SHELL_MAX_PATH} chars): {} — delete permanently instead",
+                    abs.display()
+                ),
+            ));
+        }
+        wide_path.extend(wide);
+        wide_path.push(0);
+    }
+    wide_path.push(0); // double-null terminator for the whole list
 
     let mut file_op = SHFileOpStructW {
         hwnd: std::ptr::null_mut(),
