@@ -312,6 +312,7 @@ mod tests {
             shred: false,
             only_empty: false,
             recycle: false,
+            no_size_preview: false,
         }
     }
 
