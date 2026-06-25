@@ -84,7 +84,12 @@ fn report_error(path: &Path, err: &std::io::Error) {
     );
 }
 
-fn confirm_interactive(paths: &[PathBuf], dry_run: bool, recycle: bool) -> io::Result<bool> {
+fn confirm_interactive(
+    paths: &[PathBuf],
+    dry_run: bool,
+    recycle: bool,
+    show_sizes: bool,
+) -> io::Result<bool> {
     use std::io::IsTerminal;
     if !std::io::stdin().is_terminal() {
         return Err(io::Error::new(
@@ -104,24 +109,36 @@ fn confirm_interactive(paths: &[PathBuf], dry_run: bool, recycle: bool) -> io::R
         .bright_white()
     );
 
-    // Compute sizes for the previewed paths in parallel — sequential
-    // dir_size_recursive calls can take seconds each on large trees.
-    use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
     let preview: Vec<&PathBuf> = paths.iter().take(20).collect();
-    let sizes: Vec<u64> = preview
-        .par_iter()
-        .map(|path| size::dir_size_recursive(path))
-        .collect();
+    if show_sizes {
+        // Compute sizes for the previewed paths in parallel — sequential
+        // dir_size_recursive calls can take seconds each on large trees.
+        // Users can opt out with --no-size-preview when they want the
+        // confirmation prompt to appear immediately for huge directory trees.
+        use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+        let sizes: Vec<u64> = preview
+            .par_iter()
+            .map(|path| size::dir_size_recursive(path))
+            .collect();
 
-    for (path, total) in preview.iter().zip(sizes) {
-        if total > 0 {
+        for (path, total) in preview.iter().zip(sizes) {
+            if total > 0 {
+                eprintln!(
+                    "  {}  {}",
+                    path.display().bright_yellow(),
+                    size::format_size(total).dimmed()
+                );
+            } else {
+                eprintln!("  {}", path.display().bright_yellow());
+            }
+        }
+    } else {
+        for path in &preview {
             eprintln!(
                 "  {}  {}",
                 path.display().bright_yellow(),
-                size::format_size(total).dimmed()
+                "size skipped".dimmed()
             );
-        } else {
-            eprintln!("  {}", path.display().bright_yellow());
         }
     }
     if paths.len() > 20 {
@@ -240,7 +257,12 @@ fn run_delete(options: &cli::CliOptions, start: Instant) -> bool {
     // If no --yes/--force and no --dry-run: show preview with sizes, then
     // ask for interactive confirmation.
     if options.dry_run && !options.batch {
-        match confirm_interactive(&options.paths, options.dry_run, options.recycle) {
+        match confirm_interactive(
+            &options.paths,
+            options.dry_run,
+            options.recycle,
+            !options.no_size_preview,
+        ) {
             Ok(true) => {
                 let mut real_options = options.clone();
                 real_options.dry_run = false;

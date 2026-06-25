@@ -4,8 +4,8 @@ use std::{
     io,
     path::Path,
     sync::{
-        atomic::{AtomicU64, Ordering},
-        Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex,
     },
 };
 
@@ -212,6 +212,7 @@ fn process_file_batch(
     error_count: &AtomicU64,
     failures: &Mutex<Vec<DeletionFailure>>,
     bar: Option<&ProgressBar>,
+    processed_count: Option<&AtomicU64>,
 ) {
     // Honour Ctrl+C between batches so huge deletions stop promptly.
     if crate::stop::is_stop_requested() {
@@ -223,8 +224,12 @@ fn process_file_batch(
             push_failure(failures, &entry.path, &err);
         }
     }
+    let processed = chunk.len() as u64;
     if let Some(b) = bar {
-        b.inc(chunk.len() as u64);
+        b.inc(processed);
+    }
+    if let Some(count) = processed_count {
+        count.fetch_add(processed, Ordering::Relaxed);
     }
 }
 
@@ -343,15 +348,43 @@ fn delete_directory_pipeline(path: &Path, bar: Option<ProgressBar>, shred: bool)
     // ── rayon pool: drain batch_rx in parallel ────────────────────────────
     let file_errors = AtomicU64::new(0);
     let failures = Mutex::new(Vec::<DeletionFailure>::new());
+    let file_done = Arc::new(AtomicU64::new(0));
+    let monitor_stop = Arc::new(AtomicBool::new(false));
+    let progress_monitor = bar.as_ref().map(|b| {
+        let bar = b.clone();
+        let file_done = Arc::clone(&file_done);
+        let monitor_stop = Arc::clone(&monitor_stop);
+        std::thread::spawn(move || {
+            while !monitor_stop.load(Ordering::Acquire) {
+                let deleted = file_done.load(Ordering::Relaxed);
+                if deleted > 0 {
+                    bar.set_message(format!("Scanning / deleting files ({deleted} deleted)"));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        })
+    });
 
     // Stream batches into the rayon pool as they arrive so file deletion
     // overlaps with the scan (true pipelining). `par_bridge` keeps all
     // workers busy while the scan thread is still producing entries.
+    let file_done_for_workers = Arc::clone(&file_done);
     batch_rx.into_iter().par_bridge().for_each(|batch| {
         // Files are deleted while the scan bar is still active, so don't
         // touch the bar here — its position tracks scanned entries.
-        process_file_batch(&batch, shred, &file_errors, &failures, None);
+        process_file_batch(
+            &batch,
+            shred,
+            &file_errors,
+            &failures,
+            None,
+            Some(file_done_for_workers.as_ref()),
+        );
     });
+    monitor_stop.store(true, Ordering::Release);
+    if let Some(handle) = progress_monitor {
+        let _ = handle.join();
+    }
     consumer_thread.join().ok();
 
     let scan_result = scan_thread
@@ -359,6 +392,10 @@ fn delete_directory_pipeline(path: &Path, bar: Option<ProgressBar>, shred: bool)
         .map_err(|_| io::Error::other("scan thread panicked"))??;
 
     if let Some(ref b) = bar {
+        b.set_message(format!(
+            "Deleted files ({})",
+            file_done.load(Ordering::Relaxed)
+        ));
         b.set_style(
             ProgressStyle::default_bar()
                 .template("{prefix} [{bar:40}] {pos}/{len} {per_sec} ETA {eta} {msg}")
@@ -420,7 +457,7 @@ fn delete_directory_filtered(
 
     let cs = chunk_size(plan.files_and_links.len().max(1));
     plan.files_and_links.par_chunks(cs).for_each(|chunk| {
-        process_file_batch(chunk, shred, &file_errors, &failures, bar.as_ref());
+        process_file_batch(chunk, shred, &file_errors, &failures, bar.as_ref(), None);
     });
 
     if let Some(ref b) = bar {

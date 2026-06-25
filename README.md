@@ -87,6 +87,7 @@ zap --version
 | `--shred` | Overwrite files with random data before deleting (3 passes). Note: file names/MFT records are not wiped, and on SSDs wear-leveling means overwrites are best-effort. |
 | `--only-empty` | Only delete if the directory is empty. |
 | `--recycle` | Send to Recycle Bin instead of permanent delete (also a checkbox in the GUI dialog and an Explorer context-menu entry). Batched: one shell call / one Undo for the whole selection. |
+| `--no-size-preview` | Show the confirmation prompt immediately without calculating preview sizes. Useful for huge trees where sizing would feel like a hang. |
 | `--include GLOB` | Only delete paths matching glob pattern (repeatable). |
 | `--exclude GLOB` | Skip paths matching glob pattern (repeatable). |
 | `--min-size SIZE` | Only delete files larger than SIZE (bytes, or `10k`, `5mb`, `1.5g`, `2tb`). |
@@ -100,6 +101,7 @@ Examples:
 zap --dry-run "C:\temp\build-output"
 zap --yes "C:\temp\build-output"
 zap --yes --threads 4 "C:\temp\huge-repo"
+zap --no-size-preview "C:\temp\huge-repo"
 zap --yes --shred "C:\temp\secret-files"
 zap --yes --exclude "*.log" --min-size 10mb "C:\temp\project"
 zap --yes -- "-weird-folder-name"

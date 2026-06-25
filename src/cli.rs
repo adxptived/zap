@@ -18,6 +18,7 @@ pub struct CliOptions {
     pub shred: bool,
     pub only_empty: bool,
     pub recycle: bool,
+    pub no_size_preview: bool,
 }
 
 impl CliOptions {
@@ -100,6 +101,7 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> io::Result<CliAct
     let mut shred = false;
     let mut only_empty = false;
     let mut recycle = false;
+    let mut no_size_preview = false;
     let mut threads = None;
     let mut paths = Vec::new();
     let mut filter_includes: Vec<Pattern> = Vec::new();
@@ -123,6 +125,7 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> io::Result<CliAct
             Some("--shred") => shred = true,
             Some("--only-empty") => only_empty = true,
             Some("--recycle") => recycle = true,
+            Some("--no-size-preview") => no_size_preview = true,
             Some("--force") | Some("--yes") => force = true,
             Some("--threads") | Some("-j") => {
                 let value = iter.next().ok_or_else(|| {
@@ -318,6 +321,7 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> io::Result<CliAct
         shred,
         only_empty,
         recycle,
+        no_size_preview,
     }))
 }
 
@@ -353,6 +357,9 @@ pub fn print_help() {
     println!("  --shred             Overwrite files with random data before deleting");
     println!("  --only-empty        Only delete if directory is empty");
     println!("  --recycle           Send to Recycle Bin instead of permanent delete");
+    println!(
+        "  --no-size-preview   Skip directory size calculation in the confirmation preview"
+    );
     println!();
     println!("Options:");
     println!(
@@ -422,6 +429,22 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_args_accepts_no_size_preview() {
+        let result = parse_args([
+            OsString::from("--no-size-preview"),
+            OsString::from("file.txt"),
+        ])
+        .unwrap();
+        match result {
+            CliAction::Run(options) => {
+                assert!(options.dry_run);
+                assert!(options.no_size_preview);
+            }
+            _ => panic!("expected run action"),
+        }
+    }
+
+    #[test]
     fn test_parse_args_accepts_force() {
         let result = parse_args([OsString::from("--yes"), OsString::from("file.txt")]).unwrap();
         match result {
@@ -429,6 +452,7 @@ mod tests {
                 assert!(!options.dry_run);
                 assert_eq!(options.threads, None);
                 assert_eq!(options.paths, vec![PathBuf::from("file.txt")]);
+                assert!(!options.no_size_preview);
             }
             _ => panic!("expected run action"),
         }
