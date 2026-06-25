@@ -1,4 +1,4 @@
-use indicatif::MultiProgress;
+use indicatif::{MultiProgress, ProgressStyle};
 use owo_colors::{AnsiColors, OwoColorize};
 use std::collections::HashSet;
 use std::fs::{self, File};
@@ -328,6 +328,65 @@ fn run_delete(options: &cli::CliOptions, start: Instant) -> bool {
     }
 }
 
+
+fn bulk_file_roots_candidate(
+    options: &cli::CliOptions,
+    allow_dangerous: bool,
+) -> Option<Vec<PathBuf>> {
+    if options.dry_run || options.recycle || options.only_empty || !options.filter.is_empty() {
+        return None;
+    }
+    let mut files = Vec::with_capacity(options.paths.len());
+    for path in &options.paths {
+        let metadata = fs::symlink_metadata(path).ok()?;
+        if !(metadata.is_file() || metadata.file_type().is_symlink()) {
+            return None;
+        }
+        if !metadata.file_type().is_symlink() {
+            let canonical = protect::sanitize_path(path).ok()?;
+            if protect::is_protected_path(&canonical) && !allow_dangerous {
+                return None;
+            }
+        }
+        files.push(path.clone());
+    }
+    (files.len() >= 64).then_some(files)
+}
+
+fn run_bulk_file_roots(
+    options: &cli::CliOptions,
+    files: &[PathBuf],
+) -> Vec<(PathBuf, std::io::Error)> {
+    let bar = if options.silent {
+        None
+    } else {
+        let bar = indicatif::ProgressBar::new(files.len() as u64);
+        bar.set_style(
+            ProgressStyle::default_bar()
+                .template("Bulk files [{bar:40}] {pos}/{len} {per_sec} ETA {eta} {msg}")
+                .unwrap()
+                .progress_chars("#>-"),
+        );
+        bar.set_message("Deleting top-level files");
+        Some(bar)
+    };
+
+    let summary = delete::delete_file_roots_bulk(files, options.shred, bar.as_ref());
+    if let Some(bar) = bar {
+        if summary.errors.is_empty() {
+            bar.finish_with_message(format!("Deleted {} files", summary.deleted));
+        } else {
+            bar.finish_with_message(format!("Deleted {}, failed {}", summary.deleted, summary.errors.len()));
+        }
+    }
+
+    summary
+        .errors
+        .into_iter()
+        .map(|(path, message)| (path, io::Error::other(message)))
+        .collect()
+}
+
 fn run_delete_inner(
     options: &cli::CliOptions,
     use_current_pool: bool,
@@ -341,6 +400,10 @@ fn run_delete_parallel(
     use_current_pool: bool,
     allow_dangerous: bool,
 ) -> Vec<(PathBuf, std::io::Error)> {
+    if let Some(files) = bulk_file_roots_candidate(options, allow_dangerous) {
+        return run_bulk_file_roots(options, &files);
+    }
+
     // Recycle mode: one SHFileOperationW call for the whole selection — a
     // single shell roundtrip and a single Explorer "Undo" entry. Validation
     // (roots, protected paths, symlinks) happens per path inside.

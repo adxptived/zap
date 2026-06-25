@@ -107,6 +107,14 @@ zap --yes --exclude "*.log" --min-size 10mb "C:\temp\project"
 zap --yes -- "-weird-folder-name"
 ```
 
+## Performance Notes
+
+For large Explorer or CLI selections made of many top-level files, Zap uses a bulk
+file-root delete path. This avoids creating one worker/progress item per file and
+keeps selections with thousands of files responsive while preserving the same
+file, symlink, cancellation, and error-reporting behavior. Directory roots still
+use the streaming scan/delete pipeline.
+
 ## Safety Model
 
 Zap is destructive, so the deletion engine keeps several guardrails in place:

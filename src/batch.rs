@@ -3,7 +3,7 @@
 //! processes into a single deletion run.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -68,20 +68,17 @@ fn hex_byte(b: u8) -> Option<u8> {
     }
 }
 
+#[inline]
+fn is_committed_batch_file(path: &Path) -> bool {
+    path.extension().is_some_and(|ext| ext == "txt")
+}
+
 pub fn batch_state(paths_dir: &Path) -> usize {
-    let mut file_count = 0;
-
-    if let Ok(entries) = fs::read_dir(paths_dir) {
-        for entry in entries.flatten() {
-            if let Ok(metadata) = entry.metadata() {
-                if metadata.is_file() {
-                    file_count += 1;
-                }
-            }
-        }
-    }
-
-    file_count
+    fs::read_dir(paths_dir)
+        .into_iter()
+        .flat_map(|entries| entries.flatten())
+        .filter(|entry| is_committed_batch_file(&entry.path()))
+        .count()
 }
 
 pub fn wait_for_batch_quiet(paths_dir: &Path, required_quiet_polls: usize, max_polls: usize) {
@@ -114,12 +111,15 @@ pub fn write_batch_paths(paths_dir: &Path, paths: &[PathBuf]) -> io::Result<()> 
     for attempt in 0..100_u32 {
         let path = paths_dir.join(format!("{timestamp}-{pid}-{attempt}.txt.tmp"));
         match OpenOptions::new().create_new(true).write(true).open(&path) {
-            Ok(mut file) => {
+            Ok(file) => {
+                let mut writer = BufWriter::with_capacity(64 * 1024, file);
                 for p in paths {
                     let encoded = hex_encode(p.as_os_str().as_encoded_bytes());
-                    writeln!(file, "{encoded}")?;
+                    writeln!(writer, "{encoded}")?;
                 }
-                file.flush()?;
+                writer.flush()?;
+                drop(writer);
+
                 let final_path = path.with_extension("txt");
                 if let Err(err) = fs::rename(&path, &final_path) {
                     let _ = fs::remove_file(&path);
@@ -139,19 +139,20 @@ pub fn write_batch_paths(paths_dir: &Path, paths: &[PathBuf]) -> io::Result<()> 
 }
 
 pub fn read_batch_paths(paths_dir: &Path) -> Vec<PathBuf> {
-    let files: Vec<_> = fs::read_dir(paths_dir)
+    let mut files: Vec<_> = fs::read_dir(paths_dir)
         .into_iter()
         .flat_map(|entries| entries.flatten())
         .filter_map(|entry| {
             let path = entry.path();
-            // Only accept .txt files; ignore .txt.tmp partial writes,
-            // directories, and unrelated files. This avoids a metadata
-            // syscall per entry.
-            path.extension()
-                .is_some_and(|ext| ext == "txt")
-                .then_some(path)
+            // Only accept committed .txt files; ignore .txt.tmp partial writes,
+            // directories, and unrelated files. Checking the extension avoids a
+            // metadata syscall per entry, which matters when Explorer launches
+            // hundreds or thousands of zap processes into the same batch dir.
+            is_committed_batch_file(&path).then_some(path)
         })
         .collect();
+
+    files.sort_unstable();
 
     files
         .into_iter()
@@ -327,6 +328,20 @@ mod tests {
     }
 
     #[test]
+    fn test_batch_state_counts_committed_txt_without_metadata() {
+        let dir = temp_dir();
+        fs::write(dir.join("first.txt"), "00\n").unwrap();
+        fs::write(dir.join("second.txt"), "00\n").unwrap();
+        fs::write(dir.join("partial.txt.tmp"), "00\n").unwrap();
+        fs::write(dir.join("notes.log"), "00\n").unwrap();
+        fs::create_dir(dir.join("nested.txt")).unwrap();
+
+        assert_eq!(batch_state(&dir), 3);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_batch_paths_dir_respects_env_override() {
         let custom = std::env::temp_dir().join(format!("zap-batch-custom-{}", std::process::id()));
         std::env::set_var("ZAP_BATCH_ROOT", &custom);
@@ -380,7 +395,7 @@ mod tests {
         lock.flush().unwrap();
         drop(lock);
 
-        // Now refresh — should truncate to just PID + nanos
+        // Now refresh -- should truncate to just PID + nanos
         let lock = refresh_lock_owner(&lock_file).unwrap();
         drop(lock);
 

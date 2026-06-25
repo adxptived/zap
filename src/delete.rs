@@ -10,7 +10,7 @@ use std::{
 };
 
 use indicatif::{ProgressBar, ProgressStyle};
-use rayon::iter::{ParallelBridge, ParallelIterator};
+use rayon::iter::{IntoParallelRefIterator, ParallelBridge, ParallelIterator};
 use rayon::slice::ParallelSlice;
 
 use crate::filter::FilterConfig;
@@ -21,6 +21,12 @@ use crate::scan::{
 };
 
 const MAX_REPORTED_FAILURES: usize = 20;
+
+#[derive(Debug, Default)]
+pub struct BulkDeleteSummary {
+    pub deleted: u64,
+    pub errors: Vec<(std::path::PathBuf, String)>,
+}
 
 /// Adaptive chunk size: keeps every Rayon thread busy with roughly 256
 /// entries while clamped to [64, 65536] to avoid extremes.
@@ -672,6 +678,59 @@ pub fn recycle_paths_validated(
     errors
 }
 
+
+/// Delete many already-selected top-level files/symlinks with one Rayon pass.
+///
+/// This avoids spawning one task/progress bar per file when Explorer or the CLI
+/// passes thousands of individual files. Callers still perform path-level
+/// validation before choosing this fast path.
+pub fn delete_file_roots_bulk(
+    paths: &[std::path::PathBuf],
+    shred: bool,
+    bar: Option<&ProgressBar>,
+) -> BulkDeleteSummary {
+    let deleted = AtomicU64::new(0);
+    let processed = AtomicU64::new(0);
+    let errors = Mutex::new(Vec::<(std::path::PathBuf, String)>::new());
+    let cs = chunk_size(paths.len().max(1));
+
+    paths.par_chunks(cs).for_each(|chunk| {
+        if crate::stop::is_stop_requested() {
+            return;
+        }
+        for path in chunk {
+            if crate::stop::is_stop_requested() {
+                break;
+            }
+            let result = match std::fs::symlink_metadata(path) {
+                Ok(meta) if meta.file_type().is_symlink() => delete_symlink(path),
+                Ok(_) if shred => crate::shred::shred_file(path, 3),
+                Ok(_) => remove_file_with_retry(path),
+                Err(err) => Err(err),
+            };
+            match result {
+                Ok(()) => {
+                    deleted.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(err) => {
+                    if let Ok(mut guard) = errors.lock() {
+                        guard.push((path.clone(), err.to_string()));
+                    }
+                }
+            }
+            processed.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(b) = bar {
+            b.set_position(processed.load(Ordering::Relaxed));
+        }
+    });
+
+    BulkDeleteSummary {
+        deleted: deleted.load(Ordering::Relaxed),
+        errors: errors.into_inner().unwrap_or_default(),
+    }
+}
+
 pub fn delete_path(path: &Path, opts: DeleteOptions) -> io::Result<()> {
     if opts.only_empty && !path.is_dir() {
         if !opts.silent {
@@ -940,6 +999,45 @@ mod tests {
         fs::set_permissions(&file, perms).unwrap();
         delete_directory(&temp, None).unwrap();
         assert!(!temp.exists());
+    }
+
+    #[test]
+    fn test_delete_file_roots_bulk_removes_many_files() {
+        let temp = create_test_dir();
+        let files: Vec<PathBuf> = (0..128)
+            .map(|i| {
+                let path = temp.join(format!("file-{i}.txt"));
+                File::create(&path).unwrap();
+                path
+            })
+            .collect();
+
+        let summary = delete_file_roots_bulk(&files, false, None);
+        assert_eq!(summary.deleted, files.len() as u64);
+        assert!(summary.errors.is_empty());
+        assert!(files.iter().all(|path| !path.exists()));
+        assert!(temp.exists());
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_delete_file_roots_bulk_reports_failures() {
+        let temp = create_test_dir();
+        let ok = temp.join("ok.txt");
+        let blocked = temp.join("blocked.txt");
+        File::create(&ok).unwrap();
+        File::create(&blocked).unwrap();
+        set_test_remove_file_failure(Some(blocked.clone()));
+
+        let summary = delete_file_roots_bulk(&[ok.clone(), blocked.clone()], false, None);
+        set_test_remove_file_failure(None);
+
+        assert_eq!(summary.deleted, 1);
+        assert_eq!(summary.errors.len(), 1);
+        assert_eq!(summary.errors[0].0, blocked);
+        assert!(!ok.exists());
+        assert!(blocked.exists());
+        let _ = fs::remove_dir_all(&temp);
     }
 
     #[test]

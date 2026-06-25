@@ -228,21 +228,25 @@ impl ZapApp {
         }
         thread::spawn(move || {
             let start = Instant::now();
-            for path in paths {
-                // Stop button: skip everything not yet started. The item
-                // currently being deleted aborts via the same flag inside
-                // delete_path.
-                if stop::is_stop_requested() {
-                    let _ =
-                        sender.send(WorkerEvent::Done(path, Err("cancelled by user".to_owned())));
-                    continue;
+            if should_bulk_delete_file_roots(&paths, dry_run, recycle) {
+                run_bulk_file_roots_gui(paths, shred, sender.clone());
+            } else {
+                for path in paths {
+                    // Stop button: skip everything not yet started. The item
+                    // currently being deleted aborts via the same flag inside
+                    // delete_path.
+                    if stop::is_stop_requested() {
+                        let _ = sender
+                            .send(WorkerEvent::Done(path, Err("cancelled by user".to_owned())));
+                        continue;
+                    }
+                    let _ = sender.send(WorkerEvent::Started(path.clone()));
+                    let result = run_delete_path(&path, threads, dry_run, recycle, shred, &sender);
+                    let _ = sender.send(WorkerEvent::Done(
+                        path,
+                        normalize_worker_result(result, dry_run),
+                    ));
                 }
-                let _ = sender.send(WorkerEvent::Started(path.clone()));
-                let result = run_delete_path(&path, threads, dry_run, recycle, shred, &sender);
-                let _ = sender.send(WorkerEvent::Done(
-                    path,
-                    normalize_worker_result(result, dry_run),
-                ));
             }
             let _ = sender.send(WorkerEvent::Finished(start.elapsed()));
         });
@@ -470,6 +474,73 @@ impl ZapApp {
     }
 }
 
+
+fn should_bulk_delete_file_roots(paths: &[PathBuf], dry_run: bool, recycle: bool) -> bool {
+    if dry_run || recycle || paths.len() < 64 {
+        return false;
+    }
+    paths.iter().all(|path| {
+        fs::symlink_metadata(path)
+            .map(|meta| meta.is_file() || meta.file_type().is_symlink())
+            .unwrap_or(false)
+    })
+}
+
+fn run_bulk_file_roots_gui(paths: Vec<PathBuf>, shred: bool, sender: Sender<WorkerEvent>) {
+    let total = paths.len() as u64;
+    for path in &paths {
+        let _ = sender.send(WorkerEvent::Started(path.clone()));
+    }
+
+    let bar = indicatif::ProgressBar::hidden();
+    bar.set_length(total);
+    let monitor_bar = bar.clone();
+    let monitor_sender = sender.clone();
+    let monitor_paths = paths.clone();
+    let monitor_stop = Arc::new(AtomicBool::new(false));
+    let monitor_done = Arc::clone(&monitor_stop);
+    let monitor = thread::spawn(move || {
+        while !monitor_done.load(Ordering::Relaxed) {
+            send_bulk_progress(&monitor_sender, &monitor_paths, &monitor_bar, total);
+            thread::sleep(PROGRESS_POLL_INTERVAL);
+        }
+        send_bulk_progress(&monitor_sender, &monitor_paths, &monitor_bar, total);
+    });
+
+    let summary = delete::delete_file_roots_bulk(&paths, shred, Some(&bar));
+    monitor_stop.store(true, Ordering::Relaxed);
+    let _ = monitor.join();
+
+    let failed: std::collections::HashMap<PathBuf, String> = summary.errors.into_iter().collect();
+    for path in paths {
+        let result = failed
+            .get(&path)
+            .cloned()
+            .map_or(Ok(()), Err);
+        let _ = sender.send(WorkerEvent::Done(path, result));
+    }
+}
+
+fn send_bulk_progress(
+    sender: &Sender<WorkerEvent>,
+    paths: &[PathBuf],
+    bar: &indicatif::ProgressBar,
+    total: u64,
+) {
+    let position = bar.position();
+    let message = format!("Bulk deleting files ({position}/{total})");
+    for path in paths.iter().take(8) {
+        let _ = sender.send(WorkerEvent::Progress(
+            path.clone(),
+            ProgressSnapshot {
+                position,
+                length: Some(total),
+                message: message.clone(),
+            },
+        ));
+    }
+}
+
 impl DeleteItem {
     fn pending(path: PathBuf) -> Self {
         Self {
@@ -589,6 +660,36 @@ pub fn should_auto_close(app: &ZapApp, counts: &StatusCounts) -> bool {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn bulk_file_roots_requires_many_plain_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "zapg-bulk-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let few: Vec<PathBuf> = (0..4)
+            .map(|i| {
+                let path = dir.join(format!("file-{i}.txt"));
+                fs::write(&path, b"x").unwrap();
+                path
+            })
+            .collect();
+        assert!(!should_bulk_delete_file_roots(&few, false, false));
+
+        let many: Vec<PathBuf> = (0..64)
+            .map(|i| {
+                let path = dir.join(format!("many-{i}.txt"));
+                fs::write(&path, b"x").unwrap();
+                path
+            })
+            .collect();
+        assert!(should_bulk_delete_file_roots(&many, false, false));
+        assert!(!should_bulk_delete_file_roots(&many, true, false));
+        assert!(!should_bulk_delete_file_roots(&many, false, true));
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn destructive_delete_treats_missing_paths_as_already_done() {
