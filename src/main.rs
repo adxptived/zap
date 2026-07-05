@@ -331,7 +331,6 @@ fn run_delete(options: &cli::CliOptions, start: Instant) -> bool {
     }
 }
 
-
 fn bulk_file_roots_candidate(
     options: &cli::CliOptions,
     allow_dangerous: bool,
@@ -379,7 +378,11 @@ fn run_bulk_file_roots(
         if summary.errors.is_empty() {
             bar.finish_with_message(format!("Deleted {} files", summary.deleted));
         } else {
-            bar.finish_with_message(format!("Deleted {}, failed {}", summary.deleted, summary.errors.len()));
+            bar.finish_with_message(format!(
+                "Deleted {}, failed {}",
+                summary.deleted,
+                summary.errors.len()
+            ));
         }
     }
 

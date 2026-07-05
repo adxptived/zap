@@ -101,13 +101,31 @@ fn recycle_many(paths: &[&Path]) -> io::Result<()> {
 /// misleading messages. Translate the common ones explicitly.
 fn shell_op_error(code: i32) -> io::Error {
     let (kind, msg) = match code {
-        0x74 => (io::ErrorKind::InvalidInput, "the source is a root directory"),
-        0x76 => (io::ErrorKind::PermissionDenied, "security settings denied access to the source"),
-        0x78 => (io::ErrorKind::PermissionDenied, "access denied to the source file or folder"),
+        0x74 => (
+            io::ErrorKind::InvalidInput,
+            "the source is a root directory",
+        ),
+        0x76 => (
+            io::ErrorKind::PermissionDenied,
+            "security settings denied access to the source",
+        ),
+        0x78 => (
+            io::ErrorKind::PermissionDenied,
+            "access denied to the source file or folder",
+        ),
         0x7C => (io::ErrorKind::InvalidInput, "the path is invalid"),
-        0x7E | 0x80 => (io::ErrorKind::AlreadyExists, "an item with this name already exists"),
-        0x81 => (io::ErrorKind::InvalidInput, "the file is too large for the Recycle Bin"),
-        0x82 => (io::ErrorKind::PermissionDenied, "the source is a read-only disc"),
+        0x7E | 0x80 => (
+            io::ErrorKind::AlreadyExists,
+            "an item with this name already exists",
+        ),
+        0x81 => (
+            io::ErrorKind::InvalidInput,
+            "the file is too large for the Recycle Bin",
+        ),
+        0x82 => (
+            io::ErrorKind::PermissionDenied,
+            "the source is a read-only disc",
+        ),
         0x02 => (io::ErrorKind::NotFound, "the file was not found"),
         0x03 => (io::ErrorKind::NotFound, "the path was not found"),
         0x05 => (io::ErrorKind::PermissionDenied, "access is denied"),

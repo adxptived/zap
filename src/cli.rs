@@ -363,9 +363,7 @@ pub fn print_help() {
     println!("  --shred             Overwrite files with random data before deleting");
     println!("  --only-empty        Only delete if directory is empty");
     println!("  --recycle           Send to Recycle Bin instead of permanent delete");
-    println!(
-        "  --no-size-preview   Skip directory size calculation in the confirmation preview"
-    );
+    println!("  --no-size-preview   Skip directory size calculation in the confirmation preview");
     println!();
     println!("Options:");
     println!(

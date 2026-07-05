@@ -10,7 +10,7 @@ use std::{
 };
 
 use indicatif::{ProgressBar, ProgressStyle};
-use rayon::iter::{IntoParallelRefIterator, ParallelBridge, ParallelIterator};
+use rayon::iter::{ParallelBridge, ParallelIterator};
 use rayon::slice::ParallelSlice;
 
 use crate::filter::FilterConfig;
@@ -677,7 +677,6 @@ pub fn recycle_paths_validated(
 
     errors
 }
-
 
 /// Delete many already-selected top-level files/symlinks with one Rayon pass.
 ///

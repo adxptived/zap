@@ -181,7 +181,10 @@ fn parse_args() -> GuiArgs {
                 // Never treat an unrecognized flag as a path to delete —
                 // a typo in the context-menu registration must not turn
                 // into a deletion target shown in the dialog.
-                if arg.to_str().is_some_and(|s| s.len() > 1 && s.starts_with('-')) {
+                if arg
+                    .to_str()
+                    .is_some_and(|s| s.len() > 1 && s.starts_with('-'))
+                {
                     continue;
                 }
                 parsed.paths.push(PathBuf::from(arg));
