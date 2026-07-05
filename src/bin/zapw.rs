@@ -7,6 +7,7 @@ use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
+use zap::journal::{self, JournalAction, PathOutcome};
 use zap::{batch, cli, delete, path_utils};
 
 /// Internal flag used to distinguish the detached background worker
@@ -159,15 +160,37 @@ fn should_parallelize_top_level(options: &cli::CliOptions) -> bool {
 }
 
 fn run_silent_delete(options: &cli::CliOptions) -> bool {
+    let outcomes = run_silent_delete_outcomes(options);
+    let ok = outcomes.iter().all(|(_, err)| err.is_none());
+    record_journal(options, &outcomes);
+    ok
+}
+
+/// Delete all paths, returning a per-path outcome (`None` = success) so the
+/// operation journal can record exactly what happened. This is the only
+/// deletion entry point in zapw — context-menu deletions were previously
+/// the one surface that never journaled.
+fn run_silent_delete_outcomes(options: &cli::CliOptions) -> Vec<PathOutcome> {
     // Recycle mode: one SHFileOperationW call for the whole batch — single
     // shell roundtrip and a single Explorer "Undo" entry.
     #[cfg(windows)]
     if options.recycle && !options.dry_run {
-        return delete::recycle_paths_validated(&options.paths, false).is_empty();
+        let errors = delete::recycle_paths_validated(&options.paths, false);
+        return options
+            .paths
+            .iter()
+            .map(|path| {
+                let error = errors
+                    .iter()
+                    .find(|(failed, _)| failed == path)
+                    .map(|(_, err)| err.to_string());
+                (path.clone(), error)
+            })
+            .collect();
     }
 
-    let delete_one = |path: &Path| {
-        if options.dry_run {
+    let delete_one = |path: &Path| -> PathOutcome {
+        let result = if options.dry_run {
             delete::dry_run_path_silent(path)
         } else {
             // Build options via `to_delete_options` so recycle/shred/
@@ -175,18 +198,31 @@ fn run_silent_delete(options: &cli::CliOptions) -> bool {
             // manually here used to drop them, which made the context-menu
             // "Move to Recycle Bin" entry delete permanently.
             delete::delete_path(path, options.to_delete_options(false, false).silent())
-        }
+        };
+        (path.to_path_buf(), result.err().map(|err| err.to_string()))
     };
 
     if !should_parallelize_top_level(options) {
-        return options.paths.iter().all(|path| delete_one(path).is_ok());
+        return options.paths.iter().map(|p| delete_one(p)).collect();
     }
 
-    options
-        .paths
-        .par_iter()
-        .map(|path| delete_one(path).is_ok())
-        .reduce(|| true, |ok, item_ok| ok && item_ok)
+    options.paths.par_iter().map(|p| delete_one(p)).collect()
+}
+
+/// Mirror of the CLI journaling: best-effort, skipped for dry runs and when
+/// disabled by flag or environment.
+fn record_journal(options: &cli::CliOptions, outcomes: &[PathOutcome]) {
+    if options.dry_run || options.no_journal || journal::is_disabled_by_env() {
+        return;
+    }
+    let action = if options.recycle {
+        JournalAction::Recycle
+    } else if options.shred {
+        JournalAction::Shred
+    } else {
+        JournalAction::Delete
+    };
+    let _ = journal::record(action, outcomes);
 }
 
 struct BatchRun {

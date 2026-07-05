@@ -437,14 +437,14 @@ fn render_treemap_section(ui: &mut egui::Ui, app: &mut ZapApp) {
 
     if app.show_treemap {
         ui.add_space(4.0);
-        // Render while holding the lock — items are only read here, which
-        // avoids cloning the whole vector every frame.
+        // Render while holding the lock — the snapshot is only read here,
+        // which avoids cloning every frame. Entries are pre-sorted and
+        // capped by the collection thread; total is pre-computed.
         let guard = app.treemap_data.lock().unwrap();
         match guard.as_ref() {
-            Some(items) => {
+            Some(snapshot) => {
                 app.treemap_collecting = false;
-                let total = items.iter().map(|(_, sz)| sz).sum::<u64>();
-                treemap::treemap_ui(ui, items, total);
+                treemap::treemap_ui(ui, &snapshot.entries, snapshot.total);
             }
             None => {
                 treemap::treemap_ui(ui, &[], 0);
@@ -565,17 +565,15 @@ fn format_eta(secs: f32) -> String {
 fn byte_weighted_progress(app: &ZapApp, _counts: &StatusCounts) -> Option<f32> {
     let guard = app.item_sizes.lock().ok()?;
     let sizes = guard.as_ref()?;
-    let total: u64 = sizes.iter().map(|(_, sz)| sz).sum();
+    let total = sizes.total;
     if total == 0 {
         return None;
     }
-    // HashMap lookup keeps this O(n) per frame — a linear search per item
-    // would be quadratic on bulk selections with thousands of files.
-    let by_path: std::collections::HashMap<&Path, u64> =
-        sizes.iter().map(|(p, sz)| (p.as_path(), *sz)).collect();
+    // The size thread pre-builds the map and total, so per frame this is a
+    // single O(items) pass with O(1) lookups — no per-frame index rebuild.
     let mut done_bytes: f64 = 0.0;
     for item in &app.items {
-        let size = by_path.get(item.path.as_path()).copied().unwrap_or(0) as f64;
+        let size = sizes.by_path.get(&item.path).copied().unwrap_or(0) as f64;
         match &item.state {
             ItemState::Done | ItemState::Failed(_) => done_bytes += size,
             ItemState::Running => {

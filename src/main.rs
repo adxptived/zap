@@ -32,6 +32,7 @@ fn main() {
             cli::print_version();
             true
         }
+        cli::CliAction::ShowJournal(count) => show_journal(count),
         cli::CliAction::Run(options) => {
             if options.batch {
                 run_batch(&options, start)
@@ -48,6 +49,33 @@ fn main() {
 
     if !success {
         std::process::exit(1);
+    }
+}
+
+/// Print the most recent journal entries (newest last) plus the journal
+/// location, so users can audit what zap deleted and when.
+fn show_journal(count: usize) -> bool {
+    let path = journal::journal_path();
+    match journal::read_recent(count) {
+        Ok(lines) if lines.is_empty() => {
+            println!("Journal is empty ({})", path.display());
+            true
+        }
+        Ok(lines) => {
+            println!(
+                "{} most recent operations ({}):",
+                lines.len(),
+                path.display()
+            );
+            for line in lines {
+                println!("{line}");
+            }
+            true
+        }
+        Err(err) => {
+            cli::print_error(&err);
+            false
+        }
     }
 }
 

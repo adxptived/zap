@@ -4,6 +4,49 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+### Fixed
+
+- **zapw now journals context-menu deletions** — the Explorer context-menu
+  worker (the most common deletion surface) previously never wrote to the
+  operation journal; it now records per-path outcomes for direct, batch,
+  and late-drained deletions, honoring `--no-journal`/`ZAP_NO_JOURNAL`.
+- **Cancelled bulk deletions no longer reported as successes** — when Stop
+  interrupts a bulk file deletion, the skipped paths are now marked
+  "cancelled by user" instead of silently passing as deleted in the GUI
+  item list and the operation journal.
+
+### Added
+
+- **`zap --journal [N]`** — print the N most recent operation-journal
+  entries (default 20) plus the journal location, spanning the rotated
+  file when the current journal is short.
+- **Shred filename scrubbing** — after the overwrite passes, shredded files
+  are renamed to an anonymous name before removal so the original filename
+  no longer lingers in directory metadata; best-effort with a safe
+  fallback to plain removal.
+
+### Performance
+
+- **Faster shred** — the overwrite buffer grew from 64 KiB to 1 MiB
+  (capped at the file size), cutting syscall count ~16x on large files,
+  and the RNG handle is reused across chunks instead of re-created per
+  64 KiB block.
+
+- **Parallel size scanning** — `dir_size_recursive` now bridges the walk
+  onto the rayon pool so per-entry metadata reads run in parallel, resolves
+  plain files with a single metadata call (no jwalk spin-up), and the GUI
+  sizes all selected roots concurrently. Size badge and byte-weighted ETA
+  appear much sooner on large or bulk selections.
+- **Faster treemap collection** — `dir_size_tree` no longer walks every
+  file's ancestor chain (O(files × depth) allocations); sizes are credited
+  to the immediate parent and rolled up in one bottom-up pass.
+- **Cheaper treemap rendering** — entries are sorted, capped and summed once
+  in the collection thread; render frames no longer sort or sum the raw
+  entry list (which could hold tens of thousands of paths).
+- **O(1) event routing in zapg** — worker events are applied through a
+  path→index map per frame instead of a linear scan per event, and batch /
+  drag-and-drop dedup uses a HashSet instead of quadratic scans.
+
 ### Added
 
 - **Operation journal** — every real (non-dry-run) run is appended to

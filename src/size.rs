@@ -3,11 +3,26 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use rayon::iter::{ParallelBridge, ParallelIterator};
+
 pub fn dir_size_recursive(path: &Path) -> u64 {
+    // Fast path: plain files and symlinks need one metadata call, not a
+    // jwalk thread-pool spin-up. This matters when callers sum sizes over
+    // thousands of file roots (bulk Explorer selections).
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if !meta.is_dir() {
+            return meta.len();
+        }
+    }
+    // The per-entry metadata syscalls dominate this walk, and jwalk only
+    // parallelizes traversal — bridge the iterator onto rayon so metadata
+    // reads run across the thread pool too.
     jwalk::WalkDir::new(path)
         .follow_links(false)
         .skip_hidden(false)
+        .sort(false)
         .into_iter()
+        .par_bridge()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
         .map(|e| e.metadata().map(|m| m.len()).unwrap_or(0))
@@ -52,15 +67,16 @@ pub fn dir_size_tree(root: &Path) -> std::io::Result<Vec<(PathBuf, u64)>> {
 
         if file_type.is_file() {
             let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-            result.push((path.clone(), size));
-            for ancestor in path.ancestors().skip(1) {
-                if ancestor == root || ancestor.starts_with(root) {
-                    *dir_sizes.entry(ancestor.to_path_buf()).or_insert(0) += size;
-                }
-                if ancestor == root {
-                    break;
+            // Credit the size to the immediate parent only; totals are
+            // propagated to all ancestors in one bottom-up pass below.
+            // The previous per-file ancestor walk allocated O(depth)
+            // PathBufs per file, which dominated large-tree scans.
+            if let Some(parent) = path.parent() {
+                if parent.starts_with(root) {
+                    *dir_sizes.entry(parent.to_path_buf()).or_insert(0) += size;
                 }
             }
+            result.push((path, size));
         } else if file_type.is_symlink() {
             result.push((path, 0));
         } else if file_type.is_dir() {
@@ -68,10 +84,27 @@ pub fn dir_size_tree(root: &Path) -> std::io::Result<Vec<(PathBuf, u64)>> {
         }
     }
 
-    // Sort directories deepest-first for treemap layout stability
-    let mut dirs: Vec<_> = dir_sizes.into_iter().collect();
-    dirs.sort_by_key(|(path, _)| std::cmp::Reverse(path.components().count()));
-    result.extend(dirs);
+    // Propagate directory totals bottom-up: children are deeper than their
+    // parents, so one deepest-first pass rolls every subtree into its root.
+    let mut order: Vec<PathBuf> = dir_sizes.keys().cloned().collect();
+    order.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    for path in &order {
+        if path == root {
+            continue;
+        }
+        if let Some(parent) = path.parent() {
+            if parent.starts_with(root) {
+                let subtotal = dir_sizes.get(path).copied().unwrap_or(0);
+                *dir_sizes.entry(parent.to_path_buf()).or_insert(0) += subtotal;
+            }
+        }
+    }
+
+    // Directories stay deepest-first for treemap layout stability.
+    result.extend(order.into_iter().map(|path| {
+        let size = dir_sizes.get(&path).copied().unwrap_or(0);
+        (path, size)
+    }));
     Ok(result)
 }
 

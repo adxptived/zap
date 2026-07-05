@@ -6,6 +6,10 @@ use rand::RngCore;
 
 const MIN_SHRED_PASSES: usize = 1;
 
+/// Overwrite buffer size. 1 MiB keeps syscall count low on multi-GB files
+/// while staying cheap to allocate per shredded file.
+const SHRED_BUF_BYTES: usize = 1024 * 1024;
+
 pub fn shred_file(path: &Path, passes: usize) -> io::Result<()> {
     let passes = passes.max(MIN_SHRED_PASSES);
     let meta = fs::metadata(path)?;
@@ -31,7 +35,10 @@ pub fn shred_file(path: &Path, passes: usize) -> io::Result<()> {
         Err(e) => return Err(e),
     };
 
-    let mut buf = vec![0u8; 65536];
+    // Cap the buffer at the file length — no point allocating 1 MiB to
+    // shred a 4 KiB file.
+    let mut buf = vec![0u8; SHRED_BUF_BYTES.min(len.max(1) as usize)];
+    let mut rng = rand::thread_rng();
 
     for pass in 0..passes {
         file.seek(SeekFrom::Start(0))?;
@@ -40,7 +47,7 @@ pub fn shred_file(path: &Path, passes: usize) -> io::Result<()> {
         while written < len {
             let chunk = ((len - written) as usize).min(buf.len());
             if pass < passes - 1 {
-                rand::thread_rng().fill_bytes(&mut buf[..chunk]);
+                rng.fill_bytes(&mut buf[..chunk]);
             } else {
                 buf[..chunk].fill(0);
             }
@@ -55,6 +62,32 @@ pub fn shred_file(path: &Path, passes: usize) -> io::Result<()> {
     }
     drop(file);
 
+    remove_with_scrubbed_name(path)
+}
+
+/// The overwrite passes destroy the contents, but the original *filename*
+/// would still linger in directory metadata (and journals like NTFS $LogFile)
+/// after a plain remove. Rename to an anonymous name first so the deleted
+/// entry no longer reveals what the file was called. Best-effort: if the
+/// rename fails (e.g. a name collision or permissions), fall back to
+/// deleting under the original name — content destruction already happened.
+fn remove_with_scrubbed_name(path: &Path) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        let mut rng = rand::thread_rng();
+        for _ in 0..3 {
+            let name: String = (0..12)
+                .map(|_| char::from(b'a' + (rng.next_u32() % 26) as u8))
+                .collect();
+            let scrubbed = parent.join(name);
+            if scrubbed.exists() {
+                continue;
+            }
+            if fs::rename(path, &scrubbed).is_ok() {
+                return fs::remove_file(&scrubbed);
+            }
+            break;
+        }
+    }
     fs::remove_file(path)
 }
 
@@ -103,6 +136,19 @@ mod tests {
         let dir = temp_dir();
         let result = shred_file(&dir.join("no-such-file"), 1);
         assert!(result.is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_shred_leaves_directory_empty() {
+        // The name-scrubbing rename must not leave the anonymous file behind.
+        let dir = temp_dir();
+        let path = dir.join("secret-name.txt");
+        fs::write(&path, b"payload").unwrap();
+        shred_file(&path, 2).unwrap();
+        assert!(!path.exists());
+        let leftovers: Vec<_> = fs::read_dir(&dir).unwrap().collect();
+        assert!(leftovers.is_empty(), "no files may remain after shred");
         let _ = fs::remove_dir_all(&dir);
     }
 

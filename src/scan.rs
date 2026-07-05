@@ -72,39 +72,35 @@ impl ScanPlan {
             )
         });
 
-        self.dirs_by_depth = self
-            .dirs_by_depth
-            .into_iter()
-            .map(|batch| DirBatch {
-                entries: batch
-                    .entries
-                    .into_iter()
-                    .filter(|entry| {
-                        filter.matches_relative(
-                            &entry.path,
-                            base_dir,
-                            false,
-                            entry.file_size,
-                            entry.modified_time,
-                        )
-                    })
-                    .collect(),
-                depth: batch.depth,
-            })
-            .filter(|batch| !batch.entries.is_empty())
-            .collect();
+        // Filter each depth batch in place (retain) instead of rebuilding
+        // every entries vector, then drop batches that became empty.
+        for batch in &mut self.dirs_by_depth {
+            batch.entries.retain(|entry| {
+                filter.matches_relative(
+                    &entry.path,
+                    base_dir,
+                    false,
+                    entry.file_size,
+                    entry.modified_time,
+                )
+            });
+        }
+        self.dirs_by_depth.retain(|batch| !batch.entries.is_empty());
 
+        // Single pass over the retained entries instead of two filter+count
+        // scans of the same (potentially huge) vector.
+        let mut files = 0usize;
+        let mut symlinks = 0usize;
+        for entry in &self.files_and_links {
+            match entry.kind {
+                EntryKind::File => files += 1,
+                EntryKind::Symlink => symlinks += 1,
+                EntryKind::Dir { .. } => {}
+            }
+        }
         self.stats = ScanStats {
-            files: self
-                .files_and_links
-                .iter()
-                .filter(|e| matches!(e.kind, EntryKind::File))
-                .count(),
-            symlinks: self
-                .files_and_links
-                .iter()
-                .filter(|e| matches!(e.kind, EntryKind::Symlink))
-                .count(),
+            files,
+            symlinks,
             dirs: self.dirs_by_depth.iter().map(|b| b.entries.len()).sum(),
         };
 

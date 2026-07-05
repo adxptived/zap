@@ -696,13 +696,27 @@ pub fn delete_file_roots_bulk(
     let errors = Mutex::new(Vec::<(std::path::PathBuf, String)>::new());
     let cs = chunk_size(paths.len().max(1));
 
+    // Record a "cancelled" error for every path skipped after a stop
+    // request. Silence here would let callers (GUI items, the operation
+    // journal) report never-deleted paths as successes — the journal must
+    // reflect what actually happened on disk.
+    let mark_cancelled = |skipped: &[std::path::PathBuf]| {
+        if let Ok(mut guard) = errors.lock() {
+            for path in skipped {
+                guard.push((path.clone(), "cancelled by user".to_owned()));
+            }
+        }
+    };
+
     paths.par_chunks(cs).for_each(|chunk| {
         if crate::stop::is_stop_requested() {
+            mark_cancelled(chunk);
             return;
         }
-        for path in chunk {
+        for (i, path) in chunk.iter().enumerate() {
             crate::stop::wait_if_paused();
             if crate::stop::is_stop_requested() {
+                mark_cancelled(&chunk[i..]);
                 break;
             }
             let result = match std::fs::symlink_metadata(path) {
@@ -1040,6 +1054,43 @@ mod tests {
         assert_eq!(summary.errors[0].0, blocked);
         assert!(!ok.exists());
         assert!(blocked.exists());
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_delete_file_roots_bulk_marks_skipped_paths_cancelled_on_stop() {
+        // A stop request must not let skipped paths look like successes:
+        // the GUI and the operation journal treat "no error" as deleted.
+        let temp = create_test_dir();
+        let files: Vec<PathBuf> = (0..64)
+            .map(|i| {
+                let path = temp.join(format!("file-{i}.txt"));
+                File::create(&path).unwrap();
+                path
+            })
+            .collect();
+
+        // Serialize with all other tests that touch the global stop flag.
+        let _guard = crate::stop::TEST_FLAG_SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::stop::request_stop();
+        let summary = delete_file_roots_bulk(&files, false, None);
+        crate::stop::reset();
+
+        // Every path must be accounted for: deleted + errors == total.
+        assert_eq!(
+            summary.deleted as usize + summary.errors.len(),
+            files.len(),
+            "no path may silently disappear from the summary"
+        );
+        for (_, err) in &summary.errors {
+            assert_eq!(err, "cancelled by user");
+        }
+        // Paths reported as errors must still exist on disk.
+        for (path, _) in &summary.errors {
+            assert!(path.exists(), "cancelled path {path:?} was deleted");
+        }
         let _ = fs::remove_dir_all(&temp);
     }
 
