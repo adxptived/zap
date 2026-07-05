@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+### Performance
+
+- **Parallel size scanning** — `dir_size_recursive` now bridges the walk
+  onto the rayon pool so per-entry metadata reads run in parallel, resolves
+  plain files with a single metadata call (no jwalk spin-up), and the GUI
+  sizes all selected roots concurrently. Size badge and byte-weighted ETA
+  appear much sooner on large or bulk selections.
+- **Faster treemap collection** — `dir_size_tree` no longer walks every
+  file's ancestor chain (O(files × depth) allocations); sizes are credited
+  to the immediate parent and rolled up in one bottom-up pass.
+- **Cheaper treemap rendering** — entries are sorted, capped and summed once
+  in the collection thread; render frames no longer sort or sum the raw
+  entry list (which could hold tens of thousands of paths).
+- **O(1) event routing in zapg** — worker events are applied through a
+  path→index map per frame instead of a linear scan per event, and batch /
+  drag-and-drop dedup uses a HashSet instead of quadratic scans.
+
 ### Added
 
 - **Operation journal** — every real (non-dry-run) run is appended to

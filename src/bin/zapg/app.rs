@@ -78,8 +78,17 @@ pub enum WorkerEvent {
     Finished(Duration),
 }
 
-/// Treemap entries: (path, size) pairs shared with the collection thread.
-pub type TreemapData = Arc<Mutex<Option<Vec<(PathBuf, u64)>>>>;
+/// Treemap payload prepared once by the collection thread: entries are
+/// pre-sorted by size descending and truncated to the layout cap, and the
+/// total is pre-computed — so per-frame rendering never sorts or sums the
+/// (potentially huge) raw entry list.
+pub struct TreemapSnapshot {
+    pub entries: Vec<(PathBuf, u64)>,
+    pub total: u64,
+}
+
+/// Treemap data shared with the collection thread.
+pub type TreemapData = Arc<Mutex<Option<TreemapSnapshot>>>;
 
 /// Per-root byte sizes computed by the background size thread. Used both for
 /// the size badge (sum) and for byte-weighted progress/ETA: on mixed
@@ -342,17 +351,49 @@ impl ZapApp {
                 }
             }
         }
+        // Bulk runs deliver thousands of events per frame; a linear scan per
+        // event would be O(items × events). Build the path→index map once
+        // per drain instead.
+        let index: std::collections::HashMap<PathBuf, usize> = if events.is_empty() {
+            std::collections::HashMap::new()
+        } else {
+            self.items
+                .iter()
+                .enumerate()
+                .map(|(i, item)| (item.path.clone(), i))
+                .collect()
+        };
+        let apply = |items: &mut Vec<DeleteItem>,
+                     path: &Path,
+                     state: Option<ItemState>,
+                     progress: Option<Option<ProgressSnapshot>>| {
+            if let Some(&i) = index.get(path) {
+                if let Some(state) = state {
+                    items[i].state = state;
+                }
+                if let Some(progress) = progress {
+                    items[i].progress = progress;
+                }
+            }
+        };
         for event in events {
             match event {
-                WorkerEvent::Started(path) => self.set_state(&path, ItemState::Running),
-                WorkerEvent::Progress(path, p) => self.set_progress(&path, Some(p)),
+                WorkerEvent::Started(path) => {
+                    apply(&mut self.items, &path, Some(ItemState::Running), None)
+                }
+                WorkerEvent::Progress(path, p) => {
+                    apply(&mut self.items, &path, None, Some(Some(p)))
+                }
                 WorkerEvent::Done(path, Ok(())) => {
-                    self.set_progress(&path, None);
-                    self.set_state(&path, ItemState::Done);
+                    apply(&mut self.items, &path, Some(ItemState::Done), Some(None));
                 }
                 WorkerEvent::Done(path, Err(err)) => {
-                    self.set_progress(&path, None);
-                    self.set_state(&path, ItemState::Failed(err));
+                    apply(
+                        &mut self.items,
+                        &path,
+                        Some(ItemState::Failed(err)),
+                        Some(None),
+                    );
                 }
                 WorkerEvent::Finished(duration) => {
                     // Report active time only: pauses are not deletion work.
@@ -379,22 +420,6 @@ impl ZapApp {
         }
         if clear_receiver {
             self.receiver = None;
-        }
-    }
-
-    fn item_mut(&mut self, path: &Path) -> Option<&mut DeleteItem> {
-        self.items.iter_mut().find(|item| item.path == path)
-    }
-
-    fn set_state(&mut self, path: &Path, state: ItemState) {
-        if let Some(item) = self.item_mut(path) {
-            item.state = state;
-        }
-    }
-
-    fn set_progress(&mut self, path: &Path, progress: Option<ProgressSnapshot>) {
-        if let Some(item) = self.item_mut(path) {
-            item.progress = progress;
         }
     }
 
@@ -490,12 +515,19 @@ impl ZapApp {
     fn add_batch_paths_from(&mut self, paths_dir: &Path) -> bool {
         let mut paths = batch::read_batch_paths(paths_dir);
         path_utils::dedup_paths(&mut paths);
+        // Batch sessions can stream thousands of paths across polls; a
+        // linear scan per candidate would be quadratic. Dedup via HashSet.
+        let existing: std::collections::HashSet<&Path> =
+            self.items.iter().map(|item| item.path.as_path()).collect();
+        let new_paths: Vec<PathBuf> = paths
+            .into_iter()
+            .filter(|path| !existing.contains(path.as_path()))
+            .collect();
+        drop(existing);
         let mut changed = false;
-        for path in paths {
-            if !self.items.iter().any(|item| item.path == path) {
-                self.items.push(DeleteItem::pending(path));
-                changed = true;
-            }
+        for path in new_paths {
+            self.items.push(DeleteItem::pending(path));
+            changed = true;
         }
         if changed {
             // Late-arriving batch paths may include protected system paths.
@@ -520,11 +552,15 @@ impl ZapApp {
         if self.is_running() || paths.is_empty() {
             return;
         }
+        let existing: std::collections::HashSet<&Path> =
+            self.items.iter().map(|item| item.path.as_path()).collect();
+        let new_paths: Vec<PathBuf> = paths
+            .into_iter()
+            .filter(|path| !existing.contains(path.as_path()))
+            .collect();
+        drop(existing);
         let mut added = false;
-        for path in paths {
-            if self.items.iter().any(|item| item.path == path) {
-                continue;
-            }
+        for path in new_paths {
             self.items.push(DeleteItem::pending(path));
             added = true;
         }
@@ -564,8 +600,13 @@ impl ZapApp {
         let data_handle = Arc::clone(&self.treemap_data);
         let roots: Vec<PathBuf> = self.items.iter().map(|i| i.path.clone()).collect();
         thread::spawn(move || {
-            let entries = collect_treemap_entries(&roots);
-            *data_handle.lock().unwrap() = Some(entries);
+            let mut entries = collect_treemap_entries(&roots);
+            // Sort/sum once here so every render frame works on a small,
+            // ready-to-layout slice instead of the raw entry list.
+            let total: u64 = entries.iter().map(|(_, sz)| sz).sum();
+            entries.sort_by_key(|(_, sz)| std::cmp::Reverse(*sz));
+            entries.truncate(zap::treemap::MAX_LAYOUT_ITEMS);
+            *data_handle.lock().unwrap() = Some(TreemapSnapshot { entries, total });
         });
     }
 }
@@ -656,10 +697,14 @@ impl DeleteItem {
 
 fn spawn_size_calculation(total: Arc<Mutex<Option<u64>>>, sizes: ItemSizes, paths: Vec<PathBuf>) {
     thread::spawn(move || {
+        use rayon::prelude::*;
         // One pass computes both the per-root sizes (byte-weighted ETA) and
-        // their sum (size badge) — no duplicate directory walks.
+        // their sum (size badge) — no duplicate directory walks. Roots are
+        // sized in parallel: bulk Explorer selections have thousands of
+        // file roots and `dir_size_recursive` resolves each plain file with
+        // a single metadata call.
         let per_root: Vec<(PathBuf, u64)> = paths
-            .into_iter()
+            .into_par_iter()
             .map(|p| {
                 let sz = size::dir_size_recursive(&p);
                 (p, sz)

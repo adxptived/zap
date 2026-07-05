@@ -437,14 +437,14 @@ fn render_treemap_section(ui: &mut egui::Ui, app: &mut ZapApp) {
 
     if app.show_treemap {
         ui.add_space(4.0);
-        // Render while holding the lock — items are only read here, which
-        // avoids cloning the whole vector every frame.
+        // Render while holding the lock — the snapshot is only read here,
+        // which avoids cloning every frame. Entries are pre-sorted and
+        // capped by the collection thread; total is pre-computed.
         let guard = app.treemap_data.lock().unwrap();
         match guard.as_ref() {
-            Some(items) => {
+            Some(snapshot) => {
                 app.treemap_collecting = false;
-                let total = items.iter().map(|(_, sz)| sz).sum::<u64>();
-                treemap::treemap_ui(ui, items, total);
+                treemap::treemap_ui(ui, &snapshot.entries, snapshot.total);
             }
             None => {
                 treemap::treemap_ui(ui, &[], 0);
