@@ -520,9 +520,7 @@ fn record_journal(options: &cli::CliOptions, errors: &[(PathBuf, std::io::Error)
         .paths
         .iter()
         .map(|path| {
-            let error = error_by_path
-                .get(path.as_path())
-                .map(|err| err.to_string());
+            let error = error_by_path.get(path.as_path()).map(|err| err.to_string());
             (path.clone(), error)
         })
         .collect();

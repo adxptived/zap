@@ -101,7 +101,7 @@ pub fn top_files(roots: &[PathBuf], count: usize) -> Vec<(PathBuf, u64)> {
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().is_file())
             .filter_map(|e| e.metadata().ok().map(|m| (e.path(), m.len())))
-            .fold(Vec::new, |acc, item| fold(acc, item))
+            .fold(Vec::new, &fold)
             .reduce(Vec::new, |a, b| b.into_iter().fold(a, fold));
         top = per_root.into_iter().fold(top, fold);
     }
@@ -193,18 +193,18 @@ mod tests {
         fs::create_dir(&sub).unwrap();
         fs::write(sub.join("medium.bin"), vec![0u8; 100]).unwrap();
 
-        let top = top_files(&[root.clone()], 2);
+        let top = top_files(std::slice::from_ref(&root), 2);
         assert_eq!(top.len(), 2);
         assert!(top[0].0.ends_with("big.bin") && top[0].1 == 300);
         assert!(top[1].0.ends_with("medium.bin") && top[1].1 == 100);
 
         // Asking for more than exists returns everything, still sorted.
-        let all = top_files(&[root.clone()], 10);
+        let all = top_files(std::slice::from_ref(&root), 10);
         assert_eq!(all.len(), 3);
         assert!(all[2].0.ends_with("small.bin"));
 
         // count == 0 short-circuits.
-        assert!(top_files(&[root.clone()], 0).is_empty());
+        assert!(top_files(std::slice::from_ref(&root), 0).is_empty());
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -226,7 +226,7 @@ mod tests {
         );
 
         // A file given directly as a root is reported too.
-        let top = top_files(&[inner.clone()], 5);
+        let top = top_files(std::slice::from_ref(&inner), 5);
         assert_eq!(top.len(), 1);
         assert_eq!(top[0].1, 50);
 

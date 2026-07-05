@@ -57,12 +57,16 @@ open the **Zap** submenu.
 | Menu item | Behavior |
 | --- | --- |
 | **Delete...** | Opens the GUI confirmation dialog. This is the default and safest flow. |
+| **Move to Recycle Bin** | Sends the selection to the Recycle Bin (one Undo restores everything). |
 | **Zap Delete** | Deletes immediately with no GUI and no terminal window. |
+| **Shred (secure delete)...** | Opens the confirmation dialog with Shred pre-selected. Never silent — overwriting is unrecoverable. |
 
 The GUI dialog supports:
 
 - **Preview only** to scan without deleting.
 - **Limit threads** to cap Rayon worker threads.
+- **Shred** with a configurable number of overwrite passes (1–35).
+- **Show largest files** panel to see what dominates the selection size before deleting.
 - Automatic close after successful destructive deletion.
 - Visible failure state when deletion cannot complete.
 
@@ -84,15 +88,21 @@ zap --version
 | `--threads N`, `-j N` | Override the Rayon worker thread count. |
 | `--silent` | Suppress progress output. Used by `zapw.exe`. |
 | `--batch` | Internal Explorer multi-select coordination flag. |
-| `--shred` | Overwrite files with random data before deleting (3 passes). Note: file names/MFT records are not wiped, and on SSDs wear-leveling means overwrites are best-effort. |
+| `--shred` | Overwrite files with random data before deleting (3 passes by default). Note: file names/MFT records are not wiped, and on SSDs wear-leveling means overwrites are best-effort. |
+| `--shred-passes N` | Number of overwrite passes for `--shred` (1–35, default 3). Implies `--shred`. |
 | `--only-empty` | Only delete if the directory is empty. |
 | `--recycle` | Send to Recycle Bin instead of permanent delete (also a checkbox in the GUI dialog and an Explorer context-menu entry). Batched: one shell call / one Undo for the whole selection. |
 | `--no-size-preview` | Show the confirmation prompt immediately without calculating preview sizes. Useful for huge trees where sizing would feel like a hang. |
 | `--include GLOB` | Only delete paths matching glob pattern (repeatable). |
 | `--exclude GLOB` | Skip paths matching glob pattern (repeatable). |
 | `--min-size SIZE` | Only delete files larger than SIZE (bytes, or `10k`, `5mb`, `1.5g`, `2tb`). |
+| `--max-size SIZE` | Only delete files of at most SIZE (same formats as `--min-size`). Files whose size cannot be read are kept (fail closed). |
 | `--newer-than WHEN` | Only delete files newer than a date/time (RFC 3339) or age (e.g. `12h`, `30d`). |
 | `--older-than WHEN` | Only delete files older than a date/time (RFC 3339) or age (e.g. `12h`, `30d`). |
+| `--json` | Print one machine-readable JSON summary on stdout (implies `--silent`). For scripts. |
+| `--journal [N]` | Show the N most recent journal entries (default 20) and exit. |
+| `--journal-clear` | Delete the operation journal (including the rotated file) and exit. |
+| `--top N` | Report the N largest files under the given paths and exit. No deletion; combinable with `--json`. |
 | `--` | Treat every following argument as a path (for names starting with `-`). |
 
 Examples:
@@ -104,6 +114,9 @@ zap --yes --threads 4 "C:\temp\huge-repo"
 zap --no-size-preview "C:\temp\huge-repo"
 zap --yes --shred "C:\temp\secret-files"
 zap --yes --exclude "*.log" --min-size 10mb "C:\temp\project"
+zap --yes --shred-passes 7 "C:\temp\secret-files"
+zap --top 20 "C:\Users\me\Downloads"
+zap --json --yes "C:\temp\build-output"
 zap --yes -- "-weird-folder-name"
 ```
 

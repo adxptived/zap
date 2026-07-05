@@ -31,6 +31,25 @@ All notable changes to this project will be documented in this file.
 - **`zap --journal [N]`** — print the N most recent operation-journal
   entries (default 20) plus the journal location, spanning the rotated
   file when the current journal is short.
+- **`zap --journal-clear`** — delete the operation journal (including the
+  rotated file) in one command.
+- **`zap --max-size SIZE`** — complement to `--min-size`: only delete
+  files of at most SIZE. Files whose size cannot be read are kept (fail
+  closed). Combines with `--min-size` into a size band.
+- **`zap --shred-passes N`** — configurable overwrite pass count for
+  shred (1–35, default 3); implies `--shred`. Also available as a slider
+  in the GUI dialog when Shred is checked.
+- **`zap --json`** — machine-readable JSON summary on stdout for scripts
+  (implies `--silent`): ok/total/failed counts, elapsed time, succeeded
+  paths, and per-path errors. Also works with `--top`.
+- **`zap --top N <path>...`** — report the N largest files under the given
+  paths without deleting anything; overlapping roots are deduplicated.
+- **GUI "Show largest files" panel** — collapsible report of the 10
+  biggest files in the selection, collected in the background, so you can
+  see what dominates the size badge before committing.
+- **Explorer "Shred (secure delete)…" menu entry** — opens the
+  confirmation dialog with Shred pre-selected (`zapg --shred`). Never
+  silent: overwriting is unrecoverable, so the dialog is mandatory.
 - **Shred filename scrubbing** — after the overwrite passes, shredded files
   are renamed to an anonymous name before removal so the original filename
   no longer lingers in directory metadata; best-effort with a safe
@@ -38,6 +57,18 @@ All notable changes to this project will be documented in this file.
 
 ### Performance
 
+- **Long-path support doubles as a fix** — Win32 delete/metadata calls now
+  use verbatim `\\?\` paths, skipping per-call path normalization and
+  making deletes work beyond the 260-char `MAX_PATH` limit (deep
+  `node_modules` trees).
+- **One less syscall per directory during scans** — the reparse-point
+  check reuses metadata already fetched for the size preview instead of
+  issuing a separate `GetFileAttributesW` per directory.
+- **Faster locked/readonly recovery** — the POSIX force-delete
+  (`FILE_DISPOSITION_INFO_EX` + `IGNORE_READONLY_ATTRIBUTE`) is now the
+  first retry for `PermissionDenied` failures instead of the last resort,
+  resolving the common Windows failure modes in one shot without the
+  clear-readonly dance or sleep loops.
 - **O(paths) journal recording** — per-path error lookup during journal
   recording now uses a hash map instead of a linear scan per path,
   removing an O(paths × errors) hotspot on bulk runs with mass failures.

@@ -534,7 +534,9 @@ pub fn print_help() {
         "  --shred-passes N    Overwrite passes for --shred (1–{}, default {}; implies --shred)",
         MAX_SHRED_PASSES, DEFAULT_SHRED_PASSES
     );
-    println!("  --top N             Report the N largest files under the paths and exit (no deletion)");
+    println!(
+        "  --top N             Report the N largest files under the paths and exit (no deletion)"
+    );
     println!("  --                  Treat all remaining arguments as paths");
     println!();
     println!("Examples:");

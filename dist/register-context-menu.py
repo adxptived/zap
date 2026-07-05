@@ -124,6 +124,16 @@ def register_context_menu(menu_root, target_placeholder):
         f'"{ZAPW_PATH}" --batch --silent --yes "{target_placeholder}"',
         f'"{ICON_PATH}"',
     )
+    # Shred opens the confirmation dialog (never silent): overwriting data
+    # is unrecoverable, so the user must always see and confirm the
+    # selection before it runs.
+    add_menu_item(
+        menu_root,
+        "zap-shred",
+        "Shred (secure delete)...",
+        f'"{ZAPG_PATH}" --batch --shred "{target_placeholder}"',
+        f'"{ICON_PATH}"',
+    )
 
 
 try:

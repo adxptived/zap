@@ -73,4 +73,15 @@ if errorlevel 1 exit /b 1
 reg add "%ROOT%\shell\zap-delete\command" /f /ve /t REG_SZ /d "\"%ZAPW_EXE%\" --batch --silent --yes \"%TARGET%\"" >nul
 if errorlevel 1 exit /b 1
 
+rem Shred opens the confirmation dialog (never silent): overwriting data is
+rem unrecoverable, so the user must always see and confirm what is selected.
+reg add "%ROOT%\shell\zap-shred" /f /v "MUIVerb" /t REG_SZ /d "Shred (secure delete)..." >nul
+if errorlevel 1 exit /b 1
+reg add "%ROOT%\shell\zap-shred" /f /v "MultiSelectModel" /t REG_SZ /d "Document" >nul
+if errorlevel 1 exit /b 1
+reg add "%ROOT%\shell\zap-shred" /f /v "Icon" /t REG_SZ /d "\"%ICON%\"" >nul
+if errorlevel 1 exit /b 1
+reg add "%ROOT%\shell\zap-shred\command" /f /ve /t REG_SZ /d "\"%ZAPG_EXE%\" --batch --shred \"%TARGET%\"" >nul
+if errorlevel 1 exit /b 1
+
 exit /b 0

@@ -80,7 +80,10 @@ fn main() -> eframe::Result<()> {
             } else {
                 ZapApp::new(paths, args.threads, None)
             };
-            app.recycle = args.recycle;
+            // --shred and --recycle are mutually exclusive in the app UI;
+            // shred wins if a broken registration passes both.
+            app.recycle = args.recycle && !args.shred;
+            app.shred = args.shred;
             app.no_journal = args.no_journal;
             Ok(Box::new(app))
         }),
@@ -159,6 +162,8 @@ fn try_become_coordinator(own_paths: &[PathBuf]) -> CoordinatorOutcome {
 struct GuiArgs {
     batch: bool,
     recycle: bool,
+    /// Open the dialog with Shred pre-selected (context-menu "Shred" verb).
+    shred: bool,
     no_journal: bool,
     threads: Option<usize>,
     paths: Vec<PathBuf>,
@@ -171,6 +176,7 @@ fn parse_args() -> GuiArgs {
         match arg.to_str() {
             Some("--batch") => parsed.batch = true,
             Some("--recycle") => parsed.recycle = true,
+            Some("--shred") => parsed.shred = true,
             Some("--no-journal") => parsed.no_journal = true,
             Some("--threads") | Some("-j") => {
                 if let Some(value) = args.next() {

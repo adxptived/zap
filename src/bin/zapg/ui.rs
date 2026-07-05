@@ -176,6 +176,8 @@ impl eframe::App for ZapApp {
 
                 ui.add_space(6.0);
                 render_treemap_section(ui, self);
+                ui.add_space(4.0);
+                render_top_files_section(ui, self);
             });
     }
 }
@@ -468,12 +470,9 @@ fn render_top_files_section(ui: &mut egui::Ui, app: &mut ZapApp) {
                     for (path, bytes) in entries {
                         ui.horizontal(|ui| {
                             ui.label(
-                                egui::RichText::new(format!(
-                                    "{:>10}",
-                                    size::format_size(*bytes)
-                                ))
-                                .size(11.0)
-                                .monospace(),
+                                egui::RichText::new(format!("{:>10}", size::format_size(*bytes)))
+                                    .size(11.0)
+                                    .monospace(),
                             );
                             let name = path.display().to_string();
                             ui.label(egui::RichText::new(compact_text(&name, 52)).size(11.0))
