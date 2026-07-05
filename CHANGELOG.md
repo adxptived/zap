@@ -4,7 +4,22 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+### Added
+
+- **`zap --journal [N]`** — print the N most recent operation-journal
+  entries (default 20) plus the journal location, spanning the rotated
+  file when the current journal is short.
+- **Shred filename scrubbing** — after the overwrite passes, shredded files
+  are renamed to an anonymous name before removal so the original filename
+  no longer lingers in directory metadata; best-effort with a safe
+  fallback to plain removal.
+
 ### Performance
+
+- **Faster shred** — the overwrite buffer grew from 64 KiB to 1 MiB
+  (capped at the file size), cutting syscall count ~16x on large files,
+  and the RNG handle is reused across chunks instead of re-created per
+  64 KiB block.
 
 - **Parallel size scanning** — `dir_size_recursive` now bridges the walk
   onto the rayon pool so per-entry metadata reads run in parallel, resolves

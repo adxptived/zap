@@ -113,6 +113,42 @@ fn sanitize_field(s: &str) -> String {
     }
 }
 
+/// Read the most recent `limit` journal lines (newest last). Falls back to
+/// the rotated file when the current journal has fewer lines than requested,
+/// so recent history survives a rotation. Missing files yield an empty list.
+pub fn read_recent(limit: usize) -> io::Result<Vec<String>> {
+    read_recent_from(&journal_path(), limit)
+}
+
+/// Testable core of [`read_recent`].
+pub fn read_recent_from(path: &Path, limit: usize) -> io::Result<Vec<String>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let read_lines = |p: &Path| -> io::Result<Vec<String>> {
+        match fs::read_to_string(p) {
+            Ok(content) => Ok(content.lines().map(str::to_owned).collect()),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(err) => Err(err),
+        }
+    };
+    let mut lines = read_lines(path)?;
+    if lines.len() < limit {
+        let rotated = path.with_extension("1.log");
+        let mut older = read_lines(&rotated)?;
+        let need = limit - lines.len();
+        if older.len() > need {
+            older.drain(..older.len() - need);
+        }
+        older.append(&mut lines);
+        lines = older;
+    }
+    if lines.len() > limit {
+        lines.drain(..lines.len() - limit);
+    }
+    Ok(lines)
+}
+
 fn rotate_if_needed(path: &Path) -> io::Result<()> {
     let size = match fs::metadata(path) {
         Ok(meta) => meta.len(),
@@ -194,6 +230,28 @@ mod tests {
         let journal = test_journal_file();
         record_to(&journal, JournalAction::Delete, &[]).unwrap();
         assert!(!journal.exists());
+        cleanup(&journal);
+    }
+
+    #[test]
+    fn read_recent_returns_newest_lines_and_spans_rotation() {
+        let journal = test_journal_file();
+        fs::create_dir_all(journal.parent().unwrap()).unwrap();
+        fs::write(journal.with_extension("1.log"), "old1\nold2\nold3\n").unwrap();
+        fs::write(&journal, "new1\nnew2\n").unwrap();
+
+        // Within the current file only.
+        assert_eq!(read_recent_from(&journal, 2).unwrap(), vec!["new1", "new2"]);
+        // Spills into the rotated file, oldest first.
+        assert_eq!(
+            read_recent_from(&journal, 4).unwrap(),
+            vec!["old2", "old3", "new1", "new2"]
+        );
+        // Asking for more than exists returns everything.
+        assert_eq!(read_recent_from(&journal, 99).unwrap().len(), 5);
+        // Missing journal is not an error.
+        let missing = journal.parent().unwrap().join("nope.log");
+        assert!(read_recent_from(&missing, 5).unwrap().is_empty());
         cleanup(&journal);
     }
 

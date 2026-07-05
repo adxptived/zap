@@ -63,7 +63,12 @@ pub enum CliAction {
     Run(CliOptions),
     PrintHelp,
     PrintVersion,
+    /// Print the most recent journal entries (`--journal [N]`, default 20).
+    ShowJournal(usize),
 }
+
+/// Default number of journal entries shown by `--journal`.
+pub const DEFAULT_JOURNAL_ENTRIES: usize = 20;
 
 /// Parse a byte count that optionally carries a binary unit suffix
 /// (`k`/`kb`, `m`/`mb`, `g`/`gb`, `t`/`tb`, case-insensitive). Plain
@@ -159,6 +164,23 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> io::Result<CliAct
             }
             Some("--help") | Some("-h") => return Ok(CliAction::PrintHelp),
             Some("--version") | Some("-V") => return Ok(CliAction::PrintVersion),
+            Some("--journal") => {
+                // Optional count: `--journal 50`. A following path or flag
+                // means "use the default count".
+                let mut count = DEFAULT_JOURNAL_ENTRIES;
+                if let Some(next) = iter.next() {
+                    match next.to_str().and_then(|s| s.parse::<usize>().ok()) {
+                        Some(n) if n > 0 => count = n,
+                        _ => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "--journal takes an optional positive entry count",
+                            ))
+                        }
+                    }
+                }
+                return Ok(CliAction::ShowJournal(count));
+            }
             Some("--exclude") => {
                 let value = iter.next().ok_or_else(|| {
                     io::Error::new(
@@ -370,6 +392,7 @@ pub fn print_help() {
     println!("  --recycle           Send to Recycle Bin instead of permanent delete");
     println!("  --no-size-preview   Skip directory size calculation in the confirmation preview");
     println!("  --no-journal        Do not record this run in the operation journal");
+    println!("  --journal [N]       Show the N most recent journal entries (default 20) and exit");
     println!();
     println!("Options:");
     println!(
@@ -427,6 +450,20 @@ mod tests {
     #[test]
     fn test_parse_time_spec_rejects_garbage() {
         assert!(parse_time_spec("yesterday-ish").is_err());
+    }
+
+    #[test]
+    fn test_parse_args_journal_default_and_explicit_count() {
+        match parse_args([OsString::from("--journal")]).unwrap() {
+            CliAction::ShowJournal(n) => assert_eq!(n, DEFAULT_JOURNAL_ENTRIES),
+            other => panic!("expected ShowJournal, got {other:?}"),
+        }
+        match parse_args([OsString::from("--journal"), OsString::from("50")]).unwrap() {
+            CliAction::ShowJournal(n) => assert_eq!(n, 50),
+            other => panic!("expected ShowJournal, got {other:?}"),
+        }
+        assert!(parse_args([OsString::from("--journal"), OsString::from("0")]).is_err());
+        assert!(parse_args([OsString::from("--journal"), OsString::from("abc")]).is_err());
     }
 
     #[test]
