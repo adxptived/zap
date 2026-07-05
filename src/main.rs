@@ -1,7 +1,7 @@
 use indicatif::{MultiProgress, ProgressStyle};
 use owo_colors::{AnsiColors, OwoColorize};
 use std::collections::HashSet;
-use std::fs::{self, File};
+use std::fs;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -83,14 +83,35 @@ const BATCH_INITIAL_QUIET_POLLS: usize = 10;
 const BATCH_FINAL_QUIET_POLLS: usize = 30;
 const BATCH_MAX_POLLS: usize = 300;
 
-fn write_error_log(errors: &[(PathBuf, std::io::Error)]) {
-    let log_path = std::env::temp_dir().join("zap-errors.log");
-    if let Ok(file) = File::create(&log_path) {
+/// Write the failure list to a per-run log file and return its path.
+///
+/// The name includes the process id and `create_new` refuses to follow a
+/// pre-existing file, so another local user cannot pre-plant a predictable
+/// path (the old fixed `zap-errors.log` name was truncate-on-create).
+fn write_error_log(errors: &[(PathBuf, std::io::Error)]) -> Option<PathBuf> {
+    let pid = std::process::id();
+    for attempt in 0u32..16 {
+        let name = if attempt == 0 {
+            format!("zap-errors-{pid}.log")
+        } else {
+            format!("zap-errors-{pid}-{attempt}.log")
+        };
+        let log_path = std::env::temp_dir().join(name);
+        let file = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&log_path)
+        {
+            Ok(file) => file,
+            Err(_) => continue,
+        };
         let mut w = BufWriter::new(file);
         for (path, err) in errors {
             let _ = writeln!(w, "{}: {}", path.display(), err);
         }
+        return Some(log_path);
     }
+    None
 }
 
 fn elapsed_color(elapsed_secs: f32) -> AnsiColors {
@@ -342,21 +363,19 @@ fn run_delete(options: &cli::CliOptions, start: Instant) -> bool {
         }
         true
     } else {
-        write_error_log(&errors);
+        let log_path = write_error_log(&errors);
         eprintln!(
             "\n{} {} path(s) failed out of {}",
             " SUMMARY ".on_color(AnsiColors::BrightRed).black(),
             errors.len(),
             options.paths.len()
         );
-        eprintln!(
-            "{}",
-            format!(
-                "  Errors written to {}",
-                std::env::temp_dir().join("zap-errors.log").display()
-            )
-            .dimmed()
-        );
+        if let Some(log_path) = log_path {
+            eprintln!(
+                "{}",
+                format!("  Errors written to {}", log_path.display()).dimmed()
+            );
+        }
         false
     }
 }
@@ -374,14 +393,19 @@ fn record_journal(options: &cli::CliOptions, errors: &[(PathBuf, std::io::Error)
     } else {
         journal::JournalAction::Delete
     };
+    // Path→error lookup is built once: a linear `find` per path would be
+    // O(paths × errors), noticeable on bulk runs with mass failures.
+    let error_by_path: std::collections::HashMap<&Path, &std::io::Error> = errors
+        .iter()
+        .map(|(path, err)| (path.as_path(), err))
+        .collect();
     let outcomes: Vec<journal::PathOutcome> = options
         .paths
         .iter()
         .map(|path| {
-            let error = errors
-                .iter()
-                .find(|(failed, _)| failed == path)
-                .map(|(_, err)| err.to_string());
+            let error = error_by_path
+                .get(path.as_path())
+                .map(|err| err.to_string());
             (path.clone(), error)
         })
         .collect();

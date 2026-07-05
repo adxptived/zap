@@ -127,6 +127,10 @@ pub struct ZapApp {
     pub danger_confirmed: bool,
     pub recycle: bool,
     pub shred: bool,
+    /// Disable the operation journal for this run (`--no-journal`), matching
+    /// the CLI surfaces. `ZAP_NO_JOURNAL` is checked separately at record
+    /// time.
+    pub no_journal: bool,
     /// Taskbar progress mirror (Windows only). Lazily created on the UI
     /// thread once the window exists; `None` + `taskbar_unavailable` set
     /// means COM failed and we stop retrying.
@@ -165,6 +169,7 @@ impl ZapApp {
             dry_run: false,
             recycle: false,
             shred: false,
+            no_journal: false,
             #[cfg(windows)]
             taskbar: None,
             #[cfg(windows)]
@@ -222,7 +227,7 @@ impl ZapApp {
                 // Batch collection failed — keep initial paths
             }
             Err(mpsc::TryRecvError::Empty) => {
-                // Not ready yet — put the receiver back
+                // Not ready yet �� put the receiver back
                 self.batch_collecting = Some(batch_rx);
             }
             Err(mpsc::TryRecvError::Disconnected) => {
@@ -295,6 +300,7 @@ impl ZapApp {
         let dry_run = self.dry_run;
         let recycle = self.recycle;
         let shred = self.shred;
+        let no_journal = self.no_journal;
         let (sender, receiver) = mpsc::channel();
         self.receiver = Some(receiver);
         self.started_at = Some(Instant::now());
@@ -330,7 +336,7 @@ impl ZapApp {
             }
             // Record the run in the operation journal (audit trail). A dry
             // run changes nothing on disk, so it is not journaled.
-            if !dry_run && !journal::is_disabled_by_env() {
+            if !dry_run && !no_journal && !journal::is_disabled_by_env() {
                 let action = if recycle {
                     JournalAction::Recycle
                 } else if shred {

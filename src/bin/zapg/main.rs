@@ -81,6 +81,7 @@ fn main() -> eframe::Result<()> {
                 ZapApp::new(paths, args.threads, None)
             };
             app.recycle = args.recycle;
+            app.no_journal = args.no_journal;
             Ok(Box::new(app))
         }),
     )
@@ -158,6 +159,7 @@ fn try_become_coordinator(own_paths: &[PathBuf]) -> CoordinatorOutcome {
 struct GuiArgs {
     batch: bool,
     recycle: bool,
+    no_journal: bool,
     threads: Option<usize>,
     paths: Vec<PathBuf>,
 }
@@ -169,6 +171,7 @@ fn parse_args() -> GuiArgs {
         match arg.to_str() {
             Some("--batch") => parsed.batch = true,
             Some("--recycle") => parsed.recycle = true,
+            Some("--no-journal") => parsed.no_journal = true,
             Some("--threads") | Some("-j") => {
                 if let Some(value) = args.next() {
                     parsed.threads = value

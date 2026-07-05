@@ -176,14 +176,17 @@ fn run_silent_delete_outcomes(options: &cli::CliOptions) -> Vec<PathOutcome> {
     #[cfg(windows)]
     if options.recycle && !options.dry_run {
         let errors = delete::recycle_paths_validated(&options.paths, false);
+        // Build the path→error lookup once instead of a linear `find` per
+        // path (O(paths × errors) on bulk runs with mass failures).
+        let error_by_path: std::collections::HashMap<&Path, String> = errors
+            .iter()
+            .map(|(path, err)| (path.as_path(), err.to_string()))
+            .collect();
         return options
             .paths
             .iter()
             .map(|path| {
-                let error = errors
-                    .iter()
-                    .find(|(failed, _)| failed == path)
-                    .map(|(_, err)| err.to_string());
+                let error = error_by_path.get(path.as_path()).cloned();
                 (path.clone(), error)
             })
             .collect();

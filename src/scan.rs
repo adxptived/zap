@@ -189,6 +189,14 @@ pub(crate) fn scan_into_channel(
     let mut depth_buckets: Vec<Vec<ScannedEntry>> = Vec::new();
     let mut stats = ScanStats::default();
     let mut count: u64 = 0;
+    // Directories whose reparse status could not be verified (e.g. access
+    // denied on GetFileAttributesW). Fail closed for the subtree only: skip
+    // the directory and everything beneath it instead of aborting the whole
+    // run. jwalk yields a directory before its children, so prefix filtering
+    // is sufficient. The parent directory removal will fail later and be
+    // reported in the failure summary.
+    #[cfg(windows)]
+    let mut unverified_subtrees: Vec<std::path::PathBuf> = Vec::new();
 
     for res in jwalk::WalkDir::new(path)
         .follow_links(false)
@@ -217,6 +225,10 @@ pub(crate) fn scan_into_channel(
             Err(_) => continue,
         };
         let p = entry.path();
+        #[cfg(windows)]
+        if unverified_subtrees.iter().any(|s| p.starts_with(s)) {
+            continue;
+        }
         let ft = entry.file_type();
         let cached_meta = collect_metadata.then(|| entry.metadata().ok()).flatten();
 
@@ -228,11 +240,12 @@ pub(crate) fn scan_into_channel(
                 match crate::winapi::is_reparse_point(&p) {
                     Ok(true) => EntryKind::Symlink,
                     Ok(false) => EntryKind::Dir { depth: entry.depth },
-                    Err(err) => {
-                        return Err(io::Error::new(
-                            err.kind(),
-                            format!("failed to inspect {}: {}", p.display(), err),
-                        ));
+                    Err(_) => {
+                        // Cannot prove this is a plain directory — it could be
+                        // a junction whose target must never be deleted. Skip
+                        // the whole subtree (fail closed) rather than abort.
+                        unverified_subtrees.push(p);
+                        continue;
                     }
                 }
             }
@@ -388,6 +401,10 @@ fn walk_entries_with(
     };
 
     let mut count: u64 = 0;
+    // See scan_into_channel: skip subtrees whose reparse status could not be
+    // verified instead of aborting the whole run (fail closed per-subtree).
+    #[cfg(windows)]
+    let mut unverified_subtrees: Vec<std::path::PathBuf> = Vec::new();
     for res in jwalk::WalkDir::new(path)
         .follow_links(false)
         .skip_hidden(false)
@@ -411,6 +428,10 @@ fn walk_entries_with(
             Err(_) => continue,
         };
         let p = entry.path();
+        #[cfg(windows)]
+        if unverified_subtrees.iter().any(|s| p.starts_with(s)) {
+            continue;
+        }
         let ft = entry.file_type();
         let cached_meta = collect_metadata.then(|| entry.metadata().ok()).flatten();
 
@@ -422,11 +443,9 @@ fn walk_entries_with(
                 match crate::winapi::is_reparse_point(&p) {
                     Ok(true) => EntryKind::Symlink,
                     Ok(false) => EntryKind::Dir { depth: entry.depth },
-                    Err(err) => {
-                        return Err(io::Error::new(
-                            err.kind(),
-                            format!("failed to inspect {}: {}", p.display(), err),
-                        ));
+                    Err(_) => {
+                        unverified_subtrees.push(p);
+                        continue;
                     }
                 }
             }

@@ -14,6 +14,17 @@ All notable changes to this project will be documented in this file.
   interrupts a bulk file deletion, the skipped paths are now marked
   "cancelled by user" instead of silently passing as deleted in the GUI
   item list and the operation journal.
+- **`zapg --no-journal`** — the GUI dialog now accepts the same
+  `--no-journal` flag as `zap` and `zapw`; previously the journal could
+  only be disabled for GUI runs via `ZAP_NO_JOURNAL`.
+- **Unverifiable reparse points no longer abort the whole run** — when a
+  directory's reparse status cannot be checked (e.g. access denied), the
+  scan now skips just that subtree (still fail-closed: nothing beneath it
+  is deleted) instead of cancelling the entire operation; the failure
+  surfaces later as a directory-removal error.
+- **Per-run error log name** — failure logs are written to
+  `%TEMP%\zap-errors-<pid>.log` with create-new semantics instead of
+  truncating a fixed, predictable `zap-errors.log` path.
 
 ### Added
 
@@ -27,6 +38,9 @@ All notable changes to this project will be documented in this file.
 
 ### Performance
 
+- **O(paths) journal recording** — per-path error lookup during journal
+  recording now uses a hash map instead of a linear scan per path,
+  removing an O(paths × errors) hotspot on bulk runs with mass failures.
 - **Faster shred** — the overwrite buffer grew from 64 KiB to 1 MiB
   (capped at the file size), cutting syscall count ~16x on large files,
   and the RNG handle is reused across chunks instead of re-created per
