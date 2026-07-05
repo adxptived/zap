@@ -63,9 +63,16 @@ pub fn reset() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// These tests mutate process-global atomics, so they must not run
+    /// concurrently with each other — the default parallel test runner
+    /// would let one test's `reset()` break another's paused state.
+    static SERIAL: Mutex<()> = Mutex::new(());
 
     #[test]
     fn wait_if_paused_returns_immediately_when_not_paused() {
+        let _guard = SERIAL.lock().unwrap();
         reset();
         let start = std::time::Instant::now();
         wait_if_paused();
@@ -74,6 +81,7 @@ mod tests {
 
     #[test]
     fn stop_wins_over_pause() {
+        let _guard = SERIAL.lock().unwrap();
         reset();
         request_pause();
         request_stop();
@@ -88,6 +96,7 @@ mod tests {
 
     #[test]
     fn resume_unblocks_paused_wait() {
+        let _guard = SERIAL.lock().unwrap();
         reset();
         request_pause();
         let waiter = std::thread::spawn(wait_if_paused);

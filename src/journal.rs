@@ -160,7 +160,7 @@ mod tests {
             ),
         ];
         record_to(&journal, JournalAction::Delete, &outcomes).unwrap();
-        record_to(&journal, JournalAction::Recycle, &outcomes[..1].to_vec()).unwrap();
+        record_to(&journal, JournalAction::Recycle, &outcomes[..1]).unwrap();
 
         let content = fs::read_to_string(&journal).unwrap();
         let lines: Vec<&str> = content.lines().collect();

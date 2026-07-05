@@ -534,7 +534,7 @@ fn estimate_eta_secs(app: &ZapApp, counts: &StatusCounts) -> Option<f32> {
         // Sizes not computed yet — fall back to the count-based fraction.
         aggregate_progress(app, counts)
     });
-    if fraction < 0.02 || fraction >= 1.0 {
+    if !(0.02..1.0).contains(&fraction) {
         return None;
     }
     let elapsed = app.active_elapsed()?.as_secs_f32();

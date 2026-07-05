@@ -6,6 +6,20 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Operation journal** — every real (non-dry-run) run is appended to
+  `%LOCALAPPDATA%\zap\journal.log` as tab-separated lines
+  (`timestamp  action  ok|error  path`), covering CLI, GUI and worker runs.
+  Opt out with `--no-journal` or the `ZAP_NO_JOURNAL=1` env var. Best-effort:
+  journaling never fails or slows down a deletion.
+- **Pause/Resume in the GUI** — a new Pause button next to Stop blocks all
+  deletion loops at their next checkpoint and resumes them on click; Stop
+  still works while paused, and paused time is excluded from the elapsed
+  timer and the ETA.
+- **Byte-weighted progress + ETA** — the zapg progress bar and a new
+  `ETA ~…` readout now weight items by their on-disk size (computed by the
+  existing background size pass, no extra walks) instead of counting every
+  item equally, which is far more accurate on mixed selections.
+
 - **Stop button in the GUI** — the Cancel button becomes a working *Stop*
   during a run: it raises the graceful-stop flag, the in-flight item aborts
   and everything not yet started is marked "cancelled by user".
