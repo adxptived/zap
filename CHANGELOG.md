@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+### Fixed
+
+- **zapw now journals context-menu deletions** — the Explorer context-menu
+  worker (the most common deletion surface) previously never wrote to the
+  operation journal; it now records per-path outcomes for direct, batch,
+  and late-drained deletions, honoring `--no-journal`/`ZAP_NO_JOURNAL`.
+
 ### Added
 
 - **`zap --journal [N]`** — print the N most recent operation-journal
