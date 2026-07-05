@@ -56,6 +56,10 @@ pub struct ProgressSnapshot {
     pub position: u64,
     pub length: Option<u64>,
     pub message: String,
+    /// Set for bulk file-root runs where `position`/`length` already track
+    /// the *whole selection*, not a single item. The aggregate progress bar
+    /// must use this fraction directly instead of weighting it per item.
+    pub bulk: bool,
 }
 
 #[derive(Default)]
@@ -418,6 +422,19 @@ impl ZapApp {
                 changed = true;
             }
         }
+        if changed {
+            // Late-arriving batch paths may include protected system paths.
+            // The worker always runs with allow_dangerous, so the danger
+            // checkbox is the only guard — it must be re-armed here.
+            let has_dangerous = self
+                .items
+                .iter()
+                .any(|item| protect::is_protected_path(&item.path));
+            if has_dangerous && !self.has_dangerous_paths {
+                self.danger_confirmed = false;
+            }
+            self.has_dangerous_paths = has_dangerous;
+        }
         changed
     }
 
@@ -536,6 +553,7 @@ fn send_bulk_progress(
                 position,
                 length: Some(total),
                 message: message.clone(),
+                bulk: true,
             },
         ));
     }
@@ -640,6 +658,7 @@ fn send_progress(sender: &Sender<WorkerEvent>, path: &Path, bar: &indicatif::Pro
             position: bar.position(),
             length: bar.length(),
             message: bar.message(),
+            bulk: false,
         },
     ));
 }

@@ -91,7 +91,9 @@ fn confirm_interactive(
     show_sizes: bool,
 ) -> io::Result<bool> {
     use std::io::IsTerminal;
-    if !std::io::stdin().is_terminal() {
+    // A pure dry-run never reads an answer, so it must work in pipes and CI.
+    // Only the destructive confirmation prompt requires a terminal.
+    if !dry_run && !std::io::stdin().is_terminal() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "interactive confirmation requires a terminal (use --yes to skip)",
@@ -254,9 +256,9 @@ fn run_delete(options: &cli::CliOptions, start: Instant) -> bool {
         return false;
     }
 
-    // If no --yes/--force and no --dry-run: show preview with sizes, then
-    // ask for interactive confirmation.
-    if options.dry_run && !options.batch {
+    // Explicit --dry-run: preview only, never prompts. No --yes/--force:
+    // show the preview with sizes, then ask for interactive confirmation.
+    if (options.dry_run || options.needs_confirm) && !options.batch {
         match confirm_interactive(
             &options.paths,
             options.dry_run,
@@ -266,6 +268,7 @@ fn run_delete(options: &cli::CliOptions, start: Instant) -> bool {
             Ok(true) => {
                 let mut real_options = options.clone();
                 real_options.dry_run = false;
+                real_options.needs_confirm = false;
                 real_options.batch = false;
                 return run_delete(&real_options, start);
             }

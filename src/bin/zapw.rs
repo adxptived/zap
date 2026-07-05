@@ -114,6 +114,12 @@ fn worker_main(args: Vec<OsString>, batch_already_written: bool) {
 
     options.silent = true;
 
+    // A windowless worker cannot show a confirmation prompt. Without an
+    // explicit --yes the safest behavior is a silent dry-run no-op.
+    if options.needs_confirm {
+        options.dry_run = true;
+    }
+
     let mut batch_run = None;
 
     if options.batch {
@@ -304,6 +310,7 @@ mod tests {
     fn test_options(paths: Vec<PathBuf>) -> cli::CliOptions {
         cli::CliOptions {
             dry_run: false,
+            needs_confirm: false,
             threads: None,
             paths,
             batch: false,
