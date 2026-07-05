@@ -110,6 +110,19 @@ impl ScanPlan {
 
 /// How many jwalk I/O threads to use when walking. Capped at 8 to avoid
 /// overwhelming a single spinning disk; SSDs benefit from the full count.
+/// Read the reparse-point attribute from already-fetched metadata.
+///
+/// When the scan collects metadata for the size preview, the attributes are
+/// already in memory — reusing them avoids the extra `GetFileAttributesW`
+/// syscall per directory that `winapi::is_reparse_point` would issue
+/// (measurable on trees with tens of thousands of directories).
+#[cfg(windows)]
+fn is_reparse_meta(meta: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
 fn scan_parallelism() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
@@ -237,7 +250,14 @@ pub(crate) fn scan_into_channel(
         } else if ft.is_dir() {
             #[cfg(windows)]
             {
-                match crate::winapi::is_reparse_point(&p) {
+                // Metadata already fetched for the size preview carries the
+                // reparse attribute — no extra syscall. Otherwise fall back
+                // to the single-syscall GetFileAttributesW check.
+                let reparse = match cached_meta.as_ref() {
+                    Some(meta) => Ok(is_reparse_meta(meta)),
+                    None => crate::winapi::is_reparse_point(&p),
+                };
+                match reparse {
                     Ok(true) => EntryKind::Symlink,
                     Ok(false) => EntryKind::Dir { depth: entry.depth },
                     Err(_) => {
@@ -440,7 +460,13 @@ fn walk_entries_with(
         } else if ft.is_dir() {
             #[cfg(windows)]
             {
-                match crate::winapi::is_reparse_point(&p) {
+                // Reuse already-fetched metadata for the reparse bit (see
+                // is_reparse_meta); fall back to the one-syscall check.
+                let reparse = match cached_meta.as_ref() {
+                    Some(meta) => Ok(is_reparse_meta(meta)),
+                    None => crate::winapi::is_reparse_point(&p),
+                };
+                match reparse {
                     Ok(true) => EntryKind::Symlink,
                     Ok(false) => EntryKind::Dir { depth: entry.depth },
                     Err(_) => {

@@ -98,21 +98,16 @@ pub fn set_writable(path: &Path) -> io::Result<()> {
     std::fs::set_permissions(path, perms)
 }
 
-#[inline]
-fn try_force_delete(path: &Path, original: io::Error) -> io::Result<()> {
-    #[cfg(windows)]
-    {
-        if crate::winapi::force_delete(path).is_ok() {
-            return Ok(());
-        }
-    }
-    let _ = path;
-    Err(original)
-}
-
-/// Shared recovery path for `PermissionDenied` failures: clear the
-/// read-only attribute and retry `op`, then fall back to the Win32
-/// force-delete. Any other error kind is returned unchanged.
+/// Shared recovery path for `PermissionDenied` failures. Any other error
+/// kind is returned unchanged.
+///
+/// On Windows the first retry is the POSIX force-delete
+/// (`FILE_DISPOSITION_INFO_EX` + `IGNORE_READONLY_ATTRIBUTE`): it clears
+/// both readonly attributes and share-mode locks in one shot (3 syscalls),
+/// so the common Windows failure modes are resolved without the
+/// metadata → set_permissions → retry dance or the sleep loop. The older
+/// strategies remain as fallback for pre-Win10-1709 systems where
+/// `FileDispositionInfoEx` is unsupported.
 fn retry_after_clearing_readonly(
     path: &Path,
     original: io::Error,
@@ -120,6 +115,10 @@ fn retry_after_clearing_readonly(
 ) -> io::Result<()> {
     if original.kind() != io::ErrorKind::PermissionDenied {
         return Err(original);
+    }
+    #[cfg(windows)]
+    if crate::winapi::force_delete(path).is_ok() {
+        return Ok(());
     }
     let meta = std::fs::symlink_metadata(path).ok();
     if meta.as_ref().is_some_and(|m| m.permissions().readonly()) {
@@ -131,14 +130,14 @@ fn retry_after_clearing_readonly(
         }
     }
     // Transient locks (antivirus scanners, indexers) usually clear within
-    // milliseconds — retry briefly before the expensive force-delete fallback.
+    // milliseconds — retry briefly before giving up.
     for delay_ms in [10u64, 50] {
         std::thread::sleep(std::time::Duration::from_millis(delay_ms));
         if op(path).is_ok() {
             return Ok(());
         }
     }
-    try_force_delete(path, original)
+    Err(original)
 }
 
 pub fn remove_file_with_retry(path: &Path) -> io::Result<()> {
@@ -192,17 +191,15 @@ pub fn delete_symlink(path: &Path) -> io::Result<()> {
 }
 
 /// Dispatch a single file/symlink entry to the appropriate delete fn.
+/// `shred` carries the overwrite pass count when shredding is requested.
 #[inline]
-fn delete_entry(entry: &ScannedEntry, shred: bool) -> io::Result<()> {
+fn delete_entry(entry: &ScannedEntry, shred: Option<usize>) -> io::Result<()> {
     match &entry.kind {
         EntryKind::Symlink => delete_symlink(&entry.path),
-        EntryKind::File => {
-            if shred {
-                crate::shred::shred_file(&entry.path, 3)
-            } else {
-                remove_file_with_retry(&entry.path)
-            }
-        }
+        EntryKind::File => match shred {
+            Some(passes) => crate::shred::shred_file(&entry.path, passes),
+            None => remove_file_with_retry(&entry.path),
+        },
         EntryKind::Dir { .. } => Ok(()),
     }
 }
@@ -214,7 +211,7 @@ fn delete_entry(entry: &ScannedEntry, shred: bool) -> io::Result<()> {
 #[inline]
 fn process_file_batch(
     chunk: &[ScannedEntry],
-    shred: bool,
+    shred: Option<usize>,
     error_count: &AtomicU64,
     failures: &Mutex<Vec<DeletionFailure>>,
     bar: Option<&ProgressBar>,
@@ -319,7 +316,11 @@ fn finalize(
 // Pipeline delete (no filter active)
 // ---------------------------------------------------------------------------
 
-fn delete_directory_pipeline(path: &Path, bar: Option<ProgressBar>, shred: bool) -> io::Result<()> {
+fn delete_directory_pipeline(
+    path: &Path,
+    bar: Option<ProgressBar>,
+    shred: Option<usize>,
+) -> io::Result<()> {
     // Bounded channel from scan-thread to consumer-thread.
     // Capacity = num_threads * 4 so backpressure kicks in before memory bloats.
     let queue_cap = (rayon::current_num_threads() * 4).max(64);
@@ -440,7 +441,7 @@ fn delete_directory_filtered(
     path: &Path,
     bar: Option<ProgressBar>,
     filter: &FilterConfig,
-    shred: bool,
+    shred: Option<usize>,
 ) -> io::Result<()> {
     let plan = if let Some(ref b) = bar {
         scan_directory_plan_with_bar_for_filter(path, b, filter)?
@@ -493,7 +494,7 @@ fn delete_directory_pool_inner(
     silent: bool,
     external_bar: Option<ProgressBar>,
     filter: &FilterConfig,
-    shred: bool,
+    shred: Option<usize>,
 ) -> io::Result<()> {
     let bar: Option<ProgressBar> = if silent {
         None
@@ -529,7 +530,7 @@ fn delete_directory_inner(
     silent: bool,
     external_bar: Option<ProgressBar>,
     filter: &FilterConfig,
-    shred: bool,
+    shred: Option<usize>,
 ) -> io::Result<()> {
     if let Some(count) = threads {
         let pool = rayon::ThreadPoolBuilder::new()
@@ -544,14 +545,13 @@ fn delete_directory_inner(
 
 #[cfg(test)]
 pub fn delete_directory(path: &Path, threads: Option<usize>) -> io::Result<()> {
-    delete_directory_inner(path, threads, false, None, &FilterConfig::default(), false)
+    delete_directory_inner(path, threads, false, None, &FilterConfig::default(), None)
 }
 
 // ---------------------------------------------------------------------------
 // DeleteOptions builder
 // ---------------------------------------------------------------------------
 
-#[derive(Default)]
 pub struct DeleteOptions {
     pub threads: Option<usize>,
     pub silent: bool,
@@ -561,9 +561,34 @@ pub struct DeleteOptions {
     pub shred: bool,
     pub only_empty: bool,
     pub recycle: bool,
+    /// Overwrite passes when `shred` is set (default
+    /// [`crate::cli::DEFAULT_SHRED_PASSES`]).
+    pub shred_passes: usize,
+}
+
+impl Default for DeleteOptions {
+    fn default() -> Self {
+        Self {
+            threads: None,
+            silent: false,
+            bar: None,
+            allow_dangerous: false,
+            filter: FilterConfig::default(),
+            shred: false,
+            only_empty: false,
+            recycle: false,
+            shred_passes: crate::cli::DEFAULT_SHRED_PASSES,
+        }
+    }
 }
 
 impl DeleteOptions {
+    /// Pass count used when `shred` is active, `None` otherwise — the form
+    /// the internal plumbing consumes.
+    fn shred_arg(&self) -> Option<usize> {
+        self.shred.then_some(self.shred_passes.max(1))
+    }
+
     pub fn with_threads(mut self, threads: Option<usize>) -> Self {
         self.threads = threads;
         self
@@ -586,6 +611,11 @@ impl DeleteOptions {
     }
     pub fn shred(mut self) -> Self {
         self.shred = true;
+        self
+    }
+    /// Set the number of overwrite passes used by `shred` (clamped to >= 1).
+    pub fn with_shred_passes(mut self, passes: usize) -> Self {
+        self.shred_passes = passes.max(1);
         self
     }
     pub fn only_empty(mut self) -> Self {
@@ -688,7 +718,7 @@ pub fn recycle_paths_validated(
 /// validation before choosing this fast path.
 pub fn delete_file_roots_bulk(
     paths: &[std::path::PathBuf],
-    shred: bool,
+    shred: Option<usize>,
     bar: Option<&ProgressBar>,
 ) -> BulkDeleteSummary {
     let deleted = AtomicU64::new(0);
@@ -719,11 +749,11 @@ pub fn delete_file_roots_bulk(
                 mark_cancelled(&chunk[i..]);
                 break;
             }
-            let result = match std::fs::symlink_metadata(path) {
-                Ok(meta) if meta.file_type().is_symlink() => delete_symlink(path),
-                Ok(_) if shred => crate::shred::shred_file(path, 3),
-                Ok(_) => remove_file_with_retry(path),
-                Err(err) => Err(err),
+            let result = match (std::fs::symlink_metadata(path), shred) {
+                (Ok(meta), _) if meta.file_type().is_symlink() => delete_symlink(path),
+                (Ok(_), Some(passes)) => crate::shred::shred_file(path, passes),
+                (Ok(_), None) => remove_file_with_retry(path),
+                (Err(err), _) => Err(err),
             };
             match result {
                 Ok(()) => {
@@ -836,9 +866,9 @@ fn delete_path_inner(path: &Path, opts: DeleteOptions) -> io::Result<()> {
             path,
             opts.threads,
             opts.silent,
-            opts.bar,
+            opts.bar.clone(),
             &opts.filter,
-            opts.shred,
+            opts.shred_arg(),
         )
     } else if metadata.is_file() {
         // Top-level file roots must respect --include/--exclude/--min-size
@@ -861,10 +891,9 @@ fn delete_path_inner(path: &Path, opts: DeleteOptions) -> io::Result<()> {
                 return Ok(());
             }
         }
-        if opts.shred {
-            crate::shred::shred_file(path, 3)
-        } else {
-            remove_file_with_retry(path)
+        match opts.shred_arg() {
+            Some(passes) => crate::shred::shred_file(path, passes),
+            None => remove_file_with_retry(path),
         }
     } else {
         Err(io::Error::new(

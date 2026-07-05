@@ -44,6 +44,10 @@ const FILE_SHARE_WRITE: u32 = 0x02;
 const FILE_SHARE_DELETE: u32 = 0x04;
 const OPEN_EXISTING: u32 = 3;
 const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+/// Required to obtain a handle to a *directory* via `CreateFileW`; without
+/// it the call fails with `ERROR_ACCESS_DENIED` for directories. Harmless
+/// for regular files.
+const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
 
 /// FILE_INFO_BY_HANDLE_CLASS::FileDispositionInfoEx (= 21).
 const FILE_DISPOSITION_INFO_EX_CLASS: i32 = 21;
@@ -80,7 +84,18 @@ extern "system" {
 
 // ---------- Helpers --------------------------------------------------------
 
+/// Encode `path` as a NUL-terminated UTF-16 buffer, upgrading absolute
+/// paths to verbatim (`\\?\`) form so calls succeed beyond `MAX_PATH`
+/// (260 chars) — deep `node_modules` trees routinely exceed it. Paths with
+/// unpaired surrogates (invalid UTF-8) fall back to the raw encoding.
 fn to_wide(path: &Path) -> Vec<u16> {
+    if let Some(s) = path.as_os_str().to_str() {
+        if let Some(verbatim) = crate::longpath::to_verbatim(s) {
+            let mut wide: Vec<u16> = verbatim.encode_utf16().collect();
+            wide.push(0);
+            return wide;
+        }
+    }
     path.as_os_str()
         .encode_wide()
         .chain(iter::once(0))
@@ -139,7 +154,10 @@ pub fn force_delete(path: &Path) -> io::Result<()> {
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             std::ptr::null(),
             OPEN_EXISTING,
-            FILE_FLAG_OPEN_REPARSE_POINT, // never traverse the link
+            // Never traverse links; allow opening directories (empty dirs,
+            // junctions) — without BACKUP_SEMANTICS CreateFileW refuses
+            // directory handles with ERROR_ACCESS_DENIED.
+            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
             std::ptr::null_mut(),
         )
     };

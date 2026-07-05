@@ -28,6 +28,12 @@ pub struct CliOptions {
     pub no_size_preview: bool,
     /// Skip writing the operation journal for this run (`--no-journal`).
     pub no_journal: bool,
+    /// Number of overwrite passes for `--shred` (`--shred-passes N`,
+    /// default [`DEFAULT_SHRED_PASSES`]).
+    pub shred_passes: usize,
+    /// Emit a machine-readable JSON summary instead of human output
+    /// (`--json`).
+    pub json: bool,
 }
 
 impl CliOptions {
@@ -43,7 +49,11 @@ impl CliOptions {
         };
         let opts = if self.silent { opts.silent() } else { opts };
         let opts = opts.with_filter(self.filter.clone());
-        let opts = if self.shred { opts.shred() } else { opts };
+        let opts = if self.shred {
+            opts.shred().with_shred_passes(self.shred_passes)
+        } else {
+            opts
+        };
         let opts = if self.only_empty {
             opts.only_empty()
         } else {
@@ -65,10 +75,26 @@ pub enum CliAction {
     PrintVersion,
     /// Print the most recent journal entries (`--journal [N]`, default 20).
     ShowJournal(usize),
+    /// Delete the operation journal (`--journal-clear`).
+    ClearJournal,
+    /// Report the N largest files under the given paths without deleting
+    /// anything (`--top N <path>...`). `json` selects machine output.
+    TopFiles {
+        count: usize,
+        paths: Vec<PathBuf>,
+        json: bool,
+    },
 }
 
 /// Default number of journal entries shown by `--journal`.
 pub const DEFAULT_JOURNAL_ENTRIES: usize = 20;
+
+/// Default number of overwrite passes for `--shred`.
+pub const DEFAULT_SHRED_PASSES: usize = 3;
+
+/// Upper bound for `--shred-passes` (Gutmann's 35-pass scheme is the most
+/// paranoid published standard; anything beyond it only wastes time).
+pub const MAX_SHRED_PASSES: usize = 35;
 
 /// Parse a byte count that optionally carries a binary unit suffix
 /// (`k`/`kb`, `m`/`mb`, `g`/`gb`, `t`/`tb`, case-insensitive). Plain
@@ -122,8 +148,12 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> io::Result<CliAct
     let mut filter_includes: Vec<Pattern> = Vec::new();
     let mut filter_excludes: Vec<Pattern> = Vec::new();
     let mut min_size: Option<u64> = None;
+    let mut max_size: Option<u64> = None;
     let mut newer_than: Option<std::time::SystemTime> = None;
     let mut older_than: Option<std::time::SystemTime> = None;
+    let mut shred_passes: Option<usize> = None;
+    let mut json = false;
+    let mut top: Option<usize> = None;
     let mut iter = args.into_iter();
     let mut flags_done = false;
 
@@ -142,7 +172,43 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> io::Result<CliAct
             Some("--recycle") => recycle = true,
             Some("--no-size-preview") => no_size_preview = true,
             Some("--no-journal") => no_journal = true,
+            Some("--json") => json = true,
             Some("--force") | Some("--yes") => force = true,
+            Some("--journal-clear") => return Ok(CliAction::ClearJournal),
+            Some("--shred-passes") => {
+                let value = iter.next().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "--shred-passes requires a pass count",
+                    )
+                })?;
+                let parsed = value.to_str().and_then(|s| s.parse::<usize>().ok());
+                let count = parsed
+                    .filter(|v| (1..=MAX_SHRED_PASSES).contains(v))
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("--shred-passes must be between 1 and {MAX_SHRED_PASSES}"),
+                        )
+                    })?;
+                shred_passes = Some(count);
+                // Asking for overwrite passes only makes sense when
+                // shredding — imply --shred for convenience.
+                shred = true;
+            }
+            Some("--top") => {
+                let value = iter.next().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "--top requires a file count")
+                })?;
+                let parsed = value.to_str().and_then(|s| s.parse::<usize>().ok());
+                let count = parsed.filter(|v| *v > 0).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "--top must be a positive integer",
+                    )
+                })?;
+                top = Some(count);
+            }
             Some("--threads") | Some("-j") => {
                 let value = iter.next().ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidInput, "--threads requires a value")
@@ -243,6 +309,26 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> io::Result<CliAct
                     )
                 })?);
             }
+            Some("--max-size") => {
+                let value = iter.next().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "--max-size requires a byte count",
+                    )
+                })?;
+                let s = value.to_str().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "--max-size must be valid UTF-8",
+                    )
+                })?;
+                max_size = Some(parse_byte_size(s).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("--max-size must be a byte count like 1048576, 512KB, or 1.5GB, got '{s}'"),
+                    )
+                })?);
+            }
             Some("--newer-than") => {
                 let value = iter.next().ok_or_else(|| {
                     io::Error::new(
@@ -302,6 +388,29 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> io::Result<CliAct
         ));
     }
 
+    if let (Some(min), Some(max)) = (min_size, max_size) {
+        if max < min {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("--max-size ({max}) must not be smaller than --min-size ({min})"),
+            ));
+        }
+    }
+
+    if let Some(count) = top {
+        // Report-only mode: deletion flags are irrelevant and most likely a
+        // mistake — reject the destructive ones explicitly.
+        if shred || recycle || only_empty {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--top is a report-only mode and cannot be combined with --shred/--recycle/--only-empty",
+            ));
+        }
+        let mut seen: HashSet<PathBuf> = HashSet::with_capacity(paths.len());
+        paths.retain(|p| seen.insert(p.clone()));
+        return Ok(CliAction::TopFiles { count, paths, json });
+    }
+
     if shred && recycle {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -320,12 +429,13 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> io::Result<CliAct
         && (!filter_includes.is_empty()
             || !filter_excludes.is_empty()
             || min_size.is_some()
+            || max_size.is_some()
             || newer_than.is_some()
             || older_than.is_some())
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "--recycle cannot be combined with filters (--include/--exclude/--min-size/--newer-than/--older-than): the Recycle Bin move always takes the whole item",
+            "--recycle cannot be combined with filters (--include/--exclude/--min-size/--max-size/--newer-than/--older-than): the Recycle Bin move always takes the whole item",
         ));
     }
 
@@ -347,6 +457,7 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> io::Result<CliAct
             includes: filter_includes,
             excludes: filter_excludes,
             min_size,
+            max_size,
             newer_than,
             older_than,
         },
@@ -355,6 +466,8 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> io::Result<CliAct
         recycle,
         no_size_preview,
         no_journal,
+        shred_passes: shred_passes.unwrap_or(DEFAULT_SHRED_PASSES),
+        json,
     }))
 }
 

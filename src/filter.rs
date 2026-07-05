@@ -15,6 +15,7 @@ pub struct FilterConfig {
     pub includes: Vec<Pattern>,
     pub excludes: Vec<Pattern>,
     pub min_size: Option<u64>,
+    pub max_size: Option<u64>,
     pub newer_than: Option<SystemTime>,
     pub older_than: Option<SystemTime>,
 }
@@ -24,12 +25,16 @@ impl FilterConfig {
         self.includes.is_empty()
             && self.excludes.is_empty()
             && self.min_size.is_none()
+            && self.max_size.is_none()
             && self.newer_than.is_none()
             && self.older_than.is_none()
     }
 
     pub fn needs_metadata(&self) -> bool {
-        self.min_size.is_some() || self.newer_than.is_some() || self.older_than.is_some()
+        self.min_size.is_some()
+            || self.max_size.is_some()
+            || self.newer_than.is_some()
+            || self.older_than.is_some()
     }
 
     pub fn matches_relative(
@@ -44,6 +49,14 @@ impl FilterConfig {
             if let Some(min) = self.min_size {
                 if file_size.unwrap_or(0) < min {
                     return false;
+                }
+            }
+            if let Some(max) = self.max_size {
+                // Unknown size fails closed for --max-size: a file we could
+                // not stat may well be huge, so do not delete it.
+                match file_size {
+                    Some(size) if size <= max => {}
+                    _ => return false,
                 }
             }
         }
