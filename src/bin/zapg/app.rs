@@ -56,6 +56,10 @@ pub struct ProgressSnapshot {
     pub position: u64,
     pub length: Option<u64>,
     pub message: String,
+    /// Set for bulk file-root runs where `position`/`length` already track
+    /// the *whole selection*, not a single item. The aggregate progress bar
+    /// must use this fraction directly instead of weighting it per item.
+    pub bulk: bool,
 }
 
 #[derive(Default)]
@@ -418,6 +422,19 @@ impl ZapApp {
                 changed = true;
             }
         }
+        if changed {
+            // Late-arriving batch paths may include protected system paths.
+            // The worker always runs with allow_dangerous, so the danger
+            // checkbox is the only guard — it must be re-armed here.
+            let has_dangerous = self
+                .items
+                .iter()
+                .any(|item| protect::is_protected_path(&item.path));
+            if has_dangerous && !self.has_dangerous_paths {
+                self.danger_confirmed = false;
+            }
+            self.has_dangerous_paths = has_dangerous;
+        }
         changed
     }
 
@@ -474,7 +491,6 @@ impl ZapApp {
     }
 }
 
-
 fn should_bulk_delete_file_roots(paths: &[PathBuf], dry_run: bool, recycle: bool) -> bool {
     if dry_run || recycle || paths.len() < 64 {
         return false;
@@ -513,10 +529,7 @@ fn run_bulk_file_roots_gui(paths: Vec<PathBuf>, shred: bool, sender: Sender<Work
 
     let failed: std::collections::HashMap<PathBuf, String> = summary.errors.into_iter().collect();
     for path in paths {
-        let result = failed
-            .get(&path)
-            .cloned()
-            .map_or(Ok(()), Err);
+        let result = failed.get(&path).cloned().map_or(Ok(()), Err);
         let _ = sender.send(WorkerEvent::Done(path, result));
     }
 }
@@ -536,6 +549,7 @@ fn send_bulk_progress(
                 position,
                 length: Some(total),
                 message: message.clone(),
+                bulk: true,
             },
         ));
     }
@@ -640,6 +654,7 @@ fn send_progress(sender: &Sender<WorkerEvent>, path: &Path, bar: &indicatif::Pro
             position: bar.position(),
             length: bar.length(),
             message: bar.message(),
+            bulk: false,
         },
     ));
 }
@@ -663,10 +678,7 @@ mod tests {
 
     #[test]
     fn bulk_file_roots_requires_many_plain_files() {
-        let dir = std::env::temp_dir().join(format!(
-            "zapg-bulk-test-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("zapg-bulk-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let few: Vec<PathBuf> = (0..4)

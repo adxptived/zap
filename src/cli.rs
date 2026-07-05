@@ -10,6 +10,13 @@ const MAX_THREADS: usize = 1024;
 #[derive(Debug, Clone)]
 pub struct CliOptions {
     pub dry_run: bool,
+    /// Set when neither `--yes`/`--force` nor `--dry-run` was given: the
+    /// caller must show a preview and ask for interactive confirmation
+    /// before deleting. Kept separate from `dry_run` so an explicit
+    /// `--dry-run` (preview only, never prompts) is distinguishable from
+    /// "preview, then ask" (previously both collapsed into `dry_run`,
+    /// which made the confirmation prompt unreachable).
+    pub needs_confirm: bool,
     pub threads: Option<usize>,
     pub paths: Vec<PathBuf>,
     pub batch: bool,
@@ -299,14 +306,13 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> io::Result<CliAct
     let mut seen: HashSet<PathBuf> = HashSet::with_capacity(paths.len());
     paths.retain(|p| seen.insert(p.clone()));
 
-    // If no --yes/--force and no --dry-run: auto-enable dry-run + prompt.
-    // The caller (main.rs) will handle the interactive confirm flow.
-    if !dry_run && !force {
-        dry_run = true;
-    }
+    // If no --yes/--force and no --dry-run: the caller (main.rs) must show
+    // a preview and ask for interactive confirmation before deleting.
+    let needs_confirm = !dry_run && !force;
 
     Ok(CliAction::Run(CliOptions {
         dry_run,
+        needs_confirm,
         threads,
         paths,
         batch,
@@ -357,9 +363,7 @@ pub fn print_help() {
     println!("  --shred             Overwrite files with random data before deleting");
     println!("  --only-empty        Only delete if directory is empty");
     println!("  --recycle           Send to Recycle Bin instead of permanent delete");
-    println!(
-        "  --no-size-preview   Skip directory size calculation in the confirmation preview"
-    );
+    println!("  --no-size-preview   Skip directory size calculation in the confirmation preview");
     println!();
     println!("Options:");
     println!(
@@ -423,7 +427,10 @@ mod tests {
     fn test_parse_args_auto_enables_dry_run() {
         let result = parse_args([OsString::from("file.txt")]).unwrap();
         match result {
-            CliAction::Run(options) => assert!(options.dry_run),
+            CliAction::Run(options) => {
+                assert!(!options.dry_run);
+                assert!(options.needs_confirm);
+            }
             _ => panic!("expected run action"),
         }
     }
@@ -437,7 +444,7 @@ mod tests {
         .unwrap();
         match result {
             CliAction::Run(options) => {
-                assert!(options.dry_run);
+                assert!(options.needs_confirm);
                 assert!(options.no_size_preview);
             }
             _ => panic!("expected run action"),
@@ -450,6 +457,7 @@ mod tests {
         match result {
             CliAction::Run(options) => {
                 assert!(!options.dry_run);
+                assert!(!options.needs_confirm);
                 assert_eq!(options.threads, None);
                 assert_eq!(options.paths, vec![PathBuf::from("file.txt")]);
                 assert!(!options.no_size_preview);
@@ -464,6 +472,7 @@ mod tests {
         match result {
             CliAction::Run(options) => {
                 assert!(options.dry_run);
+                assert!(!options.needs_confirm);
                 assert_eq!(options.threads, None);
                 assert_eq!(options.paths, vec![PathBuf::from("file.txt")]);
             }
@@ -482,6 +491,7 @@ mod tests {
         match result {
             CliAction::Run(options) => {
                 assert!(options.dry_run);
+                assert!(!options.needs_confirm);
                 assert_eq!(options.threads, None);
             }
             _ => panic!("expected run action"),

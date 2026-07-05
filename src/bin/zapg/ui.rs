@@ -506,6 +506,15 @@ fn aggregate_progress(app: &ZapApp, counts: &StatusCounts) -> f32 {
     if total == 0 {
         return 0.0;
     }
+    // Bulk file-root runs report selection-wide progress: use it directly.
+    // Weighting it per running item would keep the bar near zero for the
+    // whole run and then jump to 100% at the end.
+    let bulk = app.items.iter().find(|item| {
+        matches!(item.state, ItemState::Running) && item.progress.as_ref().is_some_and(|p| p.bulk)
+    });
+    if let Some(item) = bulk {
+        return item_progress_fraction(item);
+    }
     let mut completed = (counts.done + counts.failed) as f32;
     for item in &app.items {
         if matches!(item.state, ItemState::Running) {
