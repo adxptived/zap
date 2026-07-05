@@ -442,6 +442,12 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> io::Result<CliAct
     let mut seen: HashSet<PathBuf> = HashSet::with_capacity(paths.len());
     paths.retain(|p| seen.insert(p.clone()));
 
+    // --json is for scripts: suppress human progress output so stdout
+    // carries exactly one parseable JSON object.
+    if json {
+        silent = true;
+    }
+
     // If no --yes/--force and no --dry-run: the caller (main.rs) must show
     // a preview and ask for interactive confirmation before deleting.
     let needs_confirm = !dry_run && !force;
@@ -506,6 +512,8 @@ pub fn print_help() {
     println!("  --no-size-preview   Skip directory size calculation in the confirmation preview");
     println!("  --no-journal        Do not record this run in the operation journal");
     println!("  --journal [N]       Show the N most recent journal entries (default 20) and exit");
+    println!("  --journal-clear     Delete the operation journal and exit");
+    println!("  --json              Print a machine-readable JSON summary (implies --silent)");
     println!();
     println!("Options:");
     println!(
@@ -517,8 +525,16 @@ pub fn print_help() {
     println!(
         "  --min-size SIZE     Only delete files of at least SIZE (bytes, or 512KB/10MB/1.5GB)"
     );
+    println!(
+        "  --max-size SIZE     Only delete files of at most SIZE (bytes, or 512KB/10MB/1.5GB)"
+    );
     println!("  --newer-than WHEN    Only delete files newer than date/time (RFC 3339) or age (e.g. 12h, 30d)");
     println!("  --older-than WHEN    Only delete files older than date/time (RFC 3339) or age (e.g. 12h, 30d)");
+    println!(
+        "  --shred-passes N    Overwrite passes for --shred (1–{}, default {}; implies --shred)",
+        MAX_SHRED_PASSES, DEFAULT_SHRED_PASSES
+    );
+    println!("  --top N             Report the N largest files under the paths and exit (no deletion)");
     println!("  --                  Treat all remaining arguments as paths");
     println!();
     println!("Examples:");
@@ -526,6 +542,8 @@ pub fn print_help() {
     println!("  zap --yes --threads 8 ./build ./dist");
     println!("  zap --yes --exclude '*.log' --min-size 10MB ./project");
     println!("  zap --yes --shred ./secret-files");
+    println!("  zap --yes --shred-passes 7 ./secret-files");
+    println!("  zap --top 20 C:\\Users\\me\\Downloads");
     println!("  zap --only-empty ./cache");
 }
 
@@ -577,6 +595,135 @@ mod tests {
         }
         assert!(parse_args([OsString::from("--journal"), OsString::from("0")]).is_err());
         assert!(parse_args([OsString::from("--journal"), OsString::from("abc")]).is_err());
+    }
+
+    #[test]
+    fn test_parse_args_journal_clear() {
+        match parse_args([OsString::from("--journal-clear")]).unwrap() {
+            CliAction::ClearJournal => {}
+            other => panic!("expected ClearJournal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_args_top_files() {
+        match parse_args([
+            OsString::from("--top"),
+            OsString::from("10"),
+            OsString::from("dir"),
+        ])
+        .unwrap()
+        {
+            CliAction::TopFiles { count, paths, json } => {
+                assert_eq!(count, 10);
+                assert_eq!(paths, vec![PathBuf::from("dir")]);
+                assert!(!json);
+            }
+            other => panic!("expected TopFiles, got {other:?}"),
+        }
+        // --json flows into the report mode.
+        match parse_args([
+            OsString::from("--top"),
+            OsString::from("5"),
+            OsString::from("--json"),
+            OsString::from("dir"),
+        ])
+        .unwrap()
+        {
+            CliAction::TopFiles { json, .. } => assert!(json),
+            other => panic!("expected TopFiles, got {other:?}"),
+        }
+        assert!(parse_args([OsString::from("--top"), OsString::from("0")]).is_err());
+        assert!(parse_args([OsString::from("--top"), OsString::from("abc")]).is_err());
+        // Report mode must reject destructive companions.
+        assert!(parse_args([
+            OsString::from("--top"),
+            OsString::from("5"),
+            OsString::from("--shred"),
+            OsString::from("dir"),
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn test_parse_args_shred_passes() {
+        match parse_args([
+            OsString::from("--shred-passes"),
+            OsString::from("7"),
+            OsString::from("--yes"),
+            OsString::from("file.txt"),
+        ])
+        .unwrap()
+        {
+            CliAction::Run(options) => {
+                assert_eq!(options.shred_passes, 7);
+                assert!(options.shred, "--shred-passes must imply --shred");
+            }
+            other => panic!("expected Run, got {other:?}"),
+        }
+        // Default without the flag.
+        match parse_args([OsString::from("--yes"), OsString::from("file.txt")]).unwrap() {
+            CliAction::Run(options) => {
+                assert_eq!(options.shred_passes, DEFAULT_SHRED_PASSES);
+                assert!(!options.shred);
+            }
+            other => panic!("expected Run, got {other:?}"),
+        }
+        assert!(parse_args([OsString::from("--shred-passes"), OsString::from("0")]).is_err());
+        assert!(parse_args([OsString::from("--shred-passes"), OsString::from("36")]).is_err());
+    }
+
+    #[test]
+    fn test_parse_args_max_size() {
+        match parse_args([
+            OsString::from("--max-size"),
+            OsString::from("10MB"),
+            OsString::from("--yes"),
+            OsString::from("dir"),
+        ])
+        .unwrap()
+        {
+            CliAction::Run(options) => {
+                assert_eq!(options.filter.max_size, Some(10 * 1024 * 1024));
+            }
+            other => panic!("expected Run, got {other:?}"),
+        }
+        // max below min is a contradiction.
+        assert!(parse_args([
+            OsString::from("--min-size"),
+            OsString::from("10MB"),
+            OsString::from("--max-size"),
+            OsString::from("1MB"),
+            OsString::from("--yes"),
+            OsString::from("dir"),
+        ])
+        .is_err());
+        // --recycle refuses filters, including the new one.
+        assert!(parse_args([
+            OsString::from("--recycle"),
+            OsString::from("--max-size"),
+            OsString::from("1MB"),
+            OsString::from("--yes"),
+            OsString::from("dir"),
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn test_parse_args_json_implies_silent() {
+        match parse_args([
+            OsString::from("--json"),
+            OsString::from("--yes"),
+            OsString::from("file.txt"),
+        ])
+        .unwrap()
+        {
+            CliAction::Run(options) => {
+                assert!(options.json);
+                assert!(options.silent, "--json must imply --silent");
+            }
+            other => panic!("expected Run, got {other:?}"),
+        }
     }
 
     #[test]

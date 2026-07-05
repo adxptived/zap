@@ -33,6 +33,8 @@ fn main() {
             true
         }
         cli::CliAction::ShowJournal(count) => show_journal(count),
+        cli::CliAction::ClearJournal => clear_journal(),
+        cli::CliAction::TopFiles { count, paths, json } => show_top_files(count, &paths, json),
         cli::CliAction::Run(options) => {
             if options.batch {
                 run_batch(&options, start)
@@ -77,6 +79,72 @@ fn show_journal(count: usize) -> bool {
             false
         }
     }
+}
+
+/// `--journal-clear`: delete the operation journal files.
+fn clear_journal() -> bool {
+    let path = journal::journal_path();
+    match journal::clear() {
+        Ok(()) => {
+            println!("Journal cleared ({})", path.display());
+            true
+        }
+        Err(err) => {
+            cli::print_error(&err);
+            false
+        }
+    }
+}
+
+/// `--top N <path>...`: report the N largest files without deleting anything.
+fn show_top_files(count: usize, paths: &[PathBuf], json: bool) -> bool {
+    let entries = size::top_files(paths, count);
+    if json {
+        // Machine-readable output for scripts: one JSON object, files
+        // descending by size. Paths are JSON-escaped strings.
+        let mut out = String::from("{\"top\":[");
+        for (i, (path, bytes)) in entries.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str(&format!(
+                "{{\"path\":{},\"bytes\":{bytes}}}",
+                json_string(&path.display().to_string())
+            ));
+        }
+        out.push_str("]}");
+        println!("{out}");
+        return true;
+    }
+    if entries.is_empty() {
+        println!("No files found under the given paths.");
+        return true;
+    }
+    println!("{} largest file(s):", entries.len());
+    for (path, bytes) in &entries {
+        println!("{:>10}  {}", size::format_size(*bytes), path.display());
+    }
+    true
+}
+
+/// Minimal JSON string encoder — escapes quotes, backslashes, and control
+/// characters. Avoids pulling a serde dependency for two output sites.
+fn json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 const BATCH_INITIAL_QUIET_POLLS: usize = 10;
@@ -357,6 +425,11 @@ fn run_delete(options: &cli::CliOptions, start: Instant) -> bool {
 
     let elapsed = start.elapsed().as_secs_f32();
 
+    if options.json {
+        print_json_summary(options, &errors, elapsed);
+        return errors.is_empty();
+    }
+
     if errors.is_empty() {
         if !options.silent {
             println!("{}", format!("{elapsed:.3}s").color(elapsed_color(elapsed)));
@@ -378,6 +451,50 @@ fn run_delete(options: &cli::CliOptions, start: Instant) -> bool {
         }
         false
     }
+}
+
+/// `--json`: one machine-readable summary object on stdout. Scripts parse
+/// this instead of scraping the human progress output.
+fn print_json_summary(
+    options: &cli::CliOptions,
+    errors: &[(PathBuf, std::io::Error)],
+    elapsed: f32,
+) {
+    let failed: std::collections::HashSet<&Path> =
+        errors.iter().map(|(path, _)| path.as_path()).collect();
+    let mut out = String::from("{");
+    out.push_str(&format!(
+        "\"ok\":{},\"total\":{},\"failed\":{},\"elapsed_secs\":{elapsed:.3},\"dry_run\":{},",
+        errors.is_empty(),
+        options.paths.len(),
+        errors.len(),
+        options.dry_run,
+    ));
+    out.push_str("\"succeeded_paths\":[");
+    let mut first = true;
+    for path in &options.paths {
+        if failed.contains(path.as_path()) {
+            continue;
+        }
+        if !first {
+            out.push(',');
+        }
+        first = false;
+        out.push_str(&json_string(&path.display().to_string()));
+    }
+    out.push_str("],\"errors\":[");
+    for (i, (path, err)) in errors.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!(
+            "{{\"path\":{},\"error\":{}}}",
+            json_string(&path.display().to_string()),
+            json_string(&err.to_string())
+        ));
+    }
+    out.push_str("]}");
+    println!("{out}");
 }
 
 /// Record the run outcome in the per-user operation journal. Best-effort:
@@ -454,7 +571,8 @@ fn run_bulk_file_roots(
         Some(bar)
     };
 
-    let summary = delete::delete_file_roots_bulk(files, options.shred, bar.as_ref());
+    let shred = options.shred.then_some(options.shred_passes.max(1));
+    let summary = delete::delete_file_roots_bulk(files, shred, bar.as_ref());
     if let Some(bar) = bar {
         if summary.errors.is_empty() {
             bar.finish_with_message(format!("Deleted {} files", summary.deleted));

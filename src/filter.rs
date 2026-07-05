@@ -196,6 +196,43 @@ mod tests {
     }
 
     #[test]
+    fn test_max_size_filters() {
+        let dir = create_test_dir();
+        let cfg = FilterConfig {
+            max_size: Some(10),
+            ..Default::default()
+        };
+        let small = dir.join("small.txt");
+        fs::write(&small, b"short").unwrap();
+        let (sz_s, mt_s) = file_info(&small);
+        let big = dir.join("big.txt");
+        fs::write(&big, b"long enough data").unwrap();
+        let (sz_b, mt_b) = file_info(&big);
+        assert!(cfg.matches_relative(&small, &dir, true, Some(sz_s), mt_s));
+        assert!(!cfg.matches_relative(&big, &dir, true, Some(sz_b), mt_b));
+        // Unknown size fails closed under --max-size: the file may be huge.
+        assert!(!cfg.matches_relative(&big, &dir, true, None, mt_b));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_min_and_max_size_band() {
+        let dir = create_test_dir();
+        let cfg = FilterConfig {
+            min_size: Some(6),
+            max_size: Some(10),
+            ..Default::default()
+        };
+        let f = dir.join("mid.txt");
+        fs::write(&f, b"12345678").unwrap(); // 8 bytes: inside the band
+        let (sz, mt) = file_info(&f);
+        assert!(cfg.matches_relative(&f, &dir, true, Some(sz), mt));
+        assert!(!cfg.matches_relative(&f, &dir, true, Some(5), mt));
+        assert!(!cfg.matches_relative(&f, &dir, true, Some(11), mt));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_dir_always_passes_size_filter() {
         let dir = create_test_dir();
         let sub = dir.join("subdir");

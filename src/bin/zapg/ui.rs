@@ -294,6 +294,17 @@ fn render_options(ui: &mut egui::Ui, app: &mut ZapApp) {
         {
             app.recycle = false;
         }
+        if app.shred {
+            ui.horizontal(|ui| {
+                ui.add_space(22.0);
+                ui.label(egui::RichText::new("Passes").size(12.0));
+                ui.add(
+                    egui::Slider::new(&mut app.shred_passes, 1..=35)
+                        .integer()
+                        .show_value(true),
+                );
+            });
+        }
         ui.horizontal(|ui| {
             ui.checkbox(&mut app.threads_enabled, "Limit threads");
             ui.add_enabled(
@@ -417,6 +428,68 @@ fn render_actions(
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     });
+}
+
+/// Collapsible report of the biggest files in the selection — lets the user
+/// sanity-check what dominates the size badge before committing to delete.
+fn render_top_files_section(ui: &mut egui::Ui, app: &mut ZapApp) {
+    let toggle_label = if app.show_top_files {
+        "\u{25B2} Hide largest files"
+    } else {
+        "\u{25BC} Show largest files"
+    };
+    if ui
+        .add_enabled(!app.is_running(), egui::Button::new(toggle_label))
+        .clicked()
+    {
+        app.show_top_files = !app.show_top_files;
+        if app.show_top_files {
+            app.start_top_files_collection();
+        }
+    }
+
+    if !app.show_top_files {
+        return;
+    }
+    ui.add_space(4.0);
+    let guard = app.top_files_data.lock().unwrap();
+    match guard.as_ref() {
+        Some(entries) if entries.is_empty() => {
+            app.top_files_collecting = false;
+            ui.label(egui::RichText::new("No files found.").size(11.0).weak());
+        }
+        Some(entries) => {
+            app.top_files_collecting = false;
+            egui::ScrollArea::vertical()
+                .id_salt("top_files_scroll")
+                .max_height(96.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    for (path, bytes) in entries {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{:>10}",
+                                    size::format_size(*bytes)
+                                ))
+                                .size(11.0)
+                                .monospace(),
+                            );
+                            let name = path.display().to_string();
+                            ui.label(egui::RichText::new(compact_text(&name, 52)).size(11.0))
+                                .on_hover_text(name);
+                        });
+                    }
+                });
+        }
+        None => {
+            ui.label(
+                egui::RichText::new("Scanning for largest files\u{2026}")
+                    .size(11.0)
+                    .weak(),
+            );
+        }
+    }
 }
 
 fn render_treemap_section(ui: &mut egui::Ui, app: &mut ZapApp) {

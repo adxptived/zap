@@ -113,6 +113,30 @@ fn sanitize_field(s: &str) -> String {
     }
 }
 
+/// Delete the journal and its rotated predecessor (`--journal-clear`).
+/// Missing files are not an error — clearing an absent journal is a no-op.
+pub fn clear() -> io::Result<()> {
+    clear_at(&journal_path())
+}
+
+/// Testable core of [`clear`].
+pub fn clear_at(path: &Path) -> io::Result<()> {
+    let mut result = Ok(());
+    for target in [path.to_path_buf(), path.with_extension("1.log")] {
+        match fs::remove_file(&target) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            // Keep trying the other file, report the first real failure.
+            Err(err) => {
+                if result.is_ok() {
+                    result = Err(err);
+                }
+            }
+        }
+    }
+    result
+}
+
 /// Read the most recent `limit` journal lines (newest last). Falls back to
 /// the rotated file when the current journal has fewer lines than requested,
 /// so recent history survives a rotation. Missing files yield an empty list.
@@ -252,6 +276,24 @@ mod tests {
         // Missing journal is not an error.
         let missing = journal.parent().unwrap().join("nope.log");
         assert!(read_recent_from(&missing, 5).unwrap().is_empty());
+        cleanup(&journal);
+    }
+
+    #[test]
+    fn test_clear_at_removes_journal_and_rotated_file() {
+        let journal = test_journal_file();
+        fs::create_dir_all(journal.parent().unwrap()).unwrap();
+        let rotated = journal.with_extension("1.log");
+        fs::write(&journal, "entry\n").unwrap();
+        fs::write(&rotated, "old entry\n").unwrap();
+
+        clear_at(&journal).unwrap();
+        assert!(!journal.exists());
+        assert!(!rotated.exists());
+
+        // Clearing an already-absent journal is a no-op, not an error.
+        clear_at(&journal).unwrap();
+
         cleanup(&journal);
     }
 

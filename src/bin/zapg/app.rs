@@ -105,6 +105,13 @@ pub struct SizeSnapshot {
 
 pub type ItemSizes = Arc<Mutex<Option<SizeSnapshot>>>;
 
+/// Largest files under the selection, descending by size. `None` while the
+/// background scan is still running.
+pub type TopFilesData = Arc<Mutex<Option<Vec<(PathBuf, u64)>>>>;
+
+/// How many files the "largest files" panel reports.
+pub const TOP_FILES_COUNT: usize = 10;
+
 pub struct ZapApp {
     pub items: Vec<DeleteItem>,
     pub threads_enabled: bool,
@@ -127,6 +134,8 @@ pub struct ZapApp {
     pub danger_confirmed: bool,
     pub recycle: bool,
     pub shred: bool,
+    /// Overwrite passes when `shred` is enabled (1–35, default 3).
+    pub shred_passes: usize,
     /// Disable the operation journal for this run (`--no-journal`), matching
     /// the CLI surfaces. `ZAP_NO_JOURNAL` is checked separately at record
     /// time.
@@ -141,6 +150,11 @@ pub struct ZapApp {
     pub show_treemap: bool,
     pub treemap_data: TreemapData,
     pub treemap_collecting: bool,
+    /// "Largest files" panel — collapsible report of the biggest files in
+    /// the selection, collected in the background like the treemap.
+    pub show_top_files: bool,
+    pub top_files_data: TopFilesData,
+    pub top_files_collecting: bool,
     /// Batch result receiver — window opens instantly, batch paths arrive
     /// asynchronously from the background collection thread.
     pub batch_collecting: Option<BatchReceiver>,
@@ -169,6 +183,7 @@ impl ZapApp {
             dry_run: false,
             recycle: false,
             shred: false,
+            shred_passes: zap::cli::DEFAULT_SHRED_PASSES,
             no_journal: false,
             #[cfg(windows)]
             taskbar: None,
@@ -188,6 +203,9 @@ impl ZapApp {
             show_treemap: false,
             treemap_data: Arc::new(Mutex::new(None)),
             treemap_collecting: false,
+            show_top_files: false,
+            top_files_data: Arc::new(Mutex::new(None)),
+            top_files_collecting: false,
             batch_collecting: None,
         }
     }
@@ -299,7 +317,9 @@ impl ZapApp {
         let threads = self.parsed_threads();
         let dry_run = self.dry_run;
         let recycle = self.recycle;
-        let shred = self.shred;
+        // Pass count only matters when shredding — collapse both flags into
+        // the Option the delete plumbing consumes.
+        let shred = self.shred.then_some(self.shred_passes.clamp(1, 35));
         let no_journal = self.no_journal;
         let (sender, receiver) = mpsc::channel();
         self.receiver = Some(receiver);
@@ -339,7 +359,7 @@ impl ZapApp {
             if !dry_run && !no_journal && !journal::is_disabled_by_env() {
                 let action = if recycle {
                     JournalAction::Recycle
-                } else if shred {
+                } else if shred.is_some() {
                     JournalAction::Shred
                 } else {
                     JournalAction::Delete
@@ -585,6 +605,13 @@ impl ZapApp {
         // New selection invalidates the previous result view.
         self.finished = None;
         self.started_at = None;
+        // The cached "largest files" report no longer covers the selection.
+        if !self.top_files_collecting {
+            *self.top_files_data.lock().unwrap() = None;
+            if self.show_top_files {
+                self.start_top_files_collection();
+            }
+        }
         self.has_dangerous_paths = self
             .items
             .iter()
@@ -607,6 +634,21 @@ impl ZapApp {
 
     /// Kick off background collection of treemap data (immediate children
     /// of each selected root with aggregated sizes — no double counting).
+    /// Kick off the background "largest files" scan (idempotent — reuses
+    /// the cached result on subsequent panel opens).
+    pub fn start_top_files_collection(&mut self) {
+        if self.top_files_collecting || self.top_files_data.lock().unwrap().is_some() {
+            return;
+        }
+        self.top_files_collecting = true;
+        let data_handle = Arc::clone(&self.top_files_data);
+        let roots: Vec<PathBuf> = self.items.iter().map(|i| i.path.clone()).collect();
+        thread::spawn(move || {
+            let top = size::top_files(&roots, TOP_FILES_COUNT);
+            *data_handle.lock().unwrap() = Some(top);
+        });
+    }
+
     pub fn start_treemap_collection(&mut self) {
         if self.treemap_collecting || self.treemap_data.lock().unwrap().is_some() {
             return;
@@ -639,7 +681,7 @@ fn should_bulk_delete_file_roots(paths: &[PathBuf], dry_run: bool, recycle: bool
 
 fn run_bulk_file_roots_gui(
     paths: Vec<PathBuf>,
-    shred: bool,
+    shred: Option<usize>,
     sender: Sender<WorkerEvent>,
 ) -> Vec<PathOutcome> {
     let total = paths.len() as u64;
@@ -776,7 +818,7 @@ pub fn run_delete_path(
     threads: Option<usize>,
     dry_run: bool,
     recycle: bool,
-    shred: bool,
+    shred: Option<usize>,
     sender: &Sender<WorkerEvent>,
 ) -> io::Result<()> {
     if dry_run {
@@ -802,8 +844,8 @@ pub fn run_delete_path(
     if recycle {
         opts = opts.recycle();
     }
-    if shred {
-        opts = opts.shred();
+    if let Some(passes) = shred {
+        opts = opts.shred().with_shred_passes(passes);
     }
     let result = delete::delete_path(path, opts);
     stop.store(true, Ordering::Relaxed);

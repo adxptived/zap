@@ -360,6 +360,8 @@ mod tests {
             recycle: false,
             no_size_preview: false,
             no_journal: true,
+            shred_passes: cli::DEFAULT_SHRED_PASSES,
+            json: false,
         }
     }
 

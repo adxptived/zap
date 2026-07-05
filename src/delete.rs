@@ -1058,7 +1058,7 @@ mod tests {
             })
             .collect();
 
-        let summary = delete_file_roots_bulk(&files, false, None);
+        let summary = delete_file_roots_bulk(&files, None, None);
         assert_eq!(summary.deleted, files.len() as u64);
         assert!(summary.errors.is_empty());
         assert!(files.iter().all(|path| !path.exists()));
@@ -1075,7 +1075,7 @@ mod tests {
         File::create(&blocked).unwrap();
         set_test_remove_file_failure(Some(blocked.clone()));
 
-        let summary = delete_file_roots_bulk(&[ok.clone(), blocked.clone()], false, None);
+        let summary = delete_file_roots_bulk(&[ok.clone(), blocked.clone()], None, None);
         set_test_remove_file_failure(None);
 
         assert_eq!(summary.deleted, 1);
@@ -1104,7 +1104,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         crate::stop::request_stop();
-        let summary = delete_file_roots_bulk(&files, false, None);
+        let summary = delete_file_roots_bulk(&files, None, None);
         crate::stop::reset();
 
         // Every path must be accounted for: deleted + errors == total.

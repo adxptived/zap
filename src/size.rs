@@ -48,6 +48,66 @@ pub fn format_size(bytes: u64) -> String {
     }
 }
 
+/// Find the `count` largest files under `roots` (descending by size).
+///
+/// Powers `--top N` and the GUI "largest files" panel. Unreadable entries
+/// are skipped — this is a report, not a deletion, so best-effort is fine.
+/// Memory stays bounded: each rayon worker keeps at most `count` candidates
+/// (a sorted Vec — `count` is small, typically <= 100, so binary-search
+/// insert beats a heap's constant factor), then the per-thread lists merge.
+pub fn top_files(roots: &[PathBuf], count: usize) -> Vec<(PathBuf, u64)> {
+    if count == 0 || roots.is_empty() {
+        return Vec::new();
+    }
+
+    // Deduplicate overlapping roots (e.g. `zap --top 10 dir dir/sub`):
+    // scanning both would report files under `dir/sub` twice.
+    let mut unique: Vec<&PathBuf> = Vec::with_capacity(roots.len());
+    for root in roots {
+        if !unique.iter().any(|kept| root.starts_with(kept)) {
+            unique.retain(|kept| !kept.starts_with(root));
+            unique.push(root);
+        }
+    }
+
+    let fold = |mut acc: Vec<(PathBuf, u64)>, item: (PathBuf, u64)| {
+        // Keep `acc` sorted descending; drop the smallest when over budget.
+        if acc.len() == count && item.1 <= acc[count - 1].1 {
+            return acc;
+        }
+        let pos = acc.partition_point(|(_, size)| *size >= item.1);
+        acc.insert(pos, item);
+        acc.truncate(count);
+        acc
+    };
+
+    let mut top: Vec<(PathBuf, u64)> = Vec::new();
+    for root in unique {
+        // Files given directly as roots participate too.
+        if let Ok(meta) = std::fs::symlink_metadata(root) {
+            if !meta.is_dir() {
+                if !meta.file_type().is_symlink() {
+                    top = fold(top, (root.clone(), meta.len()));
+                }
+                continue;
+            }
+        }
+        let per_root = jwalk::WalkDir::new(root)
+            .follow_links(false)
+            .skip_hidden(false)
+            .sort(false)
+            .into_iter()
+            .par_bridge()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+            .filter_map(|e| e.metadata().ok().map(|m| (e.path(), m.len())))
+            .fold(Vec::new, |acc, item| fold(acc, item))
+            .reduce(Vec::new, |a, b| b.into_iter().fold(a, fold));
+        top = per_root.into_iter().fold(top, fold);
+    }
+    top
+}
+
 /// Iteratively collect all entries with sizes for treemap visualization
 /// using `jwalk`. Returns (path, size) pairs for all files and directories.
 /// Does not use recursion, so deep directory trees won't blow the stack.
@@ -122,6 +182,55 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn test_top_files_returns_largest_descending() {
+        let root = temp_dir();
+        fs::write(root.join("small.bin"), vec![0u8; 10]).unwrap();
+        fs::write(root.join("big.bin"), vec![0u8; 300]).unwrap();
+        let sub = root.join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("medium.bin"), vec![0u8; 100]).unwrap();
+
+        let top = top_files(&[root.clone()], 2);
+        assert_eq!(top.len(), 2);
+        assert!(top[0].0.ends_with("big.bin") && top[0].1 == 300);
+        assert!(top[1].0.ends_with("medium.bin") && top[1].1 == 100);
+
+        // Asking for more than exists returns everything, still sorted.
+        let all = top_files(&[root.clone()], 10);
+        assert_eq!(all.len(), 3);
+        assert!(all[2].0.ends_with("small.bin"));
+
+        // count == 0 short-circuits.
+        assert!(top_files(&[root.clone()], 0).is_empty());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_top_files_dedupes_overlapping_roots_and_accepts_file_roots() {
+        let root = temp_dir();
+        let sub = root.join("sub");
+        fs::create_dir(&sub).unwrap();
+        let inner = sub.join("inner.bin");
+        fs::write(&inner, vec![0u8; 50]).unwrap();
+
+        // Overlapping roots must not double-count inner.bin.
+        let top = top_files(&[root.clone(), sub.clone()], 10);
+        assert_eq!(
+            top.iter().filter(|(p, _)| p.ends_with("inner.bin")).count(),
+            1,
+            "overlapping roots must be deduplicated"
+        );
+
+        // A file given directly as a root is reported too.
+        let top = top_files(&[inner.clone()], 5);
+        assert_eq!(top.len(), 1);
+        assert_eq!(top[0].1, 50);
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
