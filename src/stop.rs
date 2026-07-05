@@ -60,15 +60,18 @@ pub fn reset() {
     PAUSE_REQUESTED.store(false, Ordering::SeqCst);
 }
 
+/// Crate-wide serialization for tests that mutate the process-global
+/// stop/pause flags. Every such test (in any module) must hold this lock —
+/// the default parallel test runner would otherwise let one test's flag
+/// changes cancel another test's deletions mid-run.
+#[cfg(test)]
+pub static TEST_FLAG_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
-    /// These tests mutate process-global atomics, so they must not run
-    /// concurrently with each other — the default parallel test runner
-    /// would let one test's `reset()` break another's paused state.
-    static SERIAL: Mutex<()> = Mutex::new(());
+    use super::TEST_FLAG_SERIAL as SERIAL;
 
     #[test]
     fn wait_if_paused_returns_immediately_when_not_paused() {

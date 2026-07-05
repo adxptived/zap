@@ -10,6 +10,10 @@ All notable changes to this project will be documented in this file.
   worker (the most common deletion surface) previously never wrote to the
   operation journal; it now records per-path outcomes for direct, batch,
   and late-drained deletions, honoring `--no-journal`/`ZAP_NO_JOURNAL`.
+- **Cancelled bulk deletions no longer reported as successes** — when Stop
+  interrupts a bulk file deletion, the skipped paths are now marked
+  "cancelled by user" instead of silently passing as deleted in the GUI
+  item list and the operation journal.
 
 ### Added
 
