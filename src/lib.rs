@@ -2,6 +2,7 @@ pub mod batch;
 pub mod cli;
 pub mod delete;
 pub mod filter;
+pub mod journal;
 pub mod path_utils;
 pub mod protect;
 #[cfg(windows)]

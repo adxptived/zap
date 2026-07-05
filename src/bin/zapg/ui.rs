@@ -398,6 +398,21 @@ fn render_actions(
             if ui.add(stop_btn).clicked() {
                 zap::stop::request_stop();
             }
+            ui.add_space(8.0);
+            // Pause blocks all deletion loops at their next checkpoint;
+            // Resume releases them. Stop still works while paused.
+            let pause_label = if app.is_paused() { "Resume" } else { "Pause" };
+            let pause_btn = egui::Button::new(
+                egui::RichText::new(pause_label)
+                    .size(14.0)
+                    .color(cancel_text),
+            )
+            .fill(cancel_fill)
+            .corner_radius(btn_radius)
+            .min_size(egui::vec2(92.0, 34.0));
+            if ui.add(pause_btn).clicked() {
+                app.toggle_pause();
+            }
         } else if ui.add(cancel_btn).clicked() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
@@ -482,8 +497,12 @@ fn compact_path(path: &Path) -> String {
 fn status_text(counts: &StatusCounts, app: &ZapApp) -> String {
     let finished_cnt = counts.done + counts.failed;
     let total = app.items.len();
-    let elapsed = app.finished.or_else(|| app.started_at.map(|s| s.elapsed()));
-    let mut text = format!("{finished_cnt}/{total} complete");
+    let elapsed = app.active_elapsed();
+    let mut text = if app.is_paused() {
+        format!("Paused - {finished_cnt}/{total} complete")
+    } else {
+        format!("{finished_cnt}/{total} complete")
+    };
     if counts.failed > 0 {
         text.push_str(&format!(", {} failed", counts.failed));
         if let Some(error) = first_failure(&app.items) {
@@ -494,6 +513,11 @@ fn status_text(counts: &StatusCounts, app: &ZapApp) -> String {
     if let Some(d) = elapsed {
         text.push_str(&format!(" - {:.1}s", d.as_secs_f32()));
     }
+    if app.is_running() && !app.is_paused() {
+        if let Some(eta) = estimate_eta_secs(app, counts) {
+            text.push_str(&format!(" - ETA ~{}", format_eta(eta)));
+        }
+    }
     if let Some(msg) = active_progress_message(&app.items) {
         text.push_str(" - ");
         text.push_str(msg);
@@ -501,10 +525,78 @@ fn status_text(counts: &StatusCounts, app: &ZapApp) -> String {
     text
 }
 
+/// Remaining-time estimate from byte-weighted progress and active elapsed
+/// time. Byte weighting matters on mixed selections: deleting 90 small files
+/// out of 100 means little if the 10 remaining are the multi-GB folders.
+/// Returns None until enough progress exists for a stable estimate.
+fn estimate_eta_secs(app: &ZapApp, counts: &StatusCounts) -> Option<f32> {
+    let fraction = byte_weighted_progress(app, counts).unwrap_or_else(|| {
+        // Sizes not computed yet — fall back to the count-based fraction.
+        aggregate_progress(app, counts)
+    });
+    if !(0.02..1.0).contains(&fraction) {
+        return None;
+    }
+    let elapsed = app.active_elapsed()?.as_secs_f32();
+    if elapsed < 0.5 {
+        return None;
+    }
+    Some(elapsed * (1.0 - fraction) / fraction)
+}
+
+fn format_eta(secs: f32) -> String {
+    if secs < 60.0 {
+        format!("{}s", secs.ceil() as u64)
+    } else if secs < 3600.0 {
+        format!("{}m {}s", (secs / 60.0) as u64, (secs % 60.0) as u64)
+    } else {
+        format!(
+            "{}h {}m",
+            (secs / 3600.0) as u64,
+            ((secs % 3600.0) / 60.0) as u64
+        )
+    }
+}
+
+/// Selection-wide progress weighted by per-root byte sizes (computed by the
+/// background size pass). Completed items contribute their full size, the
+/// running item its internal fraction. Returns None until sizes are known
+/// or when the selection is all zero-sized.
+fn byte_weighted_progress(app: &ZapApp, _counts: &StatusCounts) -> Option<f32> {
+    let guard = app.item_sizes.lock().ok()?;
+    let sizes = guard.as_ref()?;
+    let total: u64 = sizes.iter().map(|(_, sz)| sz).sum();
+    if total == 0 {
+        return None;
+    }
+    // HashMap lookup keeps this O(n) per frame — a linear search per item
+    // would be quadratic on bulk selections with thousands of files.
+    let by_path: std::collections::HashMap<&Path, u64> =
+        sizes.iter().map(|(p, sz)| (p.as_path(), *sz)).collect();
+    let mut done_bytes: f64 = 0.0;
+    for item in &app.items {
+        let size = by_path.get(item.path.as_path()).copied().unwrap_or(0) as f64;
+        match &item.state {
+            ItemState::Done | ItemState::Failed(_) => done_bytes += size,
+            ItemState::Running => {
+                done_bytes += size * item_progress_fraction(item) as f64;
+            }
+            ItemState::Pending => {}
+        }
+    }
+    Some((done_bytes / total as f64).clamp(0.0, 1.0) as f32)
+}
+
 fn aggregate_progress(app: &ZapApp, counts: &StatusCounts) -> f32 {
     let total = app.items.len();
     if total == 0 {
         return 0.0;
+    }
+    // Prefer byte-weighted progress when the background size pass has
+    // finished: on mixed selections it reflects real remaining work far
+    // better than counting every item equally.
+    if let Some(fraction) = byte_weighted_progress(app, counts) {
+        return fraction;
     }
     // Bulk file-root runs report selection-wide progress: use it directly.
     // Weighting it per running item would keep the bar near zero for the

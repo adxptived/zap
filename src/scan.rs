@@ -201,6 +201,9 @@ pub(crate) fn scan_into_channel(
         .parallelism(jwalk::Parallelism::RayonNewPool(scan_parallelism()))
         .into_iter()
     {
+        // Pause checkpoint: blocks the scan (and via channel backpressure the
+        // deletion workers) while the GUI Pause button is active.
+        crate::stop::wait_if_paused();
         if crate::stop::is_stop_requested() {
             if let Some(b) = bar {
                 b.finish_with_message("Cancelled");
