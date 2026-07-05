@@ -220,7 +220,9 @@ fn process_file_batch(
     bar: Option<&ProgressBar>,
     processed_count: Option<&AtomicU64>,
 ) {
-    // Honour Ctrl+C between batches so huge deletions stop promptly.
+    // Honour pause and Ctrl+C between batches so huge deletions pause/stop
+    // promptly. `wait_if_paused` is a single atomic load when not paused.
+    crate::stop::wait_if_paused();
     if crate::stop::is_stop_requested() {
         return;
     }
@@ -251,6 +253,7 @@ fn delete_dir_batches(
         }
         let cs = chunk_size(batch.entries.len().max(1));
         batch.entries.par_chunks(cs).for_each(|chunk| {
+            crate::stop::wait_if_paused();
             if crate::stop::is_stop_requested() {
                 return;
             }
@@ -698,6 +701,7 @@ pub fn delete_file_roots_bulk(
             return;
         }
         for path in chunk {
+            crate::stop::wait_if_paused();
             if crate::stop::is_stop_requested() {
                 break;
             }

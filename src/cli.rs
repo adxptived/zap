@@ -26,6 +26,8 @@ pub struct CliOptions {
     pub only_empty: bool,
     pub recycle: bool,
     pub no_size_preview: bool,
+    /// Skip writing the operation journal for this run (`--no-journal`).
+    pub no_journal: bool,
 }
 
 impl CliOptions {
@@ -109,6 +111,7 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> io::Result<CliAct
     let mut only_empty = false;
     let mut recycle = false;
     let mut no_size_preview = false;
+    let mut no_journal = false;
     let mut threads = None;
     let mut paths = Vec::new();
     let mut filter_includes: Vec<Pattern> = Vec::new();
@@ -133,6 +136,7 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> io::Result<CliAct
             Some("--only-empty") => only_empty = true,
             Some("--recycle") => recycle = true,
             Some("--no-size-preview") => no_size_preview = true,
+            Some("--no-journal") => no_journal = true,
             Some("--force") | Some("--yes") => force = true,
             Some("--threads") | Some("-j") => {
                 let value = iter.next().ok_or_else(|| {
@@ -328,6 +332,7 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> io::Result<CliAct
         only_empty,
         recycle,
         no_size_preview,
+        no_journal,
     }))
 }
 
@@ -364,6 +369,7 @@ pub fn print_help() {
     println!("  --only-empty        Only delete if directory is empty");
     println!("  --recycle           Send to Recycle Bin instead of permanent delete");
     println!("  --no-size-preview   Skip directory size calculation in the confirmation preview");
+    println!("  --no-journal        Do not record this run in the operation journal");
     println!();
     println!("Options:");
     println!(

@@ -5,7 +5,7 @@ use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
-use zap::{batch, cli, delete, path_utils, protect, size, stop};
+use zap::{batch, cli, delete, journal, path_utils, protect, size, stop};
 
 #[cfg(windows)]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -304,6 +304,8 @@ fn run_delete(options: &cli::CliOptions, start: Instant) -> bool {
         run_delete_inner(options, false, allow_dangerous)
     };
 
+    record_journal(options, &errors);
+
     let elapsed = start.elapsed().as_secs_f32();
 
     if errors.is_empty() {
@@ -329,6 +331,33 @@ fn run_delete(options: &cli::CliOptions, start: Instant) -> bool {
         );
         false
     }
+}
+
+/// Record the run outcome in the per-user operation journal. Best-effort:
+/// journaling must never fail or slow down a deletion run.
+fn record_journal(options: &cli::CliOptions, errors: &[(PathBuf, std::io::Error)]) {
+    if options.dry_run || options.no_journal || journal::is_disabled_by_env() {
+        return;
+    }
+    let action = if options.recycle {
+        journal::JournalAction::Recycle
+    } else if options.shred {
+        journal::JournalAction::Shred
+    } else {
+        journal::JournalAction::Delete
+    };
+    let outcomes: Vec<journal::PathOutcome> = options
+        .paths
+        .iter()
+        .map(|path| {
+            let error = errors
+                .iter()
+                .find(|(failed, _)| failed == path)
+                .map(|(_, err)| err.to_string());
+            (path.clone(), error)
+        })
+        .collect();
+    let _ = journal::record(action, &outcomes);
 }
 
 fn bulk_file_roots_candidate(

@@ -12,6 +12,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use zap::delete::DeleteOptions;
+use zap::journal::{self, JournalAction, PathOutcome};
 use zap::{batch, delete, path_utils, protect, size, stop};
 
 use crate::MAX_THREADS;
@@ -80,6 +81,12 @@ pub enum WorkerEvent {
 /// Treemap entries: (path, size) pairs shared with the collection thread.
 pub type TreemapData = Arc<Mutex<Option<Vec<(PathBuf, u64)>>>>;
 
+/// Per-root byte sizes computed by the background size thread. Used both for
+/// the size badge (sum) and for byte-weighted progress/ETA: on mixed
+/// selections (a few huge folders + many small files) weighting by bytes is
+/// far more accurate than weighting every item equally.
+pub type ItemSizes = Arc<Mutex<Option<Vec<(PathBuf, u64)>>>>;
+
 pub struct ZapApp {
     pub items: Vec<DeleteItem>,
     pub threads_enabled: bool,
@@ -90,6 +97,13 @@ pub struct ZapApp {
     pub finished: Option<Duration>,
     pub total_size_calculating: bool,
     pub total_size: Arc<Mutex<Option<u64>>>,
+    /// Per-root sizes from the same background pass as `total_size`.
+    pub item_sizes: ItemSizes,
+    /// Time the current pause began (None while running normally).
+    pub paused_at: Option<Instant>,
+    /// Total time spent paused in this run — subtracted from elapsed so the
+    /// ETA and the timer only count active work.
+    pub paused_total: Duration,
     pub batch_session: Option<BatchSession>,
     pub has_dangerous_paths: bool,
     pub danger_confirmed: bool,
@@ -119,7 +133,12 @@ impl ZapApp {
         let has_dangerous = paths.iter().any(|p| protect::is_protected_path(p));
 
         let total_size = Arc::new(Mutex::new(None));
-        spawn_size_calculation(Arc::clone(&total_size), paths.clone());
+        let item_sizes: ItemSizes = Arc::new(Mutex::new(None));
+        spawn_size_calculation(
+            Arc::clone(&total_size),
+            Arc::clone(&item_sizes),
+            paths.clone(),
+        );
 
         Self {
             items: paths.into_iter().map(DeleteItem::pending).collect(),
@@ -137,6 +156,9 @@ impl ZapApp {
             finished: None,
             total_size_calculating: true,
             total_size,
+            item_sizes,
+            paused_at: None,
+            paused_total: Duration::ZERO,
             batch_session,
             has_dangerous_paths: has_dangerous,
             danger_confirmed: false,
@@ -195,6 +217,37 @@ impl ZapApp {
         self.receiver.is_some()
     }
 
+    pub fn is_paused(&self) -> bool {
+        self.is_running() && stop::is_paused()
+    }
+
+    /// Toggle pause/resume for the active run, tracking paused time so the
+    /// elapsed timer and ETA only count active work.
+    pub fn toggle_pause(&mut self) {
+        if !self.is_running() {
+            return;
+        }
+        if stop::is_paused() {
+            stop::request_resume();
+            if let Some(at) = self.paused_at.take() {
+                self.paused_total += at.elapsed();
+            }
+        } else {
+            stop::request_pause();
+            self.paused_at = Some(Instant::now());
+        }
+    }
+
+    /// Elapsed active time of the current/last run, excluding pauses.
+    pub fn active_elapsed(&self) -> Option<Duration> {
+        if let Some(done) = self.finished {
+            return Some(done);
+        }
+        let raw = self.started_at?.elapsed();
+        let paused = self.paused_total + self.paused_at.map(|at| at.elapsed()).unwrap_or_default();
+        Some(raw.saturating_sub(paused))
+    }
+
     pub fn thread_error(&self) -> Option<&'static str> {
         if !self.threads_enabled {
             return None;
@@ -214,8 +267,10 @@ impl ZapApp {
     }
 
     pub fn start(&mut self) {
-        // Clear any stop request left over from a cancelled previous run.
+        // Clear any stop/pause request left over from a previous run.
         stop::reset();
+        self.paused_at = None;
+        self.paused_total = Duration::ZERO;
         self.finalize_batch_session();
         let paths: Vec<PathBuf> = self.items.iter().map(|item| item.path.clone()).collect();
         let threads = self.parsed_threads();
@@ -232,25 +287,40 @@ impl ZapApp {
         }
         thread::spawn(move || {
             let start = Instant::now();
+            let mut outcomes: Vec<PathOutcome> = Vec::with_capacity(paths.len());
             if should_bulk_delete_file_roots(&paths, dry_run, recycle) {
-                run_bulk_file_roots_gui(paths, shred, sender.clone());
+                outcomes = run_bulk_file_roots_gui(paths, shred, sender.clone());
             } else {
                 for path in paths {
                     // Stop button: skip everything not yet started. The item
                     // currently being deleted aborts via the same flag inside
                     // delete_path.
                     if stop::is_stop_requested() {
-                        let _ = sender
-                            .send(WorkerEvent::Done(path, Err("cancelled by user".to_owned())));
+                        let _ = sender.send(WorkerEvent::Done(
+                            path.clone(),
+                            Err("cancelled by user".to_owned()),
+                        ));
+                        outcomes.push((path, Some("cancelled by user".to_owned())));
                         continue;
                     }
                     let _ = sender.send(WorkerEvent::Started(path.clone()));
                     let result = run_delete_path(&path, threads, dry_run, recycle, shred, &sender);
-                    let _ = sender.send(WorkerEvent::Done(
-                        path,
-                        normalize_worker_result(result, dry_run),
-                    ));
+                    let result = normalize_worker_result(result, dry_run);
+                    outcomes.push((path.clone(), result.as_ref().err().cloned()));
+                    let _ = sender.send(WorkerEvent::Done(path, result));
                 }
+            }
+            // Record the run in the operation journal (audit trail). A dry
+            // run changes nothing on disk, so it is not journaled.
+            if !dry_run && !journal::is_disabled_by_env() {
+                let action = if recycle {
+                    JournalAction::Recycle
+                } else if shred {
+                    JournalAction::Shred
+                } else {
+                    JournalAction::Delete
+                };
+                let _ = journal::record(action, &outcomes);
             }
             let _ = sender.send(WorkerEvent::Finished(start.elapsed()));
         });
@@ -285,7 +355,12 @@ impl ZapApp {
                     self.set_state(&path, ItemState::Failed(err));
                 }
                 WorkerEvent::Finished(duration) => {
-                    self.finished = Some(duration);
+                    // Report active time only: pauses are not deletion work.
+                    if let Some(at) = self.paused_at.take() {
+                        self.paused_total += at.elapsed();
+                    }
+                    stop::request_resume();
+                    self.finished = Some(duration.saturating_sub(self.paused_total));
                     clear_receiver = true;
                 }
             }
@@ -472,7 +547,11 @@ impl ZapApp {
     pub fn recalculate_total_size(&mut self) {
         self.total_size_calculating = true;
         let size_paths: Vec<PathBuf> = self.items.iter().map(|item| item.path.clone()).collect();
-        spawn_size_calculation(Arc::clone(&self.total_size), size_paths);
+        spawn_size_calculation(
+            Arc::clone(&self.total_size),
+            Arc::clone(&self.item_sizes),
+            size_paths,
+        );
     }
 
     /// Kick off background collection of treemap data (immediate children
@@ -502,7 +581,11 @@ fn should_bulk_delete_file_roots(paths: &[PathBuf], dry_run: bool, recycle: bool
     })
 }
 
-fn run_bulk_file_roots_gui(paths: Vec<PathBuf>, shred: bool, sender: Sender<WorkerEvent>) {
+fn run_bulk_file_roots_gui(
+    paths: Vec<PathBuf>,
+    shred: bool,
+    sender: Sender<WorkerEvent>,
+) -> Vec<PathOutcome> {
     let total = paths.len() as u64;
     for path in &paths {
         let _ = sender.send(WorkerEvent::Started(path.clone()));
@@ -528,10 +611,16 @@ fn run_bulk_file_roots_gui(paths: Vec<PathBuf>, shred: bool, sender: Sender<Work
     let _ = monitor.join();
 
     let failed: std::collections::HashMap<PathBuf, String> = summary.errors.into_iter().collect();
+    let mut outcomes: Vec<PathOutcome> = Vec::with_capacity(paths.len());
     for path in paths {
-        let result = failed.get(&path).cloned().map_or(Ok(()), Err);
-        let _ = sender.send(WorkerEvent::Done(path, result));
+        let error = failed.get(&path).cloned();
+        let _ = sender.send(WorkerEvent::Done(
+            path.clone(),
+            error.clone().map_or(Ok(()), Err),
+        ));
+        outcomes.push((path, error));
     }
+    outcomes
 }
 
 fn send_bulk_progress(
@@ -565,10 +654,22 @@ impl DeleteItem {
     }
 }
 
-fn spawn_size_calculation(handle: Arc<Mutex<Option<u64>>>, paths: Vec<PathBuf>) {
+fn spawn_size_calculation(total: Arc<Mutex<Option<u64>>>, sizes: ItemSizes, paths: Vec<PathBuf>) {
     thread::spawn(move || {
-        let sum: u64 = paths.iter().map(|p| size::dir_size_recursive(p)).sum();
-        if let Ok(mut guard) = handle.lock() {
+        // One pass computes both the per-root sizes (byte-weighted ETA) and
+        // their sum (size badge) — no duplicate directory walks.
+        let per_root: Vec<(PathBuf, u64)> = paths
+            .into_iter()
+            .map(|p| {
+                let sz = size::dir_size_recursive(&p);
+                (p, sz)
+            })
+            .collect();
+        let sum: u64 = per_root.iter().map(|(_, sz)| sz).sum();
+        if let Ok(mut guard) = sizes.lock() {
+            *guard = Some(per_root);
+        }
+        if let Ok(mut guard) = total.lock() {
             *guard = Some(sum);
         }
     });

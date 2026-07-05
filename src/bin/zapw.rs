@@ -320,6 +320,7 @@ mod tests {
             only_empty: false,
             recycle: false,
             no_size_preview: false,
+            no_journal: true,
         }
     }
 
