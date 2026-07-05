@@ -19,19 +19,20 @@ pub fn dedup_paths(paths: &mut Vec<PathBuf>) {
 /// Truncate a path string to `max_len` chars, prepending "..." if cut.
 pub fn compact_path(path: &Path, max_len: usize) -> String {
     let text = path.display().to_string();
-    if text.chars().count() <= max_len {
+    let char_count = text.chars().count();
+    if char_count <= max_len {
         return text;
     }
     if max_len < 4 {
         return text.chars().take(max_len).collect();
     }
-    let suffix: String = text
-        .chars()
-        .rev()
-        .take(max_len - 3)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    format!("...{suffix}")
+    // Slice the tail at a char boundary directly — avoids the previous
+    // reverse-collect-reverse triple pass and its intermediate Vec.
+    let keep = max_len - 3;
+    let start = text
+        .char_indices()
+        .nth(char_count - keep)
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    format!("...{}", &text[start..])
 }

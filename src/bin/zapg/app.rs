@@ -94,7 +94,16 @@ pub type TreemapData = Arc<Mutex<Option<TreemapSnapshot>>>;
 /// the size badge (sum) and for byte-weighted progress/ETA: on mixed
 /// selections (a few huge folders + many small files) weighting by bytes is
 /// far more accurate than weighting every item equally.
-pub type ItemSizes = Arc<Mutex<Option<Vec<(PathBuf, u64)>>>>;
+///
+/// The map and total are built once by the size thread so the per-frame
+/// progress code does O(1) lookups instead of rebuilding an index and
+/// re-summing thousands of entries on every repaint.
+pub struct SizeSnapshot {
+    pub by_path: std::collections::HashMap<PathBuf, u64>,
+    pub total: u64,
+}
+
+pub type ItemSizes = Arc<Mutex<Option<SizeSnapshot>>>;
 
 pub struct ZapApp {
     pub items: Vec<DeleteItem>,
@@ -703,16 +712,19 @@ fn spawn_size_calculation(total: Arc<Mutex<Option<u64>>>, sizes: ItemSizes, path
         // sized in parallel: bulk Explorer selections have thousands of
         // file roots and `dir_size_recursive` resolves each plain file with
         // a single metadata call.
-        let per_root: Vec<(PathBuf, u64)> = paths
+        let per_root: std::collections::HashMap<PathBuf, u64> = paths
             .into_par_iter()
             .map(|p| {
                 let sz = size::dir_size_recursive(&p);
                 (p, sz)
             })
             .collect();
-        let sum: u64 = per_root.iter().map(|(_, sz)| sz).sum();
+        let sum: u64 = per_root.values().sum();
         if let Ok(mut guard) = sizes.lock() {
-            *guard = Some(per_root);
+            *guard = Some(SizeSnapshot {
+                by_path: per_root,
+                total: sum,
+            });
         }
         if let Ok(mut guard) = total.lock() {
             *guard = Some(sum);

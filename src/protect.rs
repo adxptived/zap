@@ -111,6 +111,22 @@ fn ascii_ci_starts_with(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.len() >= needle.len() && haystack[..needle.len()].eq_ignore_ascii_case(needle)
 }
 
+/// Compare two backslash-separated paths component-wise, ASCII
+/// case-insensitively, ignoring empty components (doubled separators).
+/// Zero allocations — replaces the collect-and-join approach.
+#[cfg(windows)]
+fn components_ci_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut ai = a.split(|&c| c == b'\\').filter(|s| !s.is_empty());
+    let mut bi = b.split(|&c| c == b'\\').filter(|s| !s.is_empty());
+    loop {
+        match (ai.next(), bi.next()) {
+            (None, None) => return true,
+            (Some(x), Some(y)) if x.eq_ignore_ascii_case(y) => {}
+            _ => return false,
+        }
+    }
+}
+
 #[cfg(windows)]
 pub fn is_protected_path(path: &Path) -> bool {
     let cfg = protected_config();
@@ -138,25 +154,24 @@ pub fn is_protected_path(path: &Path) -> bool {
                 return true;
             }
             let rest = &path_bytes[pb.len() + 1..];
-            let components: Vec<&[u8]> = rest
-                .split(|&b| b == b'\\')
-                .filter(|s| !s.is_empty())
-                .collect();
-            if components.len() <= 1 {
-                return true;
+            // Skip the first component (the user name); `user_rel` is the
+            // remainder relative to the user's profile folder.
+            let mut comps = rest.split(|&b| b == b'\\').filter(|s| !s.is_empty());
+            if comps.next().is_none() {
+                return true; // "Users\" with only empty components
             }
-            // Reconstruct the relative path under the user folder for the
-            // whitelist comparison. This is the only allocation per call,
-            // and only when we are inside the Users tree.
-            let user_rel: String = components[1..]
+            let Some(first_rel) = comps.next() else {
+                return true; // Users\<name> (depth 1)
+            };
+            // Rebuild the relative slice without allocating: it starts at
+            // `first_rel` and runs to the end of `rest`.
+            let start = first_rel.as_ptr() as usize - rest.as_ptr() as usize;
+            let user_rel = &rest[start..];
+            if PROTECTED_USER_SUBDIRS
                 .iter()
-                .map(|c| std::str::from_utf8(c).unwrap_or(""))
-                .collect::<Vec<_>>()
-                .join("\\");
-            for dir in PROTECTED_USER_SUBDIRS {
-                if user_rel.eq_ignore_ascii_case(dir) {
-                    return true;
-                }
+                .any(|dir| components_ci_eq(user_rel, dir.as_bytes()))
+            {
+                return true;
             }
             continue;
         }
