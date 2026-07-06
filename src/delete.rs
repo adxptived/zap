@@ -22,6 +22,45 @@ use crate::scan::{
 
 const MAX_REPORTED_FAILURES: usize = 20;
 
+/// Process-global "YOLO" switch. Set once per run by the entry points
+/// (`delete_path`, the bulk file-root pass, the GUI workers) and read deep
+/// in [`retry_after_clearing_readonly`], which is the single choke point
+/// every delete strategy funnels through. A global avoids threading a
+/// `yolo` bool through a dozen helper signatures, mirroring how
+/// [`crate::stop`] already exposes global run state.
+static YOLO_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Count of paths handed off to reboot-time deletion during the current run
+/// (the YOLO last resort). Reset whenever YOLO is (re)enabled so each run
+/// reports its own tally.
+static REBOOT_SCHEDULED: AtomicU64 = AtomicU64::new(0);
+
+/// Enable/disable aggressive YOLO escalation for subsequent deletes.
+///
+/// Called per top-level path by [`delete_path`], so it must NOT reset the
+/// reboot tally (that would wipe the count from earlier paths in the same
+/// run). Use [`reset_reboot_scheduled`] once at the true start of a run.
+pub fn set_yolo(enabled: bool) {
+    YOLO_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+/// Whether YOLO escalation is currently armed.
+#[inline]
+pub fn is_yolo() -> bool {
+    YOLO_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Reset the reboot tally. Call once at the start of each run so the count
+/// reflects that run only (matters for the long-lived GUI process).
+pub fn reset_reboot_scheduled() {
+    REBOOT_SCHEDULED.store(0, Ordering::Relaxed);
+}
+
+/// Number of paths scheduled for deletion on next reboot during this run.
+pub fn reboot_scheduled_count() -> u64 {
+    REBOOT_SCHEDULED.load(Ordering::Relaxed)
+}
+
 #[derive(Debug, Default)]
 pub struct BulkDeleteSummary {
     pub deleted: u64,
@@ -137,6 +176,24 @@ fn retry_after_clearing_readonly(
             return Ok(());
         }
     }
+
+    // Last resort: YOLO escalation (take ownership + rewrite ACL, then
+    // schedule on reboot). Only when explicitly armed for this run — never
+    // the default. Protected system paths are already refused upstream, so
+    // this only ever touches the user's own locked/permission-denied files.
+    #[cfg(windows)]
+    if is_yolo() {
+        match crate::yolo::escalate_delete(path) {
+            crate::yolo::YoloOutcome::Deleted => return Ok(()),
+            crate::yolo::YoloOutcome::ScheduledForReboot => {
+                REBOOT_SCHEDULED.fetch_add(1, Ordering::Relaxed);
+                return Ok(());
+            }
+            // Escalation failed too — surface the original error.
+            crate::yolo::YoloOutcome::Failed(_) => {}
+        }
+    }
+
     Err(original)
 }
 
@@ -564,6 +621,10 @@ pub struct DeleteOptions {
     /// Overwrite passes when `shred` is set (default
     /// [`crate::cli::DEFAULT_SHRED_PASSES`]).
     pub shred_passes: usize,
+    /// Aggressive escalation: on Windows, take ownership + rewrite ACLs and
+    /// finally schedule reboot-time deletion for otherwise-undeletable
+    /// files. Never bypasses protected-path refusal.
+    pub yolo: bool,
 }
 
 impl Default for DeleteOptions {
@@ -578,6 +639,7 @@ impl Default for DeleteOptions {
             only_empty: false,
             recycle: false,
             shred_passes: crate::cli::DEFAULT_SHRED_PASSES,
+            yolo: false,
         }
     }
 }
@@ -624,6 +686,11 @@ impl DeleteOptions {
     }
     pub fn recycle(mut self) -> Self {
         self.recycle = true;
+        self
+    }
+    /// Arm aggressive YOLO escalation for this deletion.
+    pub fn yolo(mut self) -> Self {
+        self.yolo = true;
         self
     }
 }
@@ -779,6 +846,10 @@ pub fn delete_file_roots_bulk(
 }
 
 pub fn delete_path(path: &Path, opts: DeleteOptions) -> io::Result<()> {
+    // Arm/disarm YOLO for this run before any delete strategy runs. The
+    // bulk file-root pass sets this separately (it bypasses delete_path).
+    set_yolo(opts.yolo);
+
     if opts.only_empty && !path.is_dir() {
         if !opts.silent {
             eprintln!("Skipping non-directory (--only-empty): {}", path.display());

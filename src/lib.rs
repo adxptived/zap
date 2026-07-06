@@ -15,3 +15,5 @@ pub mod stop;
 pub mod treemap;
 #[cfg(windows)]
 pub mod winapi;
+#[cfg(windows)]
+pub mod yolo;

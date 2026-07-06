@@ -34,6 +34,10 @@ pub struct CliOptions {
     /// Emit a machine-readable JSON summary instead of human output
     /// (`--json`).
     pub json: bool,
+    /// Aggressive escalation for undeletable files (`--yolo`): take
+    /// ownership + rewrite ACLs, then schedule reboot-time deletion. Still
+    /// refuses protected system paths.
+    pub yolo: bool,
 }
 
 impl CliOptions {
@@ -60,6 +64,7 @@ impl CliOptions {
             opts
         };
         let opts = if self.recycle { opts.recycle() } else { opts };
+        let opts = if self.yolo { opts.yolo() } else { opts };
         if allow_dangerous {
             opts.allow_dangerous()
         } else {
@@ -153,6 +158,7 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> io::Result<CliAct
     let mut older_than: Option<std::time::SystemTime> = None;
     let mut shred_passes: Option<usize> = None;
     let mut json = false;
+    let mut yolo = false;
     let mut top: Option<usize> = None;
     let mut iter = args.into_iter();
     let mut flags_done = false;
@@ -173,6 +179,7 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> io::Result<CliAct
             Some("--no-size-preview") => no_size_preview = true,
             Some("--no-journal") => no_journal = true,
             Some("--json") => json = true,
+            Some("--yolo") => yolo = true,
             Some("--force") | Some("--yes") => force = true,
             Some("--journal-clear") => return Ok(CliAction::ClearJournal),
             Some("--shred-passes") => {
@@ -400,10 +407,10 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> io::Result<CliAct
     if let Some(count) = top {
         // Report-only mode: deletion flags are irrelevant and most likely a
         // mistake — reject the destructive ones explicitly.
-        if shred || recycle || only_empty {
+        if shred || recycle || only_empty || yolo {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "--top is a report-only mode and cannot be combined with --shred/--recycle/--only-empty",
+                "--top is a report-only mode and cannot be combined with --shred/--recycle/--only-empty/--yolo",
             ));
         }
         let mut seen: HashSet<PathBuf> = HashSet::with_capacity(paths.len());
@@ -422,6 +429,13 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> io::Result<CliAct
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "--recycle and --only-empty are mutually exclusive (an empty directory has no content to recover)",
+        ));
+    }
+
+    if recycle && yolo {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--recycle and --yolo are mutually exclusive (the Recycle Bin move cannot break locks or take ownership)",
         ));
     }
 
@@ -474,6 +488,7 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> io::Result<CliAct
         no_journal,
         shred_passes: shred_passes.unwrap_or(DEFAULT_SHRED_PASSES),
         json,
+        yolo,
     }))
 }
 
