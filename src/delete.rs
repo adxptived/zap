@@ -14,7 +14,7 @@ use rayon::iter::{ParallelBridge, ParallelIterator};
 use rayon::slice::ParallelSlice;
 
 use crate::filter::FilterConfig;
-use crate::protect::{is_protected_path, sanitize_path};
+use crate::protect::{is_protected_path, sanitize_path, validate_delete_target};
 use crate::scan::{
     scan_directory, scan_directory_plan_for_filter, scan_directory_plan_with_bar_for_filter,
     scan_into_channel, EntryKind, ScannedEntry,
@@ -325,8 +325,12 @@ fn delete_directory_pipeline(path: &Path, bar: Option<ProgressBar>, shred: bool)
     let queue_cap = (rayon::current_num_threads() * 4).max(64);
     let (scan_tx, scan_rx) = crossbeam_channel::bounded::<ScannedEntry>(queue_cap);
 
-    // Channel from consumer-thread to rayon workers: unbounded batches.
-    let (batch_tx, batch_rx) = crossbeam_channel::unbounded::<Vec<ScannedEntry>>();
+    // Keep only a small number of ready batches ahead of Rayon. An unbounded
+    // queue could retain the whole tree when scanning outran a slow disk or
+    // locked-file retries, defeating the bounded scan channel above.
+    let ready_batches = (rayon::current_num_threads() * 2).max(4);
+    let (batch_tx, batch_rx) =
+        crossbeam_channel::bounded::<Vec<ScannedEntry>>(ready_batches);
 
     // ── thread A: jwalk scan ──────────────────────────────────────────────
     let scan_path = path.to_path_buf();
@@ -618,47 +622,17 @@ pub fn recycle_paths_validated(
     let mut to_recycle: Vec<&std::path::PathBuf> = Vec::with_capacity(paths.len());
 
     for path in paths {
-        let metadata = match std::fs::symlink_metadata(path) {
-            Ok(m) => m,
+        let target = match validate_delete_target(path, allow_dangerous) {
+            Ok(target) => target,
             Err(err) => {
                 errors.push((path.clone(), err));
                 continue;
             }
         };
-        if metadata.file_type().is_symlink() {
+        if target.metadata.file_type().is_symlink() {
             if let Err(err) = delete_symlink(path) {
                 errors.push((path.clone(), err));
             }
-            continue;
-        }
-        let canonical = match sanitize_path(path) {
-            Ok(c) => c,
-            Err(err) => {
-                errors.push((path.clone(), err));
-                continue;
-            }
-        };
-        if canonical.parent().is_none() {
-            errors.push((
-                path.clone(),
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("refusing to delete filesystem root: {}", path.display()),
-                ),
-            ));
-            continue;
-        }
-        if is_protected_path(&canonical) && !allow_dangerous {
-            errors.push((
-                path.clone(),
-                io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    format!(
-                        "refusing to delete dangerous path without extra confirmation: {}",
-                        path.display()
-                    ),
-                ),
-            ));
             continue;
         }
         to_recycle.push(path);
@@ -689,6 +663,7 @@ pub fn recycle_paths_validated(
 pub fn delete_file_roots_bulk(
     paths: &[std::path::PathBuf],
     shred: bool,
+    allow_dangerous: bool,
     bar: Option<&ProgressBar>,
 ) -> BulkDeleteSummary {
     let deleted = AtomicU64::new(0);
@@ -719,12 +694,26 @@ pub fn delete_file_roots_bulk(
                 mark_cancelled(&chunk[i..]);
                 break;
             }
-            let result = match std::fs::symlink_metadata(path) {
-                Ok(meta) if meta.file_type().is_symlink() => delete_symlink(path),
-                Ok(_) if shred => crate::shred::shred_file(path, 3),
-                Ok(_) => remove_file_with_retry(path),
-                Err(err) => Err(err),
-            };
+            // Revalidate at the last possible moment. Besides enforcing the
+            // central safety policy, this rejects a directory swapped in after
+            // the caller selected the bulk file fast path (TOCTOU hardening).
+            let result = validate_delete_target(path, allow_dangerous).and_then(|target| {
+                if target.metadata.file_type().is_symlink() {
+                    delete_symlink(path)
+                } else if !target.metadata.is_file() {
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "bulk deletion only accepts files or symlinks: {}",
+                            path.display()
+                        ),
+                    ))
+                } else if shred {
+                    crate::shred::shred_file(path, 3)
+                } else {
+                    remove_file_with_retry(path)
+                }
+            });
             match result {
                 Ok(()) => {
                     deleted.fetch_add(1, Ordering::Relaxed);
@@ -758,25 +747,9 @@ pub fn delete_path(path: &Path, opts: DeleteOptions) -> io::Result<()> {
 
     #[cfg(windows)]
     if opts.recycle {
-        let metadata = std::fs::symlink_metadata(path)?;
-        if metadata.file_type().is_symlink() {
+        let target = validate_delete_target(path, opts.allow_dangerous)?;
+        if target.metadata.file_type().is_symlink() {
             return delete_symlink(path);
-        }
-        let canonical = sanitize_path(path)?;
-        if canonical.parent().is_none() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("refusing to delete filesystem root: {}", path.display()),
-            ));
-        }
-        if is_protected_path(&canonical) && !opts.allow_dangerous {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!(
-                    "refusing to delete dangerous path without extra confirmation: {}",
-                    path.display()
-                ),
-            ));
         }
         return crate::recycle::recycle_path(path);
     }
@@ -785,28 +758,11 @@ pub fn delete_path(path: &Path, opts: DeleteOptions) -> io::Result<()> {
 }
 
 fn delete_path_inner(path: &Path, opts: DeleteOptions) -> io::Result<()> {
-    let metadata = std::fs::symlink_metadata(path)?;
+    let target = validate_delete_target(path, opts.allow_dangerous)?;
+    let metadata = target.metadata;
 
     if metadata.file_type().is_symlink() {
         return delete_symlink(path);
-    }
-
-    let canonical = sanitize_path(path)?;
-    if canonical.parent().is_none() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("refusing to delete filesystem root: {}", path.display()),
-        ));
-    }
-
-    if is_protected_path(&canonical) && !opts.allow_dangerous {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!(
-                "refusing to delete dangerous path without extra confirmation: {}",
-                path.display()
-            ),
-        ));
     }
 
     if metadata.is_dir() {
@@ -1029,7 +985,7 @@ mod tests {
             })
             .collect();
 
-        let summary = delete_file_roots_bulk(&files, false, None);
+        let summary = delete_file_roots_bulk(&files, false, false, None);
         assert_eq!(summary.deleted, files.len() as u64);
         assert!(summary.errors.is_empty());
         assert!(files.iter().all(|path| !path.exists()));
@@ -1046,7 +1002,7 @@ mod tests {
         File::create(&blocked).unwrap();
         set_test_remove_file_failure(Some(blocked.clone()));
 
-        let summary = delete_file_roots_bulk(&[ok.clone(), blocked.clone()], false, None);
+        let summary = delete_file_roots_bulk(&[ok.clone(), blocked.clone()], false, false, None);
         set_test_remove_file_failure(None);
 
         assert_eq!(summary.deleted, 1);
@@ -1054,6 +1010,27 @@ mod tests {
         assert_eq!(summary.errors[0].0, blocked);
         assert!(!ok.exists());
         assert!(blocked.exists());
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_delete_file_roots_bulk_rejects_directory_target() {
+        let temp = create_test_dir();
+        let directory = temp.join("swapped-to-directory");
+        fs::create_dir(&directory).unwrap();
+        File::create(directory.join("must-survive.txt")).unwrap();
+
+        let summary = delete_file_roots_bulk(
+            std::slice::from_ref(&directory),
+            false,
+            false,
+            None,
+        );
+
+        assert_eq!(summary.deleted, 0);
+        assert_eq!(summary.errors.len(), 1);
+        assert_eq!(summary.errors[0].0, directory);
+        assert!(directory.join("must-survive.txt").exists());
         let _ = fs::remove_dir_all(&temp);
     }
 
@@ -1075,7 +1052,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         crate::stop::request_stop();
-        let summary = delete_file_roots_bulk(&files, false, None);
+        let summary = delete_file_roots_bulk(&files, false, false, None);
         crate::stop::reset();
 
         // Every path must be accounted for: deleted + errors == total.

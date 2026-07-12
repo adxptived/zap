@@ -1,7 +1,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 use rayon::prelude::*;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
@@ -176,16 +176,14 @@ fn run_silent_delete_outcomes(options: &cli::CliOptions) -> Vec<PathOutcome> {
     #[cfg(windows)]
     if options.recycle && !options.dry_run {
         let errors = delete::recycle_paths_validated(&options.paths, false);
+        let error_index: HashMap<&Path, String> = errors
+            .iter()
+            .map(|(path, err)| (path.as_path(), err.to_string()))
+            .collect();
         return options
             .paths
             .iter()
-            .map(|path| {
-                let error = errors
-                    .iter()
-                    .find(|(failed, _)| failed == path)
-                    .map(|(_, err)| err.to_string());
-                (path.clone(), error)
-            })
+            .map(|path| (path.clone(), error_index.get(path.as_path()).cloned()))
             .collect();
     }
 
