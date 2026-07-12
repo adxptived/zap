@@ -126,6 +126,7 @@ pub struct ZapApp {
     /// ETA and the timer only count active work.
     pub paused_total: Duration,
     pub batch_session: Option<BatchSession>,
+    pub last_batch_poll: Instant,
     pub has_dangerous_paths: bool,
     pub danger_confirmed: bool,
     pub recycle: bool,
@@ -189,6 +190,9 @@ impl ZapApp {
             paused_at: None,
             paused_total: Duration::ZERO,
             batch_session,
+            last_batch_poll: Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .unwrap_or_else(Instant::now),
             has_dangerous_paths: has_dangerous,
             danger_confirmed: false,
             show_treemap: false,
@@ -376,7 +380,11 @@ impl ZapApp {
         let mut clear_receiver = false;
         let mut worker_died = false;
         if let Some(receiver) = &self.receiver {
-            loop {
+            // Bound work per frame so a burst from bulk deletion cannot freeze
+            // rendering for seconds. Remaining events stay queued for the next
+            // 100-ms repaint; terminal events are never discarded.
+            const MAX_EVENTS_PER_FRAME: usize = 4_096;
+            for _ in 0..MAX_EVENTS_PER_FRAME {
                 match receiver.try_recv() {
                     Ok(event) => events.push(event),
                     Err(mpsc::TryRecvError::Empty) => break,
@@ -504,6 +512,10 @@ impl ZapApp {
     }
 
     pub fn poll_batch_session(&mut self) {
+        if self.last_batch_poll.elapsed() < Duration::from_millis(250) {
+            return;
+        }
+        self.last_batch_poll = Instant::now();
         // Extract paths_dir early — we can't borrow self while session is borrowed.
         let paths_dir = match &self.batch_session {
             Some(s) => s.paths_dir.clone(),
@@ -537,7 +549,8 @@ impl ZapApp {
                 batch::touch_lock(lock);
             }
         }
-        batch::wait_for_batch_quiet(&paths_dir, batch::BATCH_QUIET_POLLS, batch::BATCH_MAX_POLLS);
+        // Never wait for batch quiet on the UI thread. Regular throttled polls
+        // have already collected committed files; perform one final snapshot.
         let changed = self.add_batch_paths_from(&paths_dir);
         if let Some(ref mut session) = self.batch_session {
             session.last_path_count = self.items.len();

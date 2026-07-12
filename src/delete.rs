@@ -133,7 +133,13 @@ fn retry_after_clearing_readonly(
     // Transient locks (antivirus scanners, indexers) usually clear within
     // milliseconds — retry briefly before the expensive force-delete fallback.
     for delay_ms in [10u64, 50] {
-        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        if crate::stop::is_stop_requested() {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "deletion cancelled"));
+        }
+        std::thread::park_timeout(std::time::Duration::from_millis(delay_ms));
+        if crate::stop::is_stop_requested() {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "deletion cancelled"));
+        }
         if op(path).is_ok() {
             return Ok(());
         }

@@ -4,17 +4,17 @@
 //! without panicking rayon scopes, pause blocks workers until resumed.
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Condvar, LazyLock, Mutex};
 
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 static PAUSE_REQUESTED: AtomicBool = AtomicBool::new(false);
-
-/// Sleep granularity while paused: short enough that Resume/Stop feel
-/// instant, long enough to keep paused workers effectively idle.
-const PAUSE_POLL_MS: u64 = 50;
+static PAUSE_SIGNAL: LazyLock<(Mutex<()>, Condvar)> =
+    LazyLock::new(|| (Mutex::new(()), Condvar::new()));
 
 pub fn install_handler() {
     let _ = ctrlc::set_handler(|| {
         STOP_REQUESTED.store(true, Ordering::SeqCst);
+        PAUSE_SIGNAL.1.notify_all();
     });
 }
 
@@ -26,6 +26,7 @@ pub fn is_stop_requested() -> bool {
 /// Request a graceful stop programmatically (used by the GUI Stop button).
 pub fn request_stop() {
     STOP_REQUESTED.store(true, Ordering::SeqCst);
+    PAUSE_SIGNAL.1.notify_all();
 }
 
 /// Pause all deletion loops at their next checkpoint (GUI Pause button).
@@ -36,6 +37,7 @@ pub fn request_pause() {
 /// Resume previously paused deletion loops (GUI Resume button).
 pub fn request_resume() {
     PAUSE_REQUESTED.store(false, Ordering::SeqCst);
+    PAUSE_SIGNAL.1.notify_all();
 }
 
 #[inline]
@@ -48,8 +50,15 @@ pub fn is_paused() -> bool {
 /// wins over pause so a paused run can still be cancelled.
 #[inline]
 pub fn wait_if_paused() {
+    if !is_paused() || is_stop_requested() {
+        return;
+    }
+    let (lock, signal) = &*PAUSE_SIGNAL;
+    let mut guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     while is_paused() && !is_stop_requested() {
-        std::thread::sleep(std::time::Duration::from_millis(PAUSE_POLL_MS));
+        guard = signal
+            .wait(guard)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
     }
 }
 
@@ -58,6 +67,7 @@ pub fn wait_if_paused() {
 pub fn reset() {
     STOP_REQUESTED.store(false, Ordering::SeqCst);
     PAUSE_REQUESTED.store(false, Ordering::SeqCst);
+    PAUSE_SIGNAL.1.notify_all();
 }
 
 /// Crate-wide serialization for tests that mutate the process-global

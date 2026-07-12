@@ -1,8 +1,13 @@
 use std::fs::{self, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::sync::{Condvar, LazyLock, Mutex};
 
 use rand::RngCore;
+
+const MAX_CONCURRENT_SHREDS: usize = 2;
+static SHRED_SLOTS: LazyLock<(Mutex<usize>, Condvar)> =
+    LazyLock::new(|| (Mutex::new(0), Condvar::new()));
 
 const MIN_SHRED_PASSES: usize = 1;
 
@@ -10,7 +15,37 @@ const MIN_SHRED_PASSES: usize = 1;
 /// while staying cheap to allocate per shredded file.
 const SHRED_BUF_BYTES: usize = 1024 * 1024;
 
+struct ShredPermit;
+
+impl ShredPermit {
+    fn acquire() -> io::Result<Self> {
+        let (lock, signal) = &*SHRED_SLOTS;
+        let mut active = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        while *active >= MAX_CONCURRENT_SHREDS {
+            if crate::stop::is_stop_requested() {
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "shred cancelled"));
+            }
+            let waited = signal
+                .wait_timeout(active, std::time::Duration::from_millis(100))
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            active = waited.0;
+        }
+        *active += 1;
+        Ok(Self)
+    }
+}
+
+impl Drop for ShredPermit {
+    fn drop(&mut self) {
+        let (lock, signal) = &*SHRED_SLOTS;
+        let mut active = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        *active = active.saturating_sub(1);
+        signal.notify_one();
+    }
+}
+
 pub fn shred_file(path: &Path, passes: usize) -> io::Result<()> {
+    let _permit = ShredPermit::acquire()?;
     let passes = passes.max(MIN_SHRED_PASSES);
     let meta = fs::metadata(path)?;
     let len = meta.len();
@@ -41,10 +76,18 @@ pub fn shred_file(path: &Path, passes: usize) -> io::Result<()> {
     let mut rng = rand::thread_rng();
 
     for pass in 0..passes {
+        crate::stop::wait_if_paused();
+        if crate::stop::is_stop_requested() {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "shred cancelled"));
+        }
         file.seek(SeekFrom::Start(0))?;
         let mut written = 0u64;
 
         while written < len {
+            crate::stop::wait_if_paused();
+            if crate::stop::is_stop_requested() {
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "shred cancelled"));
+            }
             let chunk = ((len - written) as usize).min(buf.len());
             if pass < passes - 1 {
                 rng.fill_bytes(&mut buf[..chunk]);
