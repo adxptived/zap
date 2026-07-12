@@ -5,7 +5,7 @@ use std::{collections::HashSet, ffi::OsString, io, path::PathBuf};
 
 use owo_colors::{AnsiColors, OwoColorize};
 
-const MAX_THREADS: usize = 1024;
+const MAX_THREADS: usize = crate::parallelism::MAX_WORKERS;
 
 #[derive(Debug, Clone)]
 pub struct CliOptions {

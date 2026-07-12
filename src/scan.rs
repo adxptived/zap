@@ -108,13 +108,13 @@ impl ScanPlan {
     }
 }
 
-/// How many jwalk I/O threads to use when walking. Capped at 8 to avoid
-/// overwhelming a single spinning disk; SSDs benefit from the full count.
+/// Use the scan share of the common filesystem concurrency budget. This
+/// prevents every jwalk invocation from independently creating up to eight
+/// workers on top of the deletion pool.
 fn scan_parallelism() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .min(8)
+    crate::parallelism::scan_worker_count(
+        rayon::current_num_threads().min(crate::parallelism::MAX_WORKERS),
+    )
 }
 
 /// Progress-bar tick interval during scanning (entries between ticks).

@@ -22,7 +22,7 @@ use zap::{batch, path_utils};
 use app::{BatchReceiver, BatchSession, ZapApp};
 
 pub const APP_NAME: &str = "Zap";
-pub const MAX_THREADS: usize = 1024;
+pub const MAX_THREADS: usize = zap::parallelism::MAX_WORKERS;
 pub const WINDOW_WIDTH: f32 = 420.0;
 pub const WINDOW_HEIGHT_NORMAL: f32 = 260.0;
 pub const WINDOW_HEIGHT_DANGEROUS: f32 = 304.0;

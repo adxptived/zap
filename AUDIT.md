@@ -1,3 +1,21 @@
+# Оптимизация zap — единый бюджет ресурсов (2026-07-12)
+
+Введена общая политика параллелизма (`parallelism.rs`): автоматический режим
+ограничен 8 worker-ами, пользовательский — 64, а scan/delete получают
+предсказуемые доли бюджета. Размеры channel/batch очередей теперь ограничены
+общей политикой и не растут без лимита на машинах с большим числом CPU.
+
+Дополнительно GUI bulk-delete и фоновый size preview выполняются в bounded
+Rayon pools; устаревшие результаты size-проходов отбрасываются по generation
+ID. Dry-run считает типы записей одним проходом, GUI переиспользует один
+status snapshot на кадр, а смена selection сбрасывает stale size/treemap data.
+
+Проверка: `git diff --check` проходит. `cargo fmt`, `cargo clippy --all-targets`
+и `cargo test` не запущены в Sandbox, поскольку Rust toolchain отсутствует
+(`cargo: command not found`); их необходимо выполнить в CI до merge.
+
+---
+
 # Аудит zap — глубокий hardening и оптимизация (2026-07-12)
 
 Дата: 2026-07-12. Объём: полный destructive-контур `zap` / `zapw` / `zapg`,
@@ -103,7 +121,7 @@ size/treemap/GUI) + повторная проверка всего дерева 
   проходы), rename-scrub имени перед удалением (best-effort, fallback на
   оригинальное имя), пустые/readonly файлы обработаны.
 - **Bulk-cancel** (`delete.rs`): пропущенные из-за Stop пути помечаются
-  «cancelled by user» — журнал и GUI не выдают их за успех (тест есть).
+  «cancelled by user» ��� журнал и GUI не выдают их за успех (тест есть).
 - **Batch-recycle** (`recycle.rs`, `recycle_paths_validated`): один
   `SHFileOperationW` на выделение, per-path валидация (корни, protected,
   symlink-и), фоллбек на пофайловый recycle для атрибуции ошибок,

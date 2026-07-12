@@ -320,15 +320,16 @@ fn finalize(
 // ---------------------------------------------------------------------------
 
 fn delete_directory_pipeline(path: &Path, bar: Option<ProgressBar>, shred: bool) -> io::Result<()> {
-    // Bounded channel from scan-thread to consumer-thread.
-    // Capacity = num_threads * 4 so backpressure kicks in before memory bloats.
-    let queue_cap = (rayon::current_num_threads() * 4).max(64);
+    // Both queues derive from the common worker budget. This keeps memory
+    // bounded even when a machine exposes hundreds of logical CPUs.
+    let workers = rayon::current_num_threads().min(crate::parallelism::MAX_WORKERS);
+    let queue_cap = crate::parallelism::queue_capacity(workers);
     let (scan_tx, scan_rx) = crossbeam_channel::bounded::<ScannedEntry>(queue_cap);
 
     // Keep only a small number of ready batches ahead of Rayon. An unbounded
     // queue could retain the whole tree when scanning outran a slow disk or
     // locked-file retries, defeating the bounded scan channel above.
-    let ready_batches = (rayon::current_num_threads() * 2).max(4);
+    let ready_batches = workers.saturating_mul(2).clamp(4, 32);
     let (batch_tx, batch_rx) =
         crossbeam_channel::bounded::<Vec<ScannedEntry>>(ready_batches);
 
@@ -537,7 +538,9 @@ fn delete_directory_inner(
 ) -> io::Result<()> {
     if let Some(count) = threads {
         let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(count)
+            .num_threads(crate::parallelism::delete_worker_count(
+                crate::parallelism::worker_count(Some(count)),
+            ))
             .build()
             .map_err(|err| io::Error::other(err.to_string()))?;
         return pool
@@ -858,18 +861,14 @@ fn dry_run_path_inner(path: &Path, silent: bool) -> io::Result<()> {
 
     if metadata.is_dir() {
         let entries = scan_directory(path)?;
-        let file_count = entries
-            .iter()
-            .filter(|e| matches!(e.kind, EntryKind::File))
-            .count();
-        let dir_count = entries
-            .iter()
-            .filter(|e| matches!(e.kind, EntryKind::Dir { .. }))
-            .count();
-        let link_count = entries
-            .iter()
-            .filter(|e| matches!(e.kind, EntryKind::Symlink))
-            .count();
+        let (file_count, dir_count, link_count) = entries.iter().fold(
+            (0usize, 0usize, 0usize),
+            |(files, dirs, links), entry| match entry.kind {
+                EntryKind::File => (files + 1, dirs, links),
+                EntryKind::Dir { .. } => (files, dirs + 1, links),
+                EntryKind::Symlink => (files, dirs, links + 1),
+            },
+        );
         if !silent {
             println!(
                 "Would delete directory: {} ({} files, {} dirs, {} symlinks)",
