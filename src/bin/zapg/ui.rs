@@ -74,9 +74,11 @@ impl eframe::App for ZapApp {
         self.poll_batch_collection();
         self.poll_batch_session();
 
+        // Build status once per frame. The taskbar and the central panel share
+        // it instead of each scanning a potentially huge selection.
+        let counts = self.status_counts();
         #[cfg(windows)]
         {
-            let counts = self.status_counts();
             let fraction = aggregate_progress(self, &counts);
             self.update_taskbar(fraction, &counts);
         }
@@ -159,7 +161,6 @@ impl eframe::App for ZapApp {
                     render_empty_state(ui, ctx);
                     return;
                 }
-                let counts = self.status_counts();
                 if should_auto_close(self, &counts) {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     return;

@@ -115,6 +115,9 @@ pub struct ZapApp {
     pub finished: Option<Duration>,
     pub total_size_calculating: bool,
     pub total_size: Arc<Mutex<Option<u64>>>,
+    /// Generation guard prevents an obsolete background traversal from
+    /// publishing results after the selection changed.
+    pub size_generation: Arc<std::sync::atomic::AtomicU64>,
     /// Per-root sizes from the same background pass as `total_size`.
     pub item_sizes: ItemSizes,
     /// Time the current pause began (None while running normally).
@@ -123,6 +126,7 @@ pub struct ZapApp {
     /// ETA and the timer only count active work.
     pub paused_total: Duration,
     pub batch_session: Option<BatchSession>,
+    pub last_batch_poll: Instant,
     pub has_dangerous_paths: bool,
     pub danger_confirmed: bool,
     pub recycle: bool,
@@ -153,16 +157,21 @@ impl ZapApp {
 
         let total_size = Arc::new(Mutex::new(None));
         let item_sizes: ItemSizes = Arc::new(Mutex::new(None));
+        let size_generation = Arc::new(std::sync::atomic::AtomicU64::new(1));
         spawn_size_calculation(
             Arc::clone(&total_size),
             Arc::clone(&item_sizes),
+            Arc::clone(&size_generation),
+            1,
             paths.clone(),
         );
 
         Self {
             items: paths.into_iter().map(DeleteItem::pending).collect(),
             threads_enabled: threads.is_some(),
-            threads_text: threads.unwrap_or(4).to_string(),
+            threads_text: threads
+                .unwrap_or_else(|| zap::parallelism::worker_count(None))
+                .to_string(),
             dry_run: false,
             recycle: false,
             shred: false,
@@ -176,10 +185,14 @@ impl ZapApp {
             finished: None,
             total_size_calculating: true,
             total_size,
+            size_generation,
             item_sizes,
             paused_at: None,
             paused_total: Duration::ZERO,
             batch_session,
+            last_batch_poll: Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .unwrap_or_else(Instant::now),
             has_dangerous_paths: has_dangerous,
             danger_confirmed: false,
             show_treemap: false,
@@ -274,7 +287,7 @@ impl ZapApp {
         }
         match self.threads_text.parse::<usize>() {
             Ok(v) if (1..=MAX_THREADS).contains(&v) => None,
-            _ => Some("Thread limit must be between 1 and 1024."),
+            _ => Some("Thread limit must be between 1 and 64."),
         }
     }
 
@@ -313,6 +326,7 @@ impl ZapApp {
             if should_bulk_delete_file_roots(&paths, dry_run, recycle) {
                 outcomes = run_bulk_file_roots_gui(
                     paths,
+                    threads,
                     shred,
                     allow_dangerous,
                     sender.clone(),
@@ -366,7 +380,11 @@ impl ZapApp {
         let mut clear_receiver = false;
         let mut worker_died = false;
         if let Some(receiver) = &self.receiver {
-            loop {
+            // Bound work per frame so a burst from bulk deletion cannot freeze
+            // rendering for seconds. Remaining events stay queued for the next
+            // 100-ms repaint; terminal events are never discarded.
+            const MAX_EVENTS_PER_FRAME: usize = 4_096;
+            for _ in 0..MAX_EVENTS_PER_FRAME {
                 match receiver.try_recv() {
                     Ok(event) => events.push(event),
                     Err(mpsc::TryRecvError::Empty) => break,
@@ -494,6 +512,10 @@ impl ZapApp {
     }
 
     pub fn poll_batch_session(&mut self) {
+        if self.last_batch_poll.elapsed() < Duration::from_millis(250) {
+            return;
+        }
+        self.last_batch_poll = Instant::now();
         // Extract paths_dir early — we can't borrow self while session is borrowed.
         let paths_dir = match &self.batch_session {
             Some(s) => s.paths_dir.clone(),
@@ -527,7 +549,8 @@ impl ZapApp {
                 batch::touch_lock(lock);
             }
         }
-        batch::wait_for_batch_quiet(&paths_dir, batch::BATCH_QUIET_POLLS, batch::BATCH_MAX_POLLS);
+        // Never wait for batch quiet on the UI thread. Regular throttled polls
+        // have already collected committed files; perform one final snapshot.
         let changed = self.add_batch_paths_from(&paths_dir);
         if let Some(ref mut session) = self.batch_session {
             session.last_path_count = self.items.len();
@@ -608,12 +631,28 @@ impl ZapApp {
 
     pub fn recalculate_total_size(&mut self) {
         self.total_size_calculating = true;
+        if let Ok(mut total) = self.total_size.lock() {
+            *total = None;
+        }
+        if let Ok(mut sizes) = self.item_sizes.lock() {
+            *sizes = None;
+        }
+        if let Ok(mut treemap) = self.treemap_data.lock() {
+            *treemap = None;
+        }
+        self.treemap_collecting = false;
+        let generation = self.size_generation.fetch_add(1, Ordering::AcqRel) + 1;
         let size_paths: Vec<PathBuf> = self.items.iter().map(|item| item.path.clone()).collect();
         spawn_size_calculation(
             Arc::clone(&self.total_size),
             Arc::clone(&self.item_sizes),
+            Arc::clone(&self.size_generation),
+            generation,
             size_paths,
         );
+        if self.show_treemap {
+            self.start_treemap_collection();
+        }
     }
 
     /// Kick off background collection of treemap data (immediate children
@@ -650,6 +689,7 @@ fn should_bulk_delete_file_roots(paths: &[PathBuf], dry_run: bool, recycle: bool
 
 fn run_bulk_file_roots_gui(
     paths: Vec<PathBuf>,
+    threads: Option<usize>,
     shred: bool,
     allow_dangerous: bool,
     sender: Sender<WorkerEvent>,
@@ -674,8 +714,23 @@ fn run_bulk_file_roots_gui(
         send_bulk_progress(&monitor_sender, &monitor_paths, &monitor_bar, total);
     });
 
-    let summary =
-        delete::delete_file_roots_bulk(&paths, shred, allow_dangerous, Some(&bar));
+    let worker_count = zap::parallelism::worker_count(threads);
+    let summary = match rayon::ThreadPoolBuilder::new()
+        .num_threads(worker_count)
+        .build()
+    {
+        Ok(pool) => pool.install(|| {
+            delete::delete_file_roots_bulk(&paths, shred, allow_dangerous, Some(&bar))
+        }),
+        Err(err) => delete::BulkDeleteSummary {
+            deleted: 0,
+            errors: paths
+                .iter()
+                .cloned()
+                .map(|path| (path, format!("failed to configure thread pool: {err}")))
+                .collect(),
+        },
+    };
     monitor_stop.store(true, Ordering::Relaxed);
     let _ = monitor.join();
 
@@ -723,22 +778,36 @@ impl DeleteItem {
     }
 }
 
-fn spawn_size_calculation(total: Arc<Mutex<Option<u64>>>, sizes: ItemSizes, paths: Vec<PathBuf>) {
+fn spawn_size_calculation(
+    total: Arc<Mutex<Option<u64>>>,
+    sizes: ItemSizes,
+    generation: Arc<std::sync::atomic::AtomicU64>,
+    expected_generation: u64,
+    paths: Vec<PathBuf>,
+) {
     thread::spawn(move || {
         use rayon::prelude::*;
         // One pass computes both the per-root sizes (byte-weighted ETA) and
-        // their sum (size badge) — no duplicate directory walks. Roots are
-        // sized in parallel: bulk Explorer selections have thousands of
-        // file roots and `dir_size_recursive` resolves each plain file with
-        // a single metadata call.
-        let per_root: std::collections::HashMap<PathBuf, u64> = paths
-            .into_par_iter()
-            .map(|p| {
-                let sz = size::dir_size_recursive(&p);
-                (p, sz)
-            })
-            .collect();
+        // their sum (size badge). A private bounded pool prevents this optional
+        // preview from competing with deletion through Rayon's global pool.
+        let workers = zap::parallelism::worker_count(None);
+        let pool = match rayon::ThreadPoolBuilder::new().num_threads(workers).build() {
+            Ok(pool) => pool,
+            Err(_) => return,
+        };
+        let per_root: std::collections::HashMap<PathBuf, u64> = pool.install(|| {
+            paths
+                .into_par_iter()
+                .map(|p| {
+                    let sz = size::dir_size_recursive(&p);
+                    (p, sz)
+                })
+                .collect()
+        });
         let sum: u64 = per_root.values().sum();
+        if generation.load(Ordering::Acquire) != expected_generation {
+            return;
+        }
         if let Ok(mut guard) = sizes.lock() {
             *guard = Some(SizeSnapshot {
                 by_path: per_root,

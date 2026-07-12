@@ -11,10 +11,13 @@
 //! `journal.1.log` when it exceeds [`MAX_JOURNAL_BYTES`]. Journaling is
 //! best-effort: failures never abort or slow down a deletion run.
 
-use std::fs::{self, OpenOptions};
-use std::io::{self, BufWriter, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, SystemTime};
+
+static JOURNAL_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 /// Rotate the journal when it grows beyond 5 MiB. One rotation level is
 /// kept (`journal.1.log`), bounding total disk use at ~10 MiB.
@@ -79,9 +82,13 @@ pub fn record_to(path: &Path, action: JournalAction, outcomes: &[PathOutcome]) -
     if outcomes.is_empty() {
         return Ok(());
     }
+    let _process_guard = JOURNAL_MUTEX
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
+    let _file_guard = JournalFileLock::acquire(path)?;
     rotate_if_needed(path)?;
 
     let timestamp = humantime::format_rfc3339_seconds(SystemTime::now()).to_string();
@@ -101,6 +108,47 @@ pub fn record_to(path: &Path, action: JournalAction, outcomes: &[PathOutcome]) -
         )?;
     }
     w.flush()
+}
+
+struct JournalFileLock {
+    path: PathBuf,
+}
+
+impl JournalFileLock {
+    fn acquire(journal: &Path) -> io::Result<Self> {
+        let path = journal.with_extension("lock");
+        for _ in 0..100 {
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(mut file) => {
+                    writeln!(file, "{}", std::process::id())?;
+                    return Ok(Self { path });
+                }
+                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                    let stale = fs::metadata(&path)
+                        .ok()
+                        .and_then(|meta| meta.modified().ok())
+                        .and_then(|modified| modified.elapsed().ok())
+                        .is_some_and(|age| age > Duration::from_secs(30));
+                    if stale {
+                        let _ = fs::remove_file(&path);
+                    } else {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "journal is busy in another process",
+        ))
+    }
+}
+
+impl Drop for JournalFileLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
 }
 
 /// Tabs and newlines are field/record separators — replace them so a hostile
@@ -125,13 +173,7 @@ pub fn read_recent_from(path: &Path, limit: usize) -> io::Result<Vec<String>> {
     if limit == 0 {
         return Ok(Vec::new());
     }
-    let read_lines = |p: &Path| -> io::Result<Vec<String>> {
-        match fs::read_to_string(p) {
-            Ok(content) => Ok(content.lines().map(str::to_owned).collect()),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
-            Err(err) => Err(err),
-        }
-    };
+    let read_lines = |p: &Path| -> io::Result<Vec<String>> { read_tail_lines(p, limit) };
     let mut lines = read_lines(path)?;
     if lines.len() < limit {
         let rotated = path.with_extension("1.log");
@@ -147,6 +189,41 @@ pub fn read_recent_from(path: &Path, limit: usize) -> io::Result<Vec<String>> {
         lines.drain(..lines.len() - limit);
     }
     Ok(lines)
+}
+
+fn read_tail_lines(path: &Path, limit: usize) -> io::Result<Vec<String>> {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err),
+    };
+    let len = file.metadata()?.len();
+    // Journal records are short in normal operation. Read at most 1 MiB from
+    // the tail and expand only when the requested lines do not fit.
+    let mut window = (64 * 1024_u64).min(len);
+    loop {
+        file.seek(SeekFrom::Start(len.saturating_sub(window)))?;
+        let mut bytes = vec![0; window as usize];
+        file.read_exact(&mut bytes)?;
+        if window < len {
+            if let Some(first_newline) = bytes.iter().position(|byte| *byte == b'\n') {
+                bytes.drain(..=first_newline);
+            }
+        }
+        let text = String::from_utf8_lossy(&bytes);
+        let lines: Vec<String> = text.lines().map(str::to_owned).collect();
+        if lines.len() >= limit || window == len || window >= 1024 * 1024 {
+            return Ok(lines
+                .into_iter()
+                .rev()
+                .take(limit)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect());
+        }
+        window = (window.saturating_mul(2)).min(len);
+    }
 }
 
 fn rotate_if_needed(path: &Path) -> io::Result<()> {

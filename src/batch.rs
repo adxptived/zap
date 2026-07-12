@@ -3,7 +3,7 @@
 //! processes into a single deletion run.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -11,6 +11,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub const BATCH_POLL_INTERVAL: Duration = Duration::from_millis(100);
 pub const BATCH_QUIET_POLLS: usize = 10;
 pub const BATCH_MAX_POLLS: usize = 120;
+const MAX_BATCH_FILES: usize = 16_384;
+const MAX_BATCH_FILE_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_BATCH_PATHS: usize = 100_000;
+const MAX_ENCODED_PATH_BYTES: usize = 64 * 1024;
 
 /// Lock file name shared across all binaries so they coordinate with
 /// each other instead of having separate lock scopes.
@@ -77,7 +81,11 @@ pub fn batch_state(paths_dir: &Path) -> usize {
     fs::read_dir(paths_dir)
         .into_iter()
         .flat_map(|entries| entries.flatten())
-        .filter(|entry| is_committed_batch_file(&entry.path()))
+        .filter(|entry| {
+            is_committed_batch_file(&entry.path())
+                && entry.metadata().is_ok_and(|metadata| metadata.is_file())
+        })
+        .take(MAX_BATCH_FILES)
         .count()
 }
 
@@ -144,47 +152,43 @@ pub fn read_batch_paths(paths_dir: &Path) -> Vec<PathBuf> {
         .flat_map(|entries| entries.flatten())
         .filter_map(|entry| {
             let path = entry.path();
-            // Only accept committed .txt files; ignore .txt.tmp partial writes,
-            // directories, and unrelated files. Checking the extension avoids a
-            // metadata syscall per entry, which matters when Explorer launches
-            // hundreds or thousands of zap processes into the same batch dir.
-            is_committed_batch_file(&path).then_some(path)
+            if !is_committed_batch_file(&path) {
+                return None;
+            }
+            let metadata = entry.metadata().ok()?;
+            (metadata.is_file() && metadata.len() <= MAX_BATCH_FILE_BYTES).then_some(path)
         })
+        .take(MAX_BATCH_FILES)
         .collect();
 
     files.sort_unstable();
-
-    files
-        .into_iter()
-        .flat_map(|file| {
-            let content = match fs::read_to_string(&file) {
-                Ok(c) => c,
-                Err(_) => {
-                    // File may have been deleted between read_dir and now;
-                    // silently skip it -- the writer has already moved on.
-                    return vec![];
-                }
+    let mut paths = Vec::new();
+    'files: for file in files {
+        let Ok(file) = File::open(file) else {
+            continue;
+        };
+        for line in BufReader::new(file).lines() {
+            if paths.len() >= MAX_BATCH_PATHS {
+                break 'files;
+            }
+            let Ok(line) = line else {
+                break;
             };
-            content
-                .lines()
-                .filter(|line| !line.is_empty())
-                .filter_map(|line| {
-                    let bytes = hex_decode(line)?;
-                    // Validate by checking that encoding back produces identical bytes.
-                    // from_encoded_bytes_unchecked is safe because the original path
-                    // bytes were valid OS strings, and hex roundtrip preserves exact
-                    // byte content. The roundtrip check catches corruption.
-                    let os_str =
-                        unsafe { std::ffi::OsString::from_encoded_bytes_unchecked(bytes.clone()) };
-                    if os_str.as_encoded_bytes() == bytes {
-                        Some(PathBuf::from(os_str))
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect()
+            if line.is_empty() || line.len() > MAX_ENCODED_PATH_BYTES {
+                continue;
+            }
+            let Some(bytes) = hex_decode(&line) else {
+                continue;
+            };
+            // SAFETY: encoded bytes came from an OS string and the exact
+            // roundtrip below rejects malformed platform encodings.
+            let os_str = unsafe { std::ffi::OsString::from_encoded_bytes_unchecked(bytes.clone()) };
+            if os_str.as_encoded_bytes() == bytes {
+                paths.push(PathBuf::from(os_str));
+            }
+        }
+    }
+    paths
 }
 
 pub fn cleanup_stale_batch(paths_dir: &Path, lock_file: &Path) {
@@ -233,14 +237,19 @@ pub fn try_acquire_lock(lock_file: &Path) -> io::Result<File> {
     Ok(lock)
 }
 
-/// Refresh the timestamp in the lock file. Uses append so a crash
-/// mid-write leaves a valid file (reader ignores truncated last line).
+/// Refresh the timestamp without growing the heartbeat file indefinitely.
+/// The process still owns the open handle, so rewriting PID + timestamp is
+/// sufficient and keeps stale-lock inspection bounded.
 pub fn touch_lock(lock: &mut File) {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let _ = writeln!(lock, "tick:{nanos}");
+    if lock.set_len(0).is_err() || lock.seek(SeekFrom::Start(0)).is_err() {
+        return;
+    }
+    let _ = writeln!(lock, "{}", std::process::id());
+    let _ = writeln!(lock, "{nanos}");
     let _ = lock.flush();
 }
 
@@ -336,8 +345,40 @@ mod tests {
         fs::write(dir.join("notes.log"), "00\n").unwrap();
         fs::create_dir(dir.join("nested.txt")).unwrap();
 
-        assert_eq!(batch_state(&dir), 3);
+        assert_eq!(batch_state(&dir), 2);
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_read_batch_paths_rejects_oversized_files() {
+        let dir = temp_dir();
+        let oversized = File::create(dir.join("oversized.txt")).unwrap();
+        oversized.set_len(MAX_BATCH_FILE_BYTES + 1).unwrap();
+        drop(oversized);
+
+        assert!(read_batch_paths(&dir).is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_touch_lock_keeps_heartbeat_compact() {
+        let dir = temp_dir();
+        let lock_path = dir.join("lock");
+        let mut lock = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        for _ in 0..1_000 {
+            touch_lock(&mut lock);
+        }
+        drop(lock);
+
+        let content = fs::read_to_string(&lock_path).unwrap();
+        assert_eq!(content.lines().count(), 2);
+        assert!(fs::metadata(&lock_path).unwrap().len() < 128);
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -1,3 +1,51 @@
+# Аудит zap — hardening IPC, GUI и служебных подсистем (2026-07-12)
+
+Закрыты оставшиеся источники подвисаний и неконтролируемого роста ресурсов.
+GUI больше не ждёт batch quiet в UI thread, обрабатывает не более 4096 worker
+событий за кадр и опрашивает batch-каталог не чаще четырёх раз в секунду.
+Batch reader принимает только обычные committed `.txt` файлы, ограничивает
+число файлов, размер файла, строки и суммарное число путей; heartbeat lock
+перезаписывается компактно вместо бесконечного append.
+
+Pause переведён с 50-мс polling на `Condvar`: Resume, Stop и Ctrl-C будят
+воркеры немедленно. Shred ограничен двумя одновременными файлами, проверяет
+pause/stop между 1-МиБ chunks и проходами. Transient delete retry теперь
+проверяет Stop до и после ожидания.
+
+Журнал сериализован внутри процесса и через межпроцессный lock вокруг
+rotation+append. Recent history читается с хвоста окнами до 1 МиБ вместо
+загрузки всего журнала; stale lock восстанавливается через 30 секунд.
+CI теперь запускает tests и Clippy с `--all-features` на Linux/Windows.
+
+Добавлены регрессии на oversized batch input и компактность heartbeat.
+`git diff --check` проходит. Локальные `cargo fmt`, `cargo test` и Clippy не
+запущены: Rust toolchain отсутствует в Sandbox (`cargo: command not found`),
+поэтому итоговую компиляцию и Windows FFI ветки должен подтвердить CI.
+
+Оставшийся низкий риск: batch directory остаётся общей доверительной границей
+процессов одного пользователя; journal lock основан на lock-файле и после
+аварии допускает восстановление только по 30-секундному stale timeout.
+
+---
+
+# Оптимизация zap — единый бюджет ресурсов (2026-07-12)
+
+Введена общая политика параллелизма (`parallelism.rs`): автоматический режим
+ограничен 8 worker-ами, пользовательский — 64, а scan/delete получают
+предсказуемые доли бюджета. Размеры channel/batch очередей теперь ограничены
+общей политикой и не растут без лимита на машинах с большим числом CPU.
+
+Дополнительно GUI bulk-delete и фоновый size preview выполняются в bounded
+Rayon pools; устаревшие результаты size-проходов отбрасываются по generation
+ID. Dry-run считает типы записей одним проходом, GUI переиспользует один
+status snapshot на кадр, а смена selection сбрасывает stale size/treemap data.
+
+Проверка: `git diff --check` проходит. `cargo fmt`, `cargo clippy --all-targets`
+и `cargo test` не запущены в Sandbox, поскольку Rust toolchain отсутствует
+(`cargo: command not found`); их необходимо выполнить в CI до merge.
+
+---
+
 # Аудит zap — глубокий hardening и оптимизация (2026-07-12)
 
 Дата: 2026-07-12. Объём: полный destructive-контур `zap` / `zapw` / `zapg`,
@@ -103,7 +151,7 @@ size/treemap/GUI) + повторная проверка всего дерева 
   проходы), rename-scrub имени перед удалением (best-effort, fallback на
   оригинальное имя), пустые/readonly файлы обработаны.
 - **Bulk-cancel** (`delete.rs`): пропущенные из-за Stop пути помечаются
-  «cancelled by user» — журнал и GUI не выдают их за успех (тест есть).
+  «cancelled by user» ��� журнал и GUI не выдают их за успех (тест есть).
 - **Batch-recycle** (`recycle.rs`, `recycle_paths_validated`): один
   `SHFileOperationW` на выделение, per-path валидация (корни, protected,
   symlink-и), фоллбек на пофайловый recycle для атрибуции ошибок,
@@ -190,7 +238,7 @@ N выделенных элементов = N вызовов `SHFileOperationW`.
   канонизации срезается перед сравнением; отказ от корней дисков через
   `canonical.parent().is_none()`; guard от самоудаления бинарника.
 - **Batch-координация** (`batch.rs`): лок через `create_new` (атомарно),
-  PID + mtime-проверка устаревших локов, hex-кодирование путей
+  PID + mtime-проверк�� устаревших локов, hex-кодирование путей
   (Unicode-safe), tick-обновления лока с усечением.
 - **FFI** (`winapi.rs`, `recycle.rs`): корректные сигнатуры, обработка
   `INVALID_HANDLE_VALUE`/`GetLastError`, POSIX-семантика удаления
