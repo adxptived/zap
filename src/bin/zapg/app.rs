@@ -127,6 +127,7 @@ pub struct ZapApp {
     pub danger_confirmed: bool,
     pub recycle: bool,
     pub shred: bool,
+    pub no_journal: bool,
     /// Taskbar progress mirror (Windows only). Lazily created on the UI
     /// thread once the window exists; `None` + `taskbar_unavailable` set
     /// means COM failed and we stop retrying.
@@ -148,7 +149,7 @@ impl ZapApp {
         threads: Option<usize>,
         batch_session: Option<BatchSession>,
     ) -> Self {
-        let has_dangerous = paths.iter().any(|p| protect::is_protected_path(p));
+        let has_dangerous = paths.iter().any(|p| protect::is_dangerous_target(p));
 
         let total_size = Arc::new(Mutex::new(None));
         let item_sizes: ItemSizes = Arc::new(Mutex::new(None));
@@ -165,6 +166,7 @@ impl ZapApp {
             dry_run: false,
             recycle: false,
             shred: false,
+            no_journal: false,
             #[cfg(windows)]
             taskbar: None,
             #[cfg(windows)]
@@ -214,7 +216,7 @@ impl ZapApp {
                 self.has_dangerous_paths = self
                     .items
                     .iter()
-                    .any(|item| protect::is_protected_path(&item.path));
+                    .any(|item| protect::is_dangerous_target(&item.path));
                 self.batch_session = session;
                 self.recalculate_total_size();
             }
@@ -295,6 +297,8 @@ impl ZapApp {
         let dry_run = self.dry_run;
         let recycle = self.recycle;
         let shred = self.shred;
+        let allow_dangerous = self.danger_confirmed;
+        let no_journal = self.no_journal;
         let (sender, receiver) = mpsc::channel();
         self.receiver = Some(receiver);
         self.started_at = Some(Instant::now());
@@ -307,7 +311,12 @@ impl ZapApp {
             let start = Instant::now();
             let mut outcomes: Vec<PathOutcome> = Vec::with_capacity(paths.len());
             if should_bulk_delete_file_roots(&paths, dry_run, recycle) {
-                outcomes = run_bulk_file_roots_gui(paths, shred, sender.clone());
+                outcomes = run_bulk_file_roots_gui(
+                    paths,
+                    shred,
+                    allow_dangerous,
+                    sender.clone(),
+                );
             } else {
                 for path in paths {
                     // Stop button: skip everything not yet started. The item
@@ -322,7 +331,15 @@ impl ZapApp {
                         continue;
                     }
                     let _ = sender.send(WorkerEvent::Started(path.clone()));
-                    let result = run_delete_path(&path, threads, dry_run, recycle, shred, &sender);
+                    let result = run_delete_path(
+                        &path,
+                        threads,
+                        dry_run,
+                        recycle,
+                        shred,
+                        allow_dangerous,
+                        &sender,
+                    );
                     let result = normalize_worker_result(result, dry_run);
                     outcomes.push((path.clone(), result.as_ref().err().cloned()));
                     let _ = sender.send(WorkerEvent::Done(path, result));
@@ -330,7 +347,7 @@ impl ZapApp {
             }
             // Record the run in the operation journal (audit trail). A dry
             // run changes nothing on disk, so it is not journaled.
-            if !dry_run && !journal::is_disabled_by_env() {
+            if !dry_run && !no_journal && !journal::is_disabled_by_env() {
                 let action = if recycle {
                     JournalAction::Recycle
                 } else if shred {
@@ -540,12 +557,12 @@ impl ZapApp {
         }
         if changed {
             // Late-arriving batch paths may include protected system paths.
-            // The worker always runs with allow_dangerous, so the danger
-            // checkbox is the only guard — it must be re-armed here.
+            // Re-arm confirmation so the worker never receives dangerous
+            // permission inherited from an earlier, safer selection.
             let has_dangerous = self
                 .items
                 .iter()
-                .any(|item| protect::is_protected_path(&item.path));
+                .any(|item| protect::is_dangerous_target(&item.path));
             if has_dangerous && !self.has_dangerous_paths {
                 self.danger_confirmed = false;
             }
@@ -582,7 +599,7 @@ impl ZapApp {
         self.has_dangerous_paths = self
             .items
             .iter()
-            .any(|item| protect::is_protected_path(&item.path));
+            .any(|item| protect::is_dangerous_target(&item.path));
         if self.has_dangerous_paths {
             self.danger_confirmed = false;
         }
@@ -634,6 +651,7 @@ fn should_bulk_delete_file_roots(paths: &[PathBuf], dry_run: bool, recycle: bool
 fn run_bulk_file_roots_gui(
     paths: Vec<PathBuf>,
     shred: bool,
+    allow_dangerous: bool,
     sender: Sender<WorkerEvent>,
 ) -> Vec<PathOutcome> {
     let total = paths.len() as u64;
@@ -656,7 +674,8 @@ fn run_bulk_file_roots_gui(
         send_bulk_progress(&monitor_sender, &monitor_paths, &monitor_bar, total);
     });
 
-    let summary = delete::delete_file_roots_bulk(&paths, shred, Some(&bar));
+    let summary =
+        delete::delete_file_roots_bulk(&paths, shred, allow_dangerous, Some(&bar));
     monitor_stop.store(true, Ordering::Relaxed);
     let _ = monitor.join();
 
@@ -771,6 +790,7 @@ pub fn run_delete_path(
     dry_run: bool,
     recycle: bool,
     shred: bool,
+    allow_dangerous: bool,
     sender: &Sender<WorkerEvent>,
 ) -> io::Result<()> {
     if dry_run {
@@ -789,10 +809,10 @@ pub fn run_delete_path(
         }
         send_progress(&monitor_sender, &monitor_path, &monitor_bar);
     });
-    let mut opts = DeleteOptions::default()
-        .with_threads(threads)
-        .with_bar(bar)
-        .allow_dangerous();
+    let mut opts = DeleteOptions::default().with_threads(threads).with_bar(bar);
+    if allow_dangerous {
+        opts = opts.allow_dangerous();
+    }
     if recycle {
         opts = opts.recycle();
     }

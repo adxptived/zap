@@ -81,6 +81,7 @@ fn main() -> eframe::Result<()> {
                 ZapApp::new(paths, args.threads, None)
             };
             app.recycle = args.recycle;
+            app.no_journal = args.no_journal;
             Ok(Box::new(app))
         }),
     )
@@ -158,17 +159,23 @@ fn try_become_coordinator(own_paths: &[PathBuf]) -> CoordinatorOutcome {
 struct GuiArgs {
     batch: bool,
     recycle: bool,
+    no_journal: bool,
     threads: Option<usize>,
     paths: Vec<PathBuf>,
 }
 
 fn parse_args() -> GuiArgs {
+    parse_args_from(std::env::args_os().skip(1))
+}
+
+fn parse_args_from(args: impl IntoIterator<Item = std::ffi::OsString>) -> GuiArgs {
     let mut parsed = GuiArgs::default();
-    let mut args = std::env::args_os().skip(1);
+    let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.to_str() {
             Some("--batch") => parsed.batch = true,
             Some("--recycle") => parsed.recycle = true,
+            Some("--no-journal") => parsed.no_journal = true,
             Some("--threads") | Some("-j") => {
                 if let Some(value) = args.next() {
                     parsed.threads = value
@@ -282,4 +289,23 @@ fn load_app_icon() -> Option<egui::IconData> {
         width: w,
         height: h,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+
+    #[test]
+    fn parse_args_supports_no_journal_without_treating_it_as_a_path() {
+        let args = parse_args_from([
+            OsString::from("--no-journal"),
+            OsString::from("--recycle"),
+            OsString::from("target.txt"),
+        ]);
+
+        assert!(args.no_journal);
+        assert!(args.recycle);
+        assert_eq!(args.paths, vec![PathBuf::from("target.txt")]);
+    }
 }

@@ -30,6 +30,68 @@ pub fn sanitize_path(path: &Path) -> io::Result<PathBuf> {
     Ok(canonical)
 }
 
+/// Metadata and canonical identity captured at the destructive API boundary.
+/// Symlinks are intentionally not canonicalized: deleting a link must never
+/// turn into deleting its target.
+pub struct ValidatedDeleteTarget {
+    pub metadata: std::fs::Metadata,
+    pub canonical: Option<PathBuf>,
+}
+
+/// Validate a target immediately before a destructive operation.
+///
+/// All public deletion paths use this function so callers cannot accidentally
+/// bypass filesystem-root and protected-path checks. Callers must still use
+/// the original path for the actual unlink, preserving symlink semantics.
+pub fn validate_delete_target(
+    path: &Path,
+    allow_dangerous: bool,
+) -> io::Result<ValidatedDeleteTarget> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return Ok(ValidatedDeleteTarget {
+            metadata,
+            canonical: None,
+        });
+    }
+
+    let canonical = sanitize_path(path)?;
+    if canonical.parent().is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("refusing to delete filesystem root: {}", path.display()),
+        ));
+    }
+    if is_protected_path(&canonical) && !allow_dangerous {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "refusing to delete dangerous path without extra confirmation: {}",
+                path.display()
+            ),
+        ));
+    }
+
+    Ok(ValidatedDeleteTarget {
+        metadata,
+        canonical: Some(canonical),
+    })
+}
+
+/// Resolve whether a target needs the explicit dangerous-path confirmation.
+/// Missing/unreadable targets are not classified here; destructive APIs still
+/// return their concrete validation error when the operation starts.
+pub fn is_dangerous_target(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if metadata.file_type().is_symlink() {
+        return false;
+    }
+    sanitize_path(path)
+        .is_ok_and(|canonical| is_protected_path(&canonical))
+}
+
 #[cfg(windows)]
 struct ProtectedConfig {
     /// Prefixes (lower-cased once at init) that are fully protected: any

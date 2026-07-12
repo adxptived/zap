@@ -1,7 +1,7 @@
 use indicatif::{MultiProgress, ProgressStyle};
 use owo_colors::{AnsiColors, OwoColorize};
-use std::collections::HashSet;
-use std::fs::{self, File};
+use std::collections::{HashMap, HashSet};
+use std::fs::{self, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -83,14 +83,26 @@ const BATCH_INITIAL_QUIET_POLLS: usize = 10;
 const BATCH_FINAL_QUIET_POLLS: usize = 30;
 const BATCH_MAX_POLLS: usize = 300;
 
-fn write_error_log(errors: &[(PathBuf, std::io::Error)]) {
-    let log_path = std::env::temp_dir().join("zap-errors.log");
-    if let Ok(file) = File::create(&log_path) {
-        let mut w = BufWriter::new(file);
-        for (path, err) in errors {
-            let _ = writeln!(w, "{}: {}", path.display(), err);
-        }
+fn write_error_log(errors: &[(PathBuf, std::io::Error)]) -> Option<PathBuf> {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let log_path = std::env::temp_dir().join(format!(
+        "zap-errors-{}-{nonce}.log",
+        std::process::id()
+    ));
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&log_path)
+        .ok()?;
+    let mut writer = BufWriter::new(file);
+    for (path, err) in errors {
+        writeln!(writer, "{}: {}", path.display(), err).ok()?;
     }
+    writer.flush().ok()?;
+    Some(log_path)
 }
 
 fn elapsed_color(elapsed_secs: f32) -> AnsiColors {
@@ -342,21 +354,19 @@ fn run_delete(options: &cli::CliOptions, start: Instant) -> bool {
         }
         true
     } else {
-        write_error_log(&errors);
+        let error_log = write_error_log(&errors);
         eprintln!(
             "\n{} {} path(s) failed out of {}",
             " SUMMARY ".on_color(AnsiColors::BrightRed).black(),
             errors.len(),
             options.paths.len()
         );
-        eprintln!(
-            "{}",
-            format!(
-                "  Errors written to {}",
-                std::env::temp_dir().join("zap-errors.log").display()
-            )
-            .dimmed()
-        );
+        if let Some(log_path) = error_log {
+            eprintln!(
+                "{}",
+                format!("  Errors written to {}", log_path.display()).dimmed()
+            );
+        }
         false
     }
 }
@@ -374,16 +384,14 @@ fn record_journal(options: &cli::CliOptions, errors: &[(PathBuf, std::io::Error)
     } else {
         journal::JournalAction::Delete
     };
+    let error_index: HashMap<&Path, String> = errors
+        .iter()
+        .map(|(path, err)| (path.as_path(), err.to_string()))
+        .collect();
     let outcomes: Vec<journal::PathOutcome> = options
         .paths
         .iter()
-        .map(|path| {
-            let error = errors
-                .iter()
-                .find(|(failed, _)| failed == path)
-                .map(|(_, err)| err.to_string());
-            (path.clone(), error)
-        })
+        .map(|path| (path.clone(), error_index.get(path.as_path()).cloned()))
         .collect();
     let _ = journal::record(action, &outcomes);
 }
@@ -415,6 +423,7 @@ fn bulk_file_roots_candidate(
 fn run_bulk_file_roots(
     options: &cli::CliOptions,
     files: &[PathBuf],
+    allow_dangerous: bool,
 ) -> Vec<(PathBuf, std::io::Error)> {
     let bar = if options.silent {
         None
@@ -430,7 +439,12 @@ fn run_bulk_file_roots(
         Some(bar)
     };
 
-    let summary = delete::delete_file_roots_bulk(files, options.shred, bar.as_ref());
+    let summary = delete::delete_file_roots_bulk(
+        files,
+        options.shred,
+        allow_dangerous,
+        bar.as_ref(),
+    );
     if let Some(bar) = bar {
         if summary.errors.is_empty() {
             bar.finish_with_message(format!("Deleted {} files", summary.deleted));
@@ -464,7 +478,7 @@ fn run_delete_parallel(
     allow_dangerous: bool,
 ) -> Vec<(PathBuf, std::io::Error)> {
     if let Some(files) = bulk_file_roots_candidate(options, allow_dangerous) {
-        return run_bulk_file_roots(options, &files);
+        return run_bulk_file_roots(options, &files, allow_dangerous);
     }
 
     // Recycle mode: one SHFileOperationW call for the whole selection — a
@@ -581,7 +595,7 @@ fn run_batch(options: &cli::CliOptions, start: Instant) -> bool {
             merged.paths = all_paths;
             merged.batch = false;
 
-            let success = run_delete(&merged, start);
+            let mut success = run_delete(&merged, start);
 
             // Drain any late arrivals
             batch::touch_lock(&mut lock);
@@ -600,7 +614,7 @@ fn run_batch(options: &cli::CliOptions, start: Instant) -> bool {
                 let mut late_merged = options.clone();
                 late_merged.paths = pending;
                 late_merged.batch = false;
-                let _ = run_delete(&late_merged, start);
+                success &= run_delete(&late_merged, start);
             }
 
             drop(lock);
