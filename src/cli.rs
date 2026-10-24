@@ -28,9 +28,34 @@ pub struct CliOptions {
     pub no_size_preview: bool,
     /// Skip writing the operation journal for this run (`--no-journal`).
     pub no_journal: bool,
+    /// `--newer-than` / `--older-than` exactly as given. Relative ages
+    /// (`30d`) resolve against the clock at parse time, so the batch scope
+    /// compares these strings instead of the resolved times.
+    pub newer_than_spec: Option<String>,
+    pub older_than_spec: Option<String>,
 }
 
 impl CliOptions {
+    /// Batch scope for `binary`: launches merge only when every option
+    /// except the paths (and the `--batch` flag itself) is identical.
+    /// Compute it from freshly parsed options, before any in-process
+    /// adjustment, so the launcher and its worker agree on the scope.
+    pub fn batch_scope(&self, binary: &str) -> String {
+        // Resolved times differ between processes parsing the same `30d`;
+        // the raw `*_spec` strings (part of `config`) identify the filter.
+        let config = Self {
+            paths: Vec::new(),
+            batch: false,
+            filter: FilterConfig {
+                newer_than: None,
+                older_than: None,
+                ..self.filter.clone()
+            },
+            ..self.clone()
+        };
+        crate::batch::batch_scope(binary, &format!("{config:?}"))
+    }
+
     pub fn to_delete_options(
         &self,
         use_current_pool: bool,
@@ -124,6 +149,8 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> io::Result<CliAct
     let mut min_size: Option<u64> = None;
     let mut newer_than: Option<std::time::SystemTime> = None;
     let mut older_than: Option<std::time::SystemTime> = None;
+    let mut newer_than_spec: Option<String> = None;
+    let mut older_than_spec: Option<String> = None;
     let mut iter = args.into_iter();
     let mut flags_done = false;
 
@@ -256,8 +283,8 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> io::Result<CliAct
                         "--newer-than must be valid UTF-8",
                     )
                 })?;
-                let dt = parse_time_spec(s)?;
-                newer_than = Some(dt);
+                newer_than = Some(parse_time_spec(s)?);
+                newer_than_spec = Some(s.to_owned());
             }
             Some("--older-than") => {
                 let value = iter.next().ok_or_else(|| {
@@ -272,8 +299,8 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> io::Result<CliAct
                         "--older-than must be valid UTF-8",
                     )
                 })?;
-                let dt = parse_time_spec(s)?;
-                older_than = Some(dt);
+                older_than = Some(parse_time_spec(s)?);
+                older_than_spec = Some(s.to_owned());
             }
             _ => {
                 // Reject anything that looks like a flag (long or short).
@@ -355,6 +382,8 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> io::Result<CliAct
         recycle,
         no_size_preview,
         no_journal,
+        newer_than_spec,
+        older_than_spec,
     }))
 }
 
@@ -739,6 +768,20 @@ mod tests {
             }
             _ => panic!("expected run action"),
         }
+    }
+
+    #[test]
+    fn test_batch_scope_tells_relative_ages_apart() {
+        let scope = |args: &[&str]| match parse_args(args.iter().map(OsString::from)).unwrap() {
+            CliAction::Run(options) => options.batch_scope("zapw"),
+            other => panic!("expected run action, got {other:?}"),
+        };
+        let a = scope(&["--yes", "--older-than", "30d", "x"]);
+        // Same spec parsed again (a sibling process): same scope.
+        assert_eq!(a, scope(&["--yes", "--older-than", "30d", "y"]));
+        // A different age must never merge into the same batch.
+        assert_ne!(a, scope(&["--yes", "--older-than", "1d", "x"]));
+        assert_ne!(a, scope(&["--yes", "--newer-than", "30d", "x"]));
     }
 
     #[test]

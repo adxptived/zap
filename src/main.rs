@@ -495,10 +495,23 @@ fn run_delete_parallel(
     let errors: std::sync::Mutex<Vec<(PathBuf, std::io::Error)>> =
         std::sync::Mutex::new(Vec::with_capacity(options.paths.len()));
 
+    // Paths never started because of a stop request are failures, not
+    // successes: the journal and the summary must not report them deleted.
+    let mark_cancelled = |rest: &[PathBuf]| {
+        let mut errors = errors.lock().unwrap();
+        for path in rest {
+            errors.push((
+                path.clone(),
+                io::Error::new(io::ErrorKind::Interrupted, "cancelled by user"),
+            ));
+        }
+    };
+
     if options.silent {
         rayon::scope(|s| {
-            for path in &options.paths {
+            for (i, path) in options.paths.iter().enumerate() {
                 if stop::is_stop_requested() {
+                    mark_cancelled(&options.paths[i..]);
                     break;
                 }
                 let opts = options
@@ -519,8 +532,9 @@ fn run_delete_parallel(
     let mp = MultiProgress::new();
     mp.set_move_cursor(true);
     rayon::scope(|s| {
-        for path in &options.paths {
+        for (i, path) in options.paths.iter().enumerate() {
             if stop::is_stop_requested() {
+                mark_cancelled(&options.paths[i..]);
                 break;
             }
             let bar = indicatif::ProgressBar::new_spinner();
@@ -564,8 +578,9 @@ fn alloc_console() {
 }
 
 fn run_batch(options: &cli::CliOptions, start: Instant) -> bool {
-    let paths_dir = batch::batch_paths_dir();
-    let lock_file = batch::batch_lock_file();
+    let scope = options.batch_scope("zap");
+    let paths_dir = batch::batch_paths_dir(&scope);
+    let lock_file = batch::batch_lock_file(&scope);
 
     #[cfg(windows)]
     free_console();
@@ -595,14 +610,17 @@ fn run_batch(options: &cli::CliOptions, start: Instant) -> bool {
 
             let mut success = run_delete(&merged, start);
 
-            // Drain any late arrivals
+            // Drain late arrivals: once while still the leader, then once
+            // more after releasing the lock (see `release_and_collect`).
             batch::touch_lock(&mut lock);
             batch::wait_for_batch_quiet(&paths_dir, BATCH_FINAL_QUIET_POLLS, BATCH_MAX_POLLS);
-            let processed: HashSet<&PathBuf> = merged.paths.iter().collect();
+            let mut processed: HashSet<PathBuf> = merged.paths.iter().cloned().collect();
             let late_paths = batch::read_batch_paths(&paths_dir);
+            let rest = batch::release_and_collect(&paths_dir, &lock_file, Some(lock));
             let pending: Vec<PathBuf> = late_paths
                 .into_iter()
-                .filter(|p| !processed.contains(p))
+                .chain(rest)
+                .filter(|p| processed.insert(p.clone()))
                 .collect();
             if !pending.is_empty() {
                 #[cfg(windows)]
@@ -614,10 +632,6 @@ fn run_batch(options: &cli::CliOptions, start: Instant) -> bool {
                 late_merged.batch = false;
                 success &= run_delete(&late_merged, start);
             }
-
-            drop(lock);
-            let _ = fs::remove_dir_all(&paths_dir);
-            let _ = fs::remove_file(&lock_file);
 
             success
         }
@@ -641,6 +655,32 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn test_paths_skipped_by_stop_are_reported_cancelled() {
+        // Regression: paths never started after Ctrl+C produced no error,
+        // so the journal recorded them as successfully deleted.
+        let cli::CliAction::Run(options) = cli::parse_args(
+            [
+                "--yes",
+                "--silent",
+                "--no-journal",
+                "never-started-a",
+                "never-started-b",
+            ]
+            .map(std::ffi::OsString::from),
+        )
+        .unwrap() else {
+            panic!("expected a run");
+        };
+        stop::request_stop();
+        let errors = run_delete_parallel(&options, false, false);
+        stop::reset();
+        assert_eq!(errors.len(), 2);
+        assert!(errors
+            .iter()
+            .all(|(_, err)| err.kind() == io::ErrorKind::Interrupted));
     }
 
     #[test]

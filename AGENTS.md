@@ -14,17 +14,19 @@ Source code is organized under `src/`:
 - `cli.rs` — CLI argument parser (`parse_args`), help/version output, `CliOptions` / `CliAction` types.
 - `delete.rs` — Core deletion logic: parallel file/dir removal via Rayon, retry on `PermissionDenied` (files, dirs, and symlinks), dry-run, symlink handling, shred, only-empty, recycle dispatch.
 - `scan.rs` — Directory walking with `jwalk::WalkDir` and entry classification (`EntryKind`: `File`, `Dir { depth }`, `Symlink`). Caches metadata in `ScannedEntry`. Used by filtered runs, dry-run and the non-Windows pipeline.
-- `tree_delete.rs` — Windows fast path for unfiltered directory deletion: each Rayon task lists one directory (`FindFirstFileExW`), deletes its files, recurses into subdirectories in parallel and removes the directory once empty. Reparse points are unlinked, never traversed; a failure is reported once (no cascade to ancestors).
+- `tree_delete.rs` — Windows fast path for unfiltered directory deletion: each Rayon task lists one directory through a `winapi::DirHandle` and deletes its files; nothing below the root is addressed by path — directories are opened, and entries opened for deletion (`open_entry`, as the type the listing reported), relative to the verified parent handle with `FILE_OPEN_REPARSE_POINT`, so a junction swapped in mid-run can redirect neither the traversal nor a single delete. It then recurses into subdirectories in parallel and removes the directory once empty. Reparse points are unlinked, never traversed; a failure is reported once (no cascade to ancestors).
 - `protect.rs` — Protected-path checks (`is_protected_path`), path sanitization (`sanitize_path`), filesystem-root detection.
 - `filter.rs` — Glob pattern filtering (`--include`/`--exclude`), min-size, newer-than/older-than metadata filtering.
 - `recycle.rs` — Windows Recycle Bin integration via `SHFileOperationW`.
-- `shred.rs` — Secure file deletion: overwrite with random data then remove.
+- `shred.rs` — Secure file deletion: overwrite with random data then remove. Hard-linked files (link count > 1) are only unlinked, never overwritten — their data belongs to the other names too.
+- `journal.rs` — Append-only operation journal (`%LOCALAPPDATA%\zap\journal.log`, one rotation), written by all three binaries; `zap --journal [N]` prints it.
+- `parallelism.rs` — Shared worker budget (`worker_count`, scan/delete split, queue capacity) and global Rayon pool setup.
 - `size.rs` — Size/entry counting (`tree_stats`, `dir_size_recursive`, `child_sizes` for the treemap). On Windows sizes come from directory listings: no per-file open, which costs about as much kernel time as deleting the file.
 - `settings.rs` — User settings (`%APPDATA%\zap\settings.ini`, `key = value`): language, context-menu layout/icons/items, default dialog mode, auto-close, journal, failure notifications, threads. Missing/broken file falls back to defaults.
 - `context_menu.rs` — Explorer context-menu registration under `HKCU\Software\Classes` built from settings. `plan()` is pure and unit-tested; `apply()` removes every known Zap key first. The folder-background entry only ever opens the dialog. Invoked via `zapg.exe --register-menu` / `--unregister-menu` (installer) and the settings screen.
 - `stop.rs` — Global Ctrl+C signal handler (`install_handler`, `is_stop_requested`).
 - `path_utils.rs` — Path formatting helpers (`progress_name`, `compact_path`, `dedup_paths`).
-- `batch.rs` — Shared batch-coordination infrastructure for multi-process Explorer integration.
+- `batch.rs` — Shared batch-coordination infrastructure for multi-process Explorer integration. Paths are stored losslessly (UTF-16 units as hex on Windows) and decoded through safe constructors only. Reads *claim* batch files (rename, then read), and a leader ends with `release_and_collect` (drop the lock first, then claim late arrivals) so no launch is lost.
 - `treemap.rs` — Squarified treemap layout for GUI visualization.
 - `winapi.rs` — Windows API helpers (directory enumeration, reparse point detection, POSIX force delete, long-path `\\?\` prefixing).
 - `bin/zapw.rs` — Entry point of the `zapw` (windowless) binary. Silent deletion without console window.
@@ -92,7 +94,7 @@ important user data.
 | `cargo test` | Run the full test suite (all modules) |
 | `cargo test -- --nocapture` | Run tests with stdout visible (for debugging) |
 | `cargo test test_delete_` | Run only tests matching `test_delete_` prefix |
-| `cargo test --test-threads=1` | Run tests single-threaded (reduces temp-dir collisions) |
+| `cargo test -- --test-threads=1` | Run tests single-threaded (reduces temp-dir collisions) |
 
 Test coverage by module:
 - `cli.rs` — argument parsing, flag validation (`--yes`, `--dry-run`, `--threads`), error messages, duplicate paths.

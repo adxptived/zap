@@ -28,13 +28,27 @@ pub struct BatchSession {
     pub lock_file: PathBuf,
     pub lock: Option<File>,
     pub last_path_count: usize,
+    /// Set once the scope was handed over; `Drop` must not touch it then.
+    pub released: bool,
+}
+
+impl BatchSession {
+    /// Hand the scope over (see `batch::release_and_collect`) and return
+    /// the paths that arrived in the meantime.
+    pub fn release(mut self) -> Vec<PathBuf> {
+        let rest = batch::release_and_collect(&self.paths_dir, &self.lock_file, self.lock.take());
+        self.released = true;
+        rest
+    }
 }
 
 impl Drop for BatchSession {
+    /// Dialog closed without running: free the scope and discard late
+    /// arrivals instead of leaving them for an unrelated future session.
     fn drop(&mut self) {
-        drop(self.lock.take());
-        let _ = fs::remove_dir_all(&self.paths_dir);
-        let _ = fs::remove_file(&self.lock_file);
+        if !self.released {
+            batch::release_and_collect(&self.paths_dir, &self.lock_file, self.lock.take());
+        }
     }
 }
 
@@ -294,12 +308,10 @@ impl ZapApp {
         };
         match batch_rx.try_recv() {
             Ok(Some((paths, session))) => {
-                self.items = paths.into_iter().map(DeleteItem::pending).collect();
-                // Update dangerous-paths check with collected paths
-                self.has_dangerous_paths = self
-                    .items
-                    .iter()
-                    .any(|item| protect::is_dangerous_target(&item.path));
+                // Merge instead of replacing: our own paths may have been
+                // claimed by an older leader, and must stay visible anyway.
+                // `add_paths` also re-arms the danger confirmation.
+                self.add_paths(paths);
                 self.batch_session = session;
                 self.recalculate_total_size();
             }
@@ -674,30 +686,27 @@ impl ZapApp {
         }
     }
 
+    /// Called when a run starts. Releases the batch scope right away, so
+    /// Explorer launches during the run open their own dialog instead of
+    /// handing paths to a session that no longer accepts them.
     pub fn finalize_batch_session(&mut self) {
-        let paths_dir = match &self.batch_session {
-            Some(s) => s.paths_dir.clone(),
-            None => return,
+        let Some(session) = self.batch_session.take() else {
+            return;
         };
-        if let Some(ref mut session) = self.batch_session {
-            if let Some(ref mut lock) = session.lock {
-                batch::touch_lock(lock);
-            }
-        }
         // Never wait for batch quiet on the UI thread. Regular throttled polls
-        // have already collected committed files; perform one final snapshot.
-        let changed = self.add_batch_paths_from(&paths_dir);
-        if let Some(ref mut session) = self.batch_session {
-            session.last_path_count = self.items.len();
-            session.lock = None;
-        }
-        if changed {
+        // have already collected committed files; one final claim suffices.
+        if self.add_paths(session.release()) {
             self.recalculate_total_size();
         }
     }
 
     fn add_batch_paths_from(&mut self, paths_dir: &Path) -> bool {
-        let mut paths = batch::read_batch_paths(paths_dir);
+        let paths = batch::read_batch_paths(paths_dir);
+        self.add_paths(paths)
+    }
+
+    /// Append paths not yet in the selection. Returns whether any was new.
+    fn add_paths(&mut self, mut paths: Vec<PathBuf>) -> bool {
         path_utils::dedup_paths(&mut paths);
         // Batch sessions can stream thousands of paths across polls; a
         // linear scan per candidate would be quadratic. Dedup via HashSet.
@@ -708,23 +717,22 @@ impl ZapApp {
             .filter(|path| !existing.contains(path.as_path()))
             .collect();
         drop(existing);
-        let mut changed = false;
+        let changed = !new_paths.is_empty();
+        // Late-arriving batch paths may include protected system paths.
+        // Re-arm confirmation so the worker never receives dangerous
+        // permission given for an earlier selection — even one that was
+        // already dangerous.
+        if new_paths.iter().any(|p| protect::is_dangerous_target(p)) {
+            self.danger_confirmed = false;
+        }
         for path in new_paths {
             self.items.push(DeleteItem::pending(path));
-            changed = true;
         }
         if changed {
-            // Late-arriving batch paths may include protected system paths.
-            // Re-arm confirmation so the worker never receives dangerous
-            // permission inherited from an earlier, safer selection.
-            let has_dangerous = self
+            self.has_dangerous_paths = self
                 .items
                 .iter()
                 .any(|item| protect::is_dangerous_target(&item.path));
-            if has_dangerous && !self.has_dangerous_paths {
-                self.danger_confirmed = false;
-            }
-            self.has_dangerous_paths = has_dangerous;
         }
         changed
     }
@@ -1235,11 +1243,28 @@ mod tests {
                 lock_file: lock_file.clone(),
                 lock: Some(lock),
                 last_path_count: 1,
+                released: false,
             }),
         );
         app.poll_batch_session();
         assert!(app.items.iter().any(|item| item.path == late));
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn late_dangerous_path_rearms_confirmation_even_if_already_dangerous() {
+        let mut app = ZapApp::new(vec![PathBuf::from("not-there")], None, None);
+        // The user already confirmed one dangerous selection...
+        app.has_dangerous_paths = true;
+        app.danger_confirmed = true;
+        // ...then another protected path arrives from the Explorer batch.
+        assert!(app.add_paths(vec![PathBuf::from(r"C:\Windows")]));
+        assert!(app.has_dangerous_paths);
+        assert!(
+            !app.danger_confirmed,
+            "new dangerous path needs a fresh confirmation"
+        );
     }
 
     #[test]

@@ -257,11 +257,14 @@ fn process_file_batch(
     }
 }
 
+/// `keep_non_empty`: a filtered run deliberately leaves files behind, so a
+/// directory that still holds them is kept, not reported as a failure.
 fn delete_dir_batches(
     batches: &[crate::scan::DirBatch],
     error_count: &AtomicU64,
     failures: &Mutex<Vec<DeletionFailure>>,
     bar: Option<&ProgressBar>,
+    keep_non_empty: bool,
 ) {
     for batch in batches {
         if crate::stop::is_stop_requested() {
@@ -274,9 +277,14 @@ fn delete_dir_batches(
                 return;
             }
             for entry in chunk {
-                if let Err(err) = remove_dir_with_retry(&entry.path) {
-                    error_count.fetch_add(1, Ordering::Relaxed);
-                    push_failure(failures, &entry.path, &err);
+                match remove_dir_with_retry(&entry.path) {
+                    Ok(()) => {}
+                    Err(err)
+                        if keep_non_empty && err.kind() == io::ErrorKind::DirectoryNotEmpty => {}
+                    Err(err) => {
+                        error_count.fetch_add(1, Ordering::Relaxed);
+                        push_failure(failures, &entry.path, &err);
+                    }
                 }
             }
             if let Some(b) = bar {
@@ -286,11 +294,14 @@ fn delete_dir_batches(
     }
 }
 
+/// `keep_non_empty_root`: see [`delete_dir_batches`]; the root of a filtered
+/// run is removed only when nothing was kept inside it.
 fn finalize(
     root: &Path,
     total_errors: u64,
     failures: &Mutex<Vec<DeletionFailure>>,
     bar: Option<ProgressBar>,
+    keep_non_empty_root: bool,
 ) -> io::Result<()> {
     if total_errors > 0 {
         if let Some(ref b) = bar {
@@ -317,6 +328,7 @@ fn finalize(
             }
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) if keep_non_empty_root && e.kind() == io::ErrorKind::DirectoryNotEmpty => {}
         Err(e) => {
             if let Some(ref b) = bar {
                 b.finish_and_clear();
@@ -384,7 +396,7 @@ fn delete_directory_fast(path: &Path, bar: Option<ProgressBar>, shred: bool) -> 
         b.set_position(deleter.removed.load(Ordering::Relaxed));
     }
 
-    finalize(path, errors.load(Ordering::Relaxed), &failures, bar)
+    finalize(path, errors.load(Ordering::Relaxed), &failures, bar, false)
 }
 
 // ---------------------------------------------------------------------------
@@ -499,6 +511,7 @@ fn delete_directory_pipeline(path: &Path, bar: Option<ProgressBar>, shred: bool)
         &dir_errors,
         &failures,
         bar.as_ref(),
+        false,
     );
 
     finalize(
@@ -506,6 +519,7 @@ fn delete_directory_pipeline(path: &Path, bar: Option<ProgressBar>, shred: bool)
         file_errors.load(Ordering::Relaxed) + dir_errors.load(Ordering::Relaxed),
         &failures,
         bar,
+        false,
     )
 }
 
@@ -551,13 +565,20 @@ fn delete_directory_filtered(
     }
 
     let dir_errors = AtomicU64::new(0);
-    delete_dir_batches(&plan.dirs_by_depth, &dir_errors, &failures, bar.as_ref());
+    delete_dir_batches(
+        &plan.dirs_by_depth,
+        &dir_errors,
+        &failures,
+        bar.as_ref(),
+        true,
+    );
 
     finalize(
         path,
         file_errors.load(Ordering::Relaxed) + dir_errors.load(Ordering::Relaxed),
         &failures,
         bar,
+        true,
     )
 }
 
@@ -933,6 +954,12 @@ fn dry_run_path_inner(path: &Path, silent: bool) -> io::Result<()> {
     }
 
     let canonical = sanitize_path(path)?;
+    if canonical.parent().is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("refusing to delete filesystem root: {}", path.display()),
+        ));
+    }
     if is_protected_path(&canonical) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -1194,6 +1221,13 @@ mod tests {
         dry_run_path(&temp).unwrap();
         assert!(file.exists());
         let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_dry_run_refuses_filesystem_root() {
+        let err = dry_run_path_silent(Path::new(r"C:\")).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]
@@ -1463,6 +1497,81 @@ mod tests {
         delete_path(&file, DeleteOptions::default().with_filter(filter).silent()).unwrap();
         assert!(file.exists(), "file below --min-size must be kept");
         let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_shred_tree_handles_readonly_hardlinks_and_scrubs_names() {
+        let temp = create_test_dir();
+        let tree = temp.join("tree");
+        let sub = tree.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        let outside = temp.join("outside.txt");
+        fs::write(&outside, b"IMPORTANT DATA").unwrap();
+        fs::hard_link(&outside, sub.join("link.txt")).unwrap();
+        let ro = sub.join("ro.txt");
+        fs::write(&ro, b"secret").unwrap();
+        let mut perms = fs::metadata(&ro).unwrap().permissions();
+        perms.set_readonly(true);
+        fs::set_permissions(&ro, perms).unwrap();
+        for i in 0..300 {
+            fs::write(tree.join(format!("f{i}.bin")), b"secret").unwrap();
+        }
+
+        delete_path(&tree, DeleteOptions::default().shred().silent()).unwrap();
+        assert!(!tree.exists());
+        assert_eq!(fs::read(&outside).unwrap(), b"IMPORTANT DATA");
+        let leftovers: Vec<_> = fs::read_dir(&temp).unwrap().flatten().collect();
+        assert_eq!(leftovers.len(), 1, "only outside.txt may remain");
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_filtered_delete_keeping_files_succeeds() {
+        // Regression: kept files made their directories (and the root)
+        // fail with "directory not empty", turning every filtered run into
+        // an error even though exactly the right files were deleted.
+        use glob::Pattern;
+        let temp = create_test_dir();
+        let sub = temp.join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::write(temp.join("a.log"), b"x").unwrap();
+        fs::write(temp.join("keep.txt"), b"x").unwrap();
+        fs::write(sub.join("b.log"), b"x").unwrap();
+        fs::write(sub.join("keep2.txt"), b"x").unwrap();
+
+        for filter in [
+            FilterConfig {
+                includes: vec![Pattern::new("*.log").unwrap()],
+                ..Default::default()
+            },
+            FilterConfig {
+                excludes: vec![Pattern::new("*.txt").unwrap()],
+                ..Default::default()
+            },
+        ] {
+            delete_path(&temp, DeleteOptions::default().with_filter(filter).silent()).unwrap();
+            assert!(!temp.join("a.log").exists());
+            assert!(!sub.join("b.log").exists());
+            assert!(temp.join("keep.txt").exists());
+            assert!(sub.join("keep2.txt").exists());
+            fs::write(temp.join("a.log"), b"x").unwrap();
+            fs::write(sub.join("b.log"), b"x").unwrap();
+        }
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_filtered_delete_removes_root_when_nothing_is_kept() {
+        use glob::Pattern;
+        let temp = create_test_dir();
+        fs::create_dir(temp.join("sub")).unwrap();
+        fs::write(temp.join("sub").join("x.tmp"), b"x").unwrap();
+        let filter = FilterConfig {
+            excludes: vec![Pattern::new("*.keep").unwrap()],
+            ..Default::default()
+        };
+        delete_path(&temp, DeleteOptions::default().with_filter(filter).silent()).unwrap();
+        assert!(!temp.exists());
     }
 
     #[test]

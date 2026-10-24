@@ -54,7 +54,11 @@ fn main() -> eframe::Result<()> {
     // coordinator writes its own paths immediately, then collects the
     // rest from siblings asynchronously so the window appears instantly.
     let (paths, batch_session, batch_rx) = if args.batch {
-        match try_become_coordinator(&args.paths) {
+        let config = format!(
+            "recycle={} shred={} no_journal={} threads={:?}",
+            args.recycle, args.shred, args.no_journal, args.threads
+        );
+        match try_become_coordinator(&batch::batch_scope("zapg", &config), &args.paths) {
             CoordinatorOutcome::NotCoordinator => return Ok(()),
             CoordinatorOutcome::Coordinator {
                 paths,
@@ -135,9 +139,9 @@ enum CoordinatorOutcome {
 /// Fast path for non-coordinators: write own paths, try lock. If we lose
 /// the lock race, exit immediately without opening any window. The winner
 /// spawns a background thread to collect the rest.
-fn try_become_coordinator(own_paths: &[PathBuf]) -> CoordinatorOutcome {
-    let paths_dir = batch::batch_paths_dir();
-    let lock_file = batch::batch_lock_file();
+fn try_become_coordinator(scope: &str, own_paths: &[PathBuf]) -> CoordinatorOutcome {
+    let paths_dir = batch::batch_paths_dir(scope);
+    let lock_file = batch::batch_lock_file(scope);
 
     batch::cleanup_stale_batch(&paths_dir, &lock_file);
 
@@ -180,6 +184,7 @@ fn try_become_coordinator(own_paths: &[PathBuf]) -> CoordinatorOutcome {
             lock_file: lock_file_clone,
             lock: Some(lock),
             last_path_count: collected.len(),
+            released: false,
         };
         let _ = tx.send(Some((collected, Some(session))));
     });

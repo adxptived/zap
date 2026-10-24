@@ -48,12 +48,9 @@ impl Drop for ShredPermit {
 }
 
 pub fn shred_file(path: &Path, passes: usize) -> io::Result<()> {
-    let _permit = ShredPermit::acquire()?;
-    let passes = passes.max(MIN_SHRED_PASSES);
     let meta = fs::metadata(path)?;
-    let len = meta.len();
 
-    if len == 0 {
+    if meta.len() == 0 {
         if meta.permissions().readonly() {
             let _ = crate::delete::set_writable(path);
         }
@@ -72,6 +69,39 @@ pub fn shred_file(path: &Path, passes: usize) -> io::Result<()> {
         }
         Err(e) => return Err(e),
     };
+
+    let outcome = overwrite(&mut file, passes)?;
+    drop(file);
+    match outcome {
+        Overwrite::HardLinked => crate::delete::remove_file_with_retry(path),
+        Overwrite::Done => remove_with_scrubbed_name(path),
+    }
+}
+
+/// Result of [`overwrite`].
+pub(crate) enum Overwrite {
+    /// Every byte was overwritten and synced; the caller deletes the file.
+    Done,
+    /// Left untouched: other hard links share the data. A hard-linked file
+    /// shares its data with names outside the deletion target (pnpm stores,
+    /// dedup tools). Overwriting it would destroy that data too, and the
+    /// content stays reachable through the other links anyway — so the
+    /// caller only removes this name.
+    HardLinked,
+}
+
+/// Overwrite the whole content of an open, writable file in place:
+/// `passes - 1` random passes, then zeros, each synced to the device.
+pub(crate) fn overwrite(file: &mut fs::File, passes: usize) -> io::Result<Overwrite> {
+    let _permit = ShredPermit::acquire()?;
+    if link_count(file)? > 1 {
+        return Ok(Overwrite::HardLinked);
+    }
+    let passes = passes.max(MIN_SHRED_PASSES);
+    let len = file.metadata()?.len();
+    if len == 0 {
+        return Ok(Overwrite::Done);
+    }
 
     // Cap the buffer at the file length — no point allocating 1 MiB to
     // shred a 4 KiB file.
@@ -112,9 +142,31 @@ pub fn shred_file(path: &Path, passes: usize) -> io::Result<()> {
         // single write and the overwrite guarantee is lost.
         file.sync_data()?;
     }
-    drop(file);
+    Ok(Overwrite::Done)
+}
 
-    remove_with_scrubbed_name(path)
+/// Random 12-letter name used to hide a shredded file's original name.
+pub(crate) fn random_name() -> String {
+    let mut rng = rand::thread_rng();
+    (0..12)
+        .map(|_| char::from(b'a' + (rng.next_u32() % 26) as u8))
+        .collect()
+}
+
+#[cfg(windows)]
+fn link_count(file: &fs::File) -> io::Result<u32> {
+    crate::winapi::link_count(file)
+}
+
+#[cfg(unix)]
+fn link_count(file: &fs::File) -> io::Result<u32> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(file.metadata()?.nlink() as u32)
+}
+
+#[cfg(not(any(windows, unix)))]
+fn link_count(_file: &fs::File) -> io::Result<u32> {
+    Ok(1)
 }
 
 /// The overwrite passes destroy the contents, but the original *filename*
@@ -125,12 +177,8 @@ pub fn shred_file(path: &Path, passes: usize) -> io::Result<()> {
 /// deleting under the original name — content destruction already happened.
 fn remove_with_scrubbed_name(path: &Path) -> io::Result<()> {
     if let Some(parent) = path.parent() {
-        let mut rng = rand::thread_rng();
         for _ in 0..3 {
-            let name: String = (0..12)
-                .map(|_| char::from(b'a' + (rng.next_u32() % 26) as u8))
-                .collect();
-            let scrubbed = parent.join(name);
+            let scrubbed = parent.join(random_name());
             if scrubbed.exists() {
                 continue;
             }
@@ -201,6 +249,22 @@ mod tests {
         assert!(!path.exists());
         let leftovers: Vec<_> = fs::read_dir(&dir).unwrap().collect();
         assert!(leftovers.is_empty(), "no files may remain after shred");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_shred_hard_link_keeps_data_of_other_names() {
+        // Regression: shredding one name of a hard-linked file zeroed the
+        // data of the other name, which lives outside the deletion target.
+        let dir = temp_dir();
+        let outside = dir.join("outside.txt");
+        let link = dir.join("link.txt");
+        fs::write(&outside, b"IMPORTANT DATA").unwrap();
+        fs::hard_link(&outside, &link).unwrap();
+
+        shred_file(&link, 3).unwrap();
+        assert!(!link.exists());
+        assert_eq!(fs::read(&outside).unwrap(), b"IMPORTANT DATA");
         let _ = fs::remove_dir_all(&dir);
     }
 

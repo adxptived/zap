@@ -82,8 +82,9 @@ fn try_start_batch_leader(raw_args: &[OsString]) -> bool {
         return false;
     }
 
-    let paths_dir = batch::batch_paths_dir();
-    let lock_file = batch::batch_lock_file();
+    let scope = options.batch_scope("zapw");
+    let paths_dir = batch::batch_paths_dir(&scope);
+    let lock_file = batch::batch_lock_file(&scope);
 
     batch::cleanup_stale_batch(&paths_dir, &lock_file);
     if batch::write_batch_paths(&paths_dir, &options.paths).is_err() {
@@ -115,6 +116,8 @@ fn worker_main(args: Vec<OsString>, batch_already_written: bool) {
         return;
     };
 
+    // Before the adjustments below: must match the launcher's scope.
+    let scope = options.batch_scope("zapw");
     options.silent = true;
 
     // A windowless worker cannot show a confirmation prompt. Without an
@@ -135,9 +138,9 @@ fn worker_main(args: Vec<OsString>, batch_already_written: bool) {
 
     if options.batch {
         let run = if batch_already_written {
-            collect_existing_batch_paths()
+            collect_existing_batch_paths(&scope)
         } else {
-            collect_batch_paths(&options.paths)
+            collect_batch_paths(&scope, &options.paths)
         };
         match run {
             Some(mut run) => {
@@ -328,13 +331,17 @@ struct BatchRun {
     /// from underneath a long-running batch. The file mtime is refreshed
     /// by `touch_lock` in the drain loop.
     lock: Option<File>,
+    /// The scope no longer belongs to this run (never owned, or already
+    /// released): the lock file and directory may be a new leader's now
+    /// and must not be touched.
+    released: bool,
 }
 
 /// Returns `Some(run)` for the leader, `None` for followers.
 /// The lock handle must be kept alive until deletion is complete.
-fn collect_batch_paths(paths: &[PathBuf]) -> Option<BatchRun> {
-    let paths_dir = batch::batch_paths_dir();
-    let lock_file = batch::batch_lock_file();
+fn collect_batch_paths(scope: &str, paths: &[PathBuf]) -> Option<BatchRun> {
+    let paths_dir = batch::batch_paths_dir(scope);
+    let lock_file = batch::batch_lock_file(scope);
 
     batch::cleanup_stale_batch(&paths_dir, &lock_file);
     if batch::write_batch_paths(&paths_dir, paths).is_err() {
@@ -344,6 +351,7 @@ fn collect_batch_paths(paths: &[PathBuf]) -> Option<BatchRun> {
             paths_dir,
             lock_file,
             lock: None,
+            released: true,
         });
     }
 
@@ -357,6 +365,7 @@ fn collect_batch_paths(paths: &[PathBuf]) -> Option<BatchRun> {
                 paths_dir,
                 lock_file,
                 lock: Some(lock),
+                released: false,
             })
         }
         Err(_) => None,
@@ -367,15 +376,26 @@ fn collect_batch_paths(paths: &[PathBuf]) -> Option<BatchRun> {
 /// adopts the lock that was created by the short-lived Explorer process,
 /// refreshing the PID and mtime so `cleanup_stale_batch` doesn't kill an
 /// active batch.
-fn collect_existing_batch_paths() -> Option<BatchRun> {
-    let paths_dir = batch::batch_paths_dir();
-    let lock_file = batch::batch_lock_file();
+fn collect_existing_batch_paths(scope: &str) -> Option<BatchRun> {
+    let paths_dir = batch::batch_paths_dir(scope);
+    let lock_file = batch::batch_lock_file(scope);
 
     wait_for_batch_quiet_fast(&paths_dir);
     let mut collected = batch::read_batch_paths(&paths_dir);
     path_utils::dedup_paths(&mut collected);
     if collected.is_empty() {
-        return None;
+        // An older leader already claimed the launcher's paths. Release the
+        // lock the launcher created — left behind, it would make every
+        // launch in the next 30 s hand its paths to nobody.
+        let mut rest = batch::release_and_collect(&paths_dir, &lock_file, None);
+        path_utils::dedup_paths(&mut rest);
+        return (!rest.is_empty()).then_some(BatchRun {
+            paths: rest,
+            paths_dir,
+            lock_file,
+            lock: None,
+            released: true,
+        });
     }
 
     let lock = batch::refresh_lock_owner(&lock_file).ok();
@@ -385,33 +405,39 @@ fn collect_existing_batch_paths() -> Option<BatchRun> {
         paths_dir,
         lock_file,
         lock,
+        released: false,
     })
 }
 
-fn drain_late_batch_paths(options: &cli::CliOptions, run: BatchRun) -> Vec<(PathBuf, String)> {
+fn drain_late_batch_paths(options: &cli::CliOptions, mut run: BatchRun) -> Vec<(PathBuf, String)> {
     let mut processed: HashSet<PathBuf> = options.paths.iter().cloned().collect();
     let mut failures = Vec::new();
 
-    loop {
-        wait_for_batch_quiet_fast(&run.paths_dir);
-        let mut pending = batch::read_batch_paths(&run.paths_dir);
-        path_utils::dedup_paths(&mut pending);
-        pending.retain(|path| !processed.contains(path));
-
+    while !run.released {
+        let mut pending = {
+            if let Some(lock) = run.lock.as_mut() {
+                batch::touch_lock(lock);
+            }
+            wait_for_batch_quiet_fast(&run.paths_dir);
+            batch::read_batch_paths(&run.paths_dir)
+        };
         if pending.is_empty() {
-            break;
+            // Quiet: hand the scope over. Paths committed before the lock
+            // disappears are still ours; later launches lead themselves.
+            pending = batch::release_and_collect(&run.paths_dir, &run.lock_file, run.lock.take());
+            run.released = true;
+        }
+        path_utils::dedup_paths(&mut pending);
+        pending.retain(|path| processed.insert(path.clone()));
+        if pending.is_empty() {
+            continue;
         }
 
         let mut late_options = options.clone();
-        late_options.paths = pending.clone();
+        late_options.paths = pending;
         late_options.batch = false;
         failures.extend(run_silent_delete_collect(&late_options));
-        processed.extend(pending);
     }
-
-    drop(run.lock);
-    let _ = fs::remove_dir_all(&run.paths_dir);
-    let _ = fs::remove_file(&run.lock_file);
     failures
 }
 
@@ -453,6 +479,8 @@ mod tests {
             recycle: false,
             no_size_preview: false,
             no_journal: true,
+            newer_than_spec: None,
+            older_than_spec: None,
         }
     }
 
@@ -513,7 +541,8 @@ mod tests {
             includes: vec![glob::Pattern::new("*.log").unwrap()],
             ..FilterConfig::default()
         };
-        let _ = run_silent_delete(&options);
+        // Keeping filtered-out files is the point, not a failure.
+        assert!(run_silent_delete(&options));
 
         // Regression: zapw used to drop the filter (and recycle/shred flags)
         // by building DeleteOptions manually instead of via to_delete_options.
@@ -580,6 +609,7 @@ mod tests {
                 paths_dir: paths_dir.clone(),
                 lock_file: lock_file.clone(),
                 lock: None,
+                released: false,
             },
         );
 

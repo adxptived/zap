@@ -287,13 +287,19 @@ pub fn apply(settings: &Settings, targets: &MenuTargets) -> std::io::Result<()> 
     Ok(())
 }
 
-/// Remove every Zap menu entry (current and legacy layouts).
+/// Remove every Zap menu entry (current and legacy layouts), and the
+/// Explorer-wide multi-select limit if it still holds the value Zap set —
+/// it affects every context-menu verb, not just Zap's.
 #[cfg(windows)]
 pub fn unregister() -> std::io::Result<()> {
     for key in ALL_KNOWN_KEYS {
         registry::delete_tree(&format!(r"{CLASSES}\{key}"))?;
     }
-    Ok(())
+    registry::delete_dword_if(
+        EXPLORER_KEY,
+        "MultipleInvokePromptMinimum",
+        MAX_CONTEXT_MENU_SELECTIONS,
+    )
 }
 
 /// Whether any Zap entry is currently registered for files/folders.
@@ -350,6 +356,47 @@ mod registry {
         ) -> i32;
         fn RegDeleteTreeW(hkey: Hkey, sub_key: *const u16) -> i32;
         fn RegCloseKey(hkey: Hkey) -> i32;
+        fn RegGetValueW(
+            hkey: Hkey,
+            sub_key: *const u16,
+            value: *const u16,
+            flags: u32,
+            kind: *mut u32,
+            data: *mut c_void,
+            len: *mut u32,
+        ) -> i32;
+        fn RegDeleteKeyValueW(hkey: Hkey, sub_key: *const u16, value: *const u16) -> i32;
+    }
+
+    /// Delete a DWORD value only when it still equals `expected`, so a
+    /// value the user changed afterwards is left alone.
+    pub fn delete_dword_if(path: &str, name: &str, expected: u32) -> io::Result<()> {
+        const RRF_RT_REG_DWORD: u32 = 0x10;
+        let (path_w, name_w) = (wide(path), wide(name));
+        let mut data: u32 = 0;
+        let mut len = std::mem::size_of::<u32>() as u32;
+        // SAFETY: valid NUL-terminated strings and a 4-byte out-buffer.
+        let status = unsafe {
+            RegGetValueW(
+                HKEY_CURRENT_USER,
+                path_w.as_ptr(),
+                name_w.as_ptr(),
+                RRF_RT_REG_DWORD,
+                std::ptr::null_mut(),
+                &mut data as *mut u32 as *mut c_void,
+                &mut len,
+            )
+        };
+        if status != ERROR_SUCCESS || data != expected {
+            return Ok(()); // absent, another type, or changed by the user
+        }
+        // SAFETY: valid NUL-terminated strings.
+        let status =
+            unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, path_w.as_ptr(), name_w.as_ptr()) };
+        if status == ERROR_FILE_NOT_FOUND {
+            return Ok(());
+        }
+        check(status, "cannot delete value in", path)
     }
 
     fn wide(text: &str) -> Vec<u16> {

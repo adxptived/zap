@@ -51,7 +51,8 @@ inherits = "release"
 opt-level = 3
 lto = "fat"
 codegen-units = 1    # Reduce number of codegen units to increase optimizations.
-panic = "abort"
+# No `panic = "abort"`: the poisoned-mutex recovery, the GUI's dead-worker
+# detection and journaling after a failed task all rely on unwinding.
 
 [build-dependencies]
 embed-resource = "3.0.9"

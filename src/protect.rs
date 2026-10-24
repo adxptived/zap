@@ -18,16 +18,24 @@ pub fn is_filesystem_root(path: &Path) -> io::Result<bool> {
 
 pub fn sanitize_path(path: &Path) -> io::Result<PathBuf> {
     let canonical = std::fs::canonicalize(path)?;
-    // On Windows, canonicalize returns a UNC path like \\?\C:\...
-    // Strip the \\?\ prefix so that path comparisons in is_protected_path work.
     #[cfg(windows)]
-    {
-        let s = canonical.to_string_lossy();
-        if let Some(stripped) = s.strip_prefix(r"\\?\") {
-            return Ok(PathBuf::from(stripped));
-        }
-    }
+    let canonical = strip_verbatim(canonical);
     Ok(canonical)
+}
+
+/// On Windows, canonicalize returns a verbatim path (`\\?\C:\...` or
+/// `\\?\UNC\server\share\...`). Strip the prefix so comparisons in
+/// `is_protected_path` work and `parent()` reports volume roots correctly.
+#[cfg(windows)]
+fn strip_verbatim(canonical: PathBuf) -> PathBuf {
+    let s = canonical.to_string_lossy();
+    if let Some(unc) = s.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{unc}"));
+    }
+    if let Some(stripped) = s.strip_prefix(r"\\?\") {
+        return PathBuf::from(stripped);
+    }
+    canonical
 }
 
 /// Metadata and canonical identity captured at the destructive API boundary.
@@ -100,6 +108,11 @@ struct ProtectedConfig {
     /// branch has special-case logic that allows deep user content while
     /// still protecting well-known profile subdirs.
     users_index: usize,
+    /// Folders protected themselves (their contents stay deletable): the
+    /// current profile and its well-known folders wherever they really
+    /// live — a profile outside `<SystemDrive>\Users`, Documents redirected
+    /// to another drive, OneDrive. Lower-cased.
+    exact: Vec<String>,
 }
 
 #[cfg(windows)]
@@ -115,7 +128,155 @@ const PROTECTED_USER_SUBDIRS: &[&str] = &[
     "pictures",
     "music",
     "videos",
+    "onedrive",
+    "saved games",
+    "favorites",
+    "links",
+    "contacts",
+    "searches",
+    ".ssh",
 ];
+
+/// `{profile}`, `{profile}\<each PROTECTED_USER_SUBDIRS>` and the extra
+/// folders, lower-cased, for [`ProtectedConfig::exact`].
+#[cfg(windows)]
+fn exact_entries(profile: Option<&str>, extra: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut exact: Vec<String> = Vec::new();
+    if let Some(profile) = profile.filter(|p| !p.is_empty()) {
+        let profile = profile.trim_end_matches('\\');
+        exact.push(profile.to_string());
+        for sub in PROTECTED_USER_SUBDIRS {
+            exact.push(format!(r"{profile}\{sub}"));
+        }
+    }
+    exact.extend(extra.into_iter().filter(|p| !p.is_empty()));
+    for entry in &mut exact {
+        *entry = entry.to_lowercase();
+    }
+    exact.sort();
+    exact.dedup();
+    exact
+}
+
+#[cfg(windows)]
+mod known_folders {
+    use std::ffi::c_void;
+
+    #[repr(C)]
+    pub struct Guid(u32, u16, u16, [u8; 8]);
+
+    pub const DESKTOP: Guid = Guid(
+        0xB4BFCC3A,
+        0xDB2C,
+        0x424C,
+        [0xB0, 0x29, 0x7F, 0xE9, 0x9A, 0x87, 0xC6, 0x41],
+    );
+    pub const DOCUMENTS: Guid = Guid(
+        0xFDD39AD0,
+        0x238F,
+        0x46AF,
+        [0xAD, 0xB4, 0x6C, 0x85, 0x48, 0x03, 0x69, 0xC7],
+    );
+    pub const DOWNLOADS: Guid = Guid(
+        0x374DE290,
+        0x123F,
+        0x4565,
+        [0x91, 0x64, 0x39, 0xC4, 0x92, 0x5E, 0x46, 0x7B],
+    );
+    pub const PICTURES: Guid = Guid(
+        0x33E28130,
+        0x4E1E,
+        0x4676,
+        [0x83, 0x5A, 0x98, 0x39, 0x5C, 0x3B, 0xC3, 0xBB],
+    );
+    pub const MUSIC: Guid = Guid(
+        0x4BD8D571,
+        0x6D19,
+        0x48D3,
+        [0xBE, 0x97, 0x42, 0x22, 0x20, 0x08, 0x0E, 0x43],
+    );
+    pub const VIDEOS: Guid = Guid(
+        0x18989B1D,
+        0x99B5,
+        0x455B,
+        [0x84, 0x1C, 0xAB, 0x7C, 0x74, 0xE4, 0xDD, 0xFC],
+    );
+    pub const ROAMING_APP_DATA: Guid = Guid(
+        0x3EB685DB,
+        0x65F9,
+        0x4CF6,
+        [0xA0, 0x3A, 0xE3, 0xEF, 0x65, 0x72, 0x9F, 0x3D],
+    );
+    pub const LOCAL_APP_DATA: Guid = Guid(
+        0xF1B32785,
+        0x6FBA,
+        0x4FCF,
+        [0x9D, 0x55, 0x7B, 0x8E, 0x7F, 0x15, 0x70, 0x91],
+    );
+    pub const ONEDRIVE: Guid = Guid(
+        0xA52BBA46,
+        0xE9E1,
+        0x435F,
+        [0xB3, 0xD9, 0x28, 0xDA, 0xA6, 0x48, 0xC0, 0xF6],
+    );
+    pub const SAVED_GAMES: Guid = Guid(
+        0x4C5C32FF,
+        0xBB9D,
+        0x43B0,
+        [0xB5, 0xB4, 0x2D, 0x72, 0xE5, 0x4E, 0xAA, 0xA4],
+    );
+    pub const FAVORITES: Guid = Guid(
+        0x1777F761,
+        0x68AD,
+        0x4D8A,
+        [0x87, 0xBD, 0x30, 0xB7, 0x59, 0xFA, 0x33, 0xDD],
+    );
+
+    pub const ALL: [&Guid; 11] = [
+        &DESKTOP,
+        &DOCUMENTS,
+        &DOWNLOADS,
+        &PICTURES,
+        &MUSIC,
+        &VIDEOS,
+        &ROAMING_APP_DATA,
+        &LOCAL_APP_DATA,
+        &ONEDRIVE,
+        &SAVED_GAMES,
+        &FAVORITES,
+    ];
+
+    #[link(name = "shell32")]
+    extern "system" {
+        fn SHGetKnownFolderPath(
+            id: *const Guid,
+            flags: u32,
+            token: *mut c_void,
+            path: *mut *mut u16,
+        ) -> i32;
+    }
+    #[link(name = "ole32")]
+    extern "system" {
+        fn CoTaskMemFree(pv: *mut c_void);
+    }
+
+    /// Current location of a known folder, or `None` if it has none.
+    pub fn path(id: &Guid) -> Option<String> {
+        let mut raw: *mut u16 = std::ptr::null_mut();
+        // SAFETY: valid GUID and out-pointer; no access token (current user).
+        let hr = unsafe { SHGetKnownFolderPath(id, 0, std::ptr::null_mut(), &mut raw) };
+        let result = (hr >= 0 && !raw.is_null()).then(|| {
+            // SAFETY: on success `raw` is a NUL-terminated UTF-16 string.
+            unsafe {
+                let len = (0..).take_while(|&i| *raw.add(i) != 0).count();
+                String::from_utf16_lossy(std::slice::from_raw_parts(raw, len))
+            }
+        });
+        // SAFETY: the buffer must be freed whatever the result; null is fine.
+        unsafe { CoTaskMemFree(raw as *mut c_void) };
+        result
+    }
+}
 
 #[cfg(windows)]
 fn protected_config() -> &'static ProtectedConfig {
@@ -149,9 +310,20 @@ fn protected_config() -> &'static ProtectedConfig {
         ];
         let users_index = 4;
         let prefixes: Vec<String> = raw.iter().map(|s| s.to_lowercase()).collect();
+
+        let profile = env::var("USERPROFILE").ok();
+        let extra = known_folders::ALL
+            .iter()
+            .filter_map(|id| known_folders::path(id))
+            .chain(
+                ["OneDrive", "OneDriveCommercial", "OneDriveConsumer"]
+                    .iter()
+                    .filter_map(|var| env::var(var).ok()),
+            );
         ProtectedConfig {
             prefixes,
             users_index,
+            exact: exact_entries(profile.as_deref(), extra),
         }
     })
 }
@@ -190,9 +362,21 @@ fn components_ci_eq(a: &[u8], b: &[u8]) -> bool {
 
 #[cfg(windows)]
 pub fn is_protected_path(path: &Path) -> bool {
-    let cfg = protected_config();
+    is_protected_with(protected_config(), path)
+}
+
+#[cfg(windows)]
+fn is_protected_with(cfg: &ProtectedConfig, path: &Path) -> bool {
     let path_str = path.to_string_lossy();
     let path_bytes = path_str.as_bytes();
+
+    if cfg
+        .exact
+        .iter()
+        .any(|folder| components_ci_eq(path_bytes, folder.as_bytes()))
+    {
+        return true;
+    }
 
     for (i, prefix) in cfg.prefixes.iter().enumerate() {
         let pb = prefix.as_bytes();
@@ -296,6 +480,40 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
+    fn test_strip_verbatim_prefix() {
+        assert_eq!(
+            strip_verbatim(PathBuf::from(r"\\?\C:\dir")),
+            PathBuf::from(r"C:\dir")
+        );
+        assert_eq!(
+            strip_verbatim(PathBuf::from(r"\\?\UNC\server\share\dir")),
+            PathBuf::from(r"\\server\share\dir")
+        );
+        assert_eq!(
+            strip_verbatim(PathBuf::from(r"C:\plain")),
+            PathBuf::from(r"C:\plain")
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_network_share_root_is_filesystem_root() {
+        // `\\server\share\` (and a mapped drive letter, which canonicalizes
+        // to it) is the root of a remote volume and must be refused.
+        assert!(strip_verbatim(PathBuf::from(r"\\?\UNC\server\share\"))
+            .parent()
+            .is_none());
+        let share = Path::new(r"\\localhost\C$\");
+        if share.exists() {
+            let err = validate_delete_target(share, true)
+                .err()
+                .expect("must refuse");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        }
+    }
+
+    #[test]
     fn test_sanitize_path_resolves_canonical() {
         let temp = create_test_dir();
         let canonical = sanitize_path(&temp).unwrap();
@@ -357,6 +575,51 @@ mod tests {
         assert!(!is_protected_path(Path::new(
             r"C:\Users\test\somecustomdir"
         )));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_is_protected_path_blocks_more_profile_folders() {
+        for sub in ["OneDrive", "Saved Games", "Favorites", "Links", ".ssh"] {
+            let path = format!(r"C:\Users\test\{sub}");
+            assert!(is_protected_path(Path::new(&path)), "{path}");
+        }
+        assert!(!is_protected_path(Path::new(
+            r"C:\Users\test\OneDrive\old-project"
+        )));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_relocated_profile_and_redirected_folders_are_protected() {
+        // A profile outside <SystemDrive>\Users and a Documents folder
+        // redirected to another drive must be protected themselves, while
+        // their contents stay deletable.
+        let cfg = ProtectedConfig {
+            prefixes: vec![r"c:\windows".into(), r"c:\users".into()],
+            users_index: 1,
+            exact: exact_entries(Some(r"D:\Profiles\Bob"), [r"E:\Docs".to_string()]),
+        };
+        assert!(is_protected_with(&cfg, Path::new(r"D:\Profiles\Bob")));
+        assert!(is_protected_with(
+            &cfg,
+            Path::new(r"d:\profiles\bob\Desktop")
+        ));
+        assert!(is_protected_with(
+            &cfg,
+            Path::new(r"D:\Profiles\Bob\AppData\Local")
+        ));
+        assert!(is_protected_with(&cfg, Path::new(r"E:\Docs")));
+        assert!(!is_protected_with(&cfg, Path::new(r"E:\Docs\project")));
+        assert!(!is_protected_with(&cfg, Path::new(r"D:\Profiles\Bob\code")));
+        assert!(!is_protected_with(&cfg, Path::new(r"D:\Profiles")));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_known_folders_of_current_user_are_protected() {
+        let documents = known_folders::path(&known_folders::DOCUMENTS).expect("Documents");
+        assert!(is_protected_path(Path::new(&documents)), "{documents}");
     }
 
     #[test]

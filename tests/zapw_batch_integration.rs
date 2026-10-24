@@ -60,6 +60,50 @@ fn zapw_batch_deletes_50_explorer_style_processes() {
     let _ = fs::remove_dir_all(&batch_root);
 }
 
+/// Launches with different options must never merge: a path sent with a
+/// non-destructive verb must not be deleted by a concurrent delete leader.
+#[test]
+fn zapw_batch_does_not_merge_different_verbs() {
+    let data_root = unique_root("zapw-batch-verbs-data");
+    let batch_root = unique_root("zapw-batch-verbs-state");
+    fs::create_dir_all(&data_root).unwrap();
+    fs::create_dir_all(&batch_root).unwrap();
+    let doomed = data_root.join("delete-me.txt");
+    let kept = data_root.join("preview-only.txt");
+    fs::write(&doomed, "x").unwrap();
+    fs::write(&kept, "x").unwrap();
+
+    let exe = env!("CARGO_BIN_EXE_zapw");
+    let launch = |extra: &[&str], path: &PathBuf| {
+        let status = Command::new(exe)
+            .env("ZAP_BATCH_ROOT", &batch_root)
+            .args(["--batch", "--silent", "--yes"])
+            .args(extra)
+            .arg(path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    };
+    launch(&[], &doomed);
+    launch(&["--dry-run"], &kept);
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline && doomed.exists() {
+        thread::sleep(Duration::from_millis(100));
+    }
+    // Give a (wrongly) merged leader time to reach the second path too.
+    thread::sleep(Duration::from_secs(2));
+
+    assert!(!doomed.exists(), "delete verb must still delete its path");
+    assert!(
+        kept.exists(),
+        "dry-run path was deleted by the delete leader"
+    );
+
+    let _ = fs::remove_dir_all(&data_root);
+    let _ = fs::remove_dir_all(&batch_root);
+}
+
 #[test]
 fn zapw_batch_deletes_50_processes_with_slow_explorer_launch() {
     let data_root = unique_root("zapw-batch-slow-data");

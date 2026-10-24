@@ -14,12 +14,8 @@ pub const BATCH_MAX_POLLS: usize = 120;
 const MAX_BATCH_FILES: usize = 16_384;
 const MAX_BATCH_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_BATCH_PATHS: usize = 100_000;
-const MAX_ENCODED_PATH_BYTES: usize = 64 * 1024;
-
-/// Lock file name shared across all binaries so they coordinate with
-/// each other instead of having separate lock scopes.
-pub const LOCK_FILE_NAME: &str = "zap-batch.lock";
-pub const PATHS_DIR_NAME: &str = "zap-batch-paths.d";
+/// Longest Windows path (32 767 UTF-16 units) at four hex digits per unit.
+const MAX_ENCODED_PATH_BYTES: usize = 4 * 32_768;
 
 /// Returns the batch coordination root. Respects `ZAP_BATCH_ROOT` for
 /// test isolation; defaults to `%TEMP%` when the env var is unset.
@@ -29,14 +25,35 @@ pub fn batch_root() -> PathBuf {
         .unwrap_or_else(|_| std::env::temp_dir())
 }
 
-/// Returns the batch paths directory within the batch root.
-pub fn batch_paths_dir() -> PathBuf {
-    batch_root().join(PATHS_DIR_NAME)
+/// Stable identifier of one batch scope: the binary plus every option that
+/// changes what happens to the collected paths.
+///
+/// Only launches with the same scope may merge. A shared scope let a path
+/// sent to "Move to Recycle Bin" (or to the confirmation dialog) be picked
+/// up by a running "Delete permanently" leader and erased silently.
+pub fn batch_scope(binary: &str, config: &str) -> String {
+    // FNV-1a: deterministic across processes and builds, unlike `Hash`.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &byte in binary
+        .as_bytes()
+        .iter()
+        .chain(b"\0")
+        .chain(config.as_bytes())
+    {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{binary}-{hash:016x}")
 }
 
-/// Returns the batch lock file path within the batch root.
-pub fn batch_lock_file() -> PathBuf {
-    batch_root().join(LOCK_FILE_NAME)
+/// Returns the batch paths directory for `scope` within the batch root.
+pub fn batch_paths_dir(scope: &str) -> PathBuf {
+    batch_root().join(format!("zap-batch-paths-{scope}.d"))
+}
+
+/// Returns the batch lock file for `scope` within the batch root.
+pub fn batch_lock_file(scope: &str) -> PathBuf {
+    batch_root().join(format!("zap-batch-{scope}.lock"))
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -70,6 +87,59 @@ fn hex_byte(b: u8) -> Option<u8> {
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
     }
+}
+
+/// One batch line per path, in the platform's native, lossless unit:
+/// UTF-16 code units on Windows (four hex digits each), raw bytes on Unix.
+/// Decoding goes through safe constructors only — a corrupted or hostile
+/// batch file can yield a wrong path, never undefined behavior.
+#[cfg(windows)]
+fn encode_path(path: &Path) -> String {
+    use std::os::windows::ffi::OsStrExt;
+    let bytes: Vec<u8> = path
+        .as_os_str()
+        .encode_wide()
+        .flat_map(u16::to_be_bytes)
+        .collect();
+    hex_encode(&bytes)
+}
+
+#[cfg(windows)]
+fn decode_path(line: &str) -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    let bytes = hex_decode(line)?;
+    if !bytes.len().is_multiple_of(2) {
+        return None;
+    }
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+        .collect();
+    Some(PathBuf::from(std::ffi::OsString::from_wide(&units)))
+}
+
+#[cfg(unix)]
+fn encode_path(path: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    hex_encode(path.as_os_str().as_bytes())
+}
+
+#[cfg(unix)]
+fn decode_path(line: &str) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    Some(PathBuf::from(std::ffi::OsString::from_vec(hex_decode(
+        line,
+    )?)))
+}
+
+#[cfg(not(any(windows, unix)))]
+fn encode_path(path: &Path) -> String {
+    hex_encode(path.to_string_lossy().as_bytes())
+}
+
+#[cfg(not(any(windows, unix)))]
+fn decode_path(line: &str) -> Option<PathBuf> {
+    String::from_utf8(hex_decode(line)?).ok().map(PathBuf::from)
 }
 
 #[inline]
@@ -122,8 +192,7 @@ pub fn write_batch_paths(paths_dir: &Path, paths: &[PathBuf]) -> io::Result<()> 
             Ok(file) => {
                 let mut writer = BufWriter::with_capacity(64 * 1024, file);
                 for p in paths {
-                    let encoded = hex_encode(p.as_os_str().as_encoded_bytes());
-                    writeln!(writer, "{encoded}")?;
+                    writeln!(writer, "{}", encode_path(p))?;
                 }
                 writer.flush()?;
                 drop(writer);
@@ -146,6 +215,10 @@ pub fn write_batch_paths(paths_dir: &Path, paths: &[PathBuf]) -> io::Result<()> 
     ))
 }
 
+/// Read and *claim* every committed batch file: each file is renamed to a
+/// private name before it is read, so a path is handed to exactly one
+/// reader even when an old leader and a new one look at the directory at
+/// the same time. Repeated calls therefore return only new arrivals.
 pub fn read_batch_paths(paths_dir: &Path) -> Vec<PathBuf> {
     let mut files: Vec<_> = fs::read_dir(paths_dir)
         .into_iter()
@@ -162,33 +235,56 @@ pub fn read_batch_paths(paths_dir: &Path) -> Vec<PathBuf> {
         .collect();
 
     files.sort_unstable();
+    let pid = std::process::id();
     let mut paths = Vec::new();
-    'files: for file in files {
-        let Ok(file) = File::open(file) else {
-            continue;
-        };
-        for line in BufReader::new(file).lines() {
-            if paths.len() >= MAX_BATCH_PATHS {
-                break 'files;
-            }
-            let Ok(line) = line else {
-                break;
-            };
-            if line.is_empty() || line.len() > MAX_ENCODED_PATH_BYTES {
-                continue;
-            }
-            let Some(bytes) = hex_decode(&line) else {
-                continue;
-            };
-            // SAFETY: encoded bytes came from an OS string and the exact
-            // roundtrip below rejects malformed platform encodings.
-            let os_str = unsafe { std::ffi::OsString::from_encoded_bytes_unchecked(bytes.clone()) };
-            if os_str.as_encoded_bytes() == bytes {
-                paths.push(PathBuf::from(os_str));
-            }
+    for committed in files {
+        if paths.len() >= MAX_BATCH_PATHS {
+            break; // unclaimed files stay for the next read
         }
+        let mut claimed = committed.clone().into_os_string();
+        claimed.push(format!(".{pid}.claim"));
+        let claimed = PathBuf::from(claimed);
+        if fs::rename(&committed, &claimed).is_err() {
+            continue; // another reader claimed it first
+        }
+        read_claimed_file(&claimed, &mut paths);
+        let _ = fs::remove_file(&claimed);
     }
     paths
+}
+
+fn read_claimed_file(claimed: &Path, paths: &mut Vec<PathBuf>) {
+    let Ok(file) = File::open(claimed) else {
+        return;
+    };
+    for line in BufReader::new(file).lines() {
+        if paths.len() >= MAX_BATCH_PATHS {
+            return;
+        }
+        let Ok(line) = line else {
+            break;
+        };
+        if line.is_empty() || line.len() > MAX_ENCODED_PATH_BYTES {
+            continue;
+        }
+        if let Some(path) = decode_path(&line) {
+            paths.push(path);
+        }
+    }
+}
+
+/// End a leader's session without losing late arrivals.
+///
+/// The lock goes first, so every launch from now on becomes a new leader
+/// instead of handing its paths to us and exiting. Whatever was committed
+/// before that is claimed and returned for processing. The directory is
+/// removed only if empty: files of a new leader must survive.
+pub fn release_and_collect(paths_dir: &Path, lock_file: &Path, lock: Option<File>) -> Vec<PathBuf> {
+    drop(lock);
+    let _ = fs::remove_file(lock_file);
+    let rest = read_batch_paths(paths_dir);
+    let _ = fs::remove_dir(paths_dir);
+    rest
 }
 
 pub fn cleanup_stale_batch(paths_dir: &Path, lock_file: &Path) {
@@ -337,6 +433,66 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
+    fn test_batch_paths_roundtrip_unpaired_surrogates_and_reject_garbage() {
+        use std::os::windows::ffi::OsStringExt;
+        let dir = temp_dir();
+        // Valid on NTFS but not valid UTF-16: must survive unchanged.
+        let odd = PathBuf::from(std::ffi::OsString::from_wide(&[
+            b'C' as u16,
+            b':' as u16,
+            b'\\' as u16,
+            0xD800,
+            b'x' as u16,
+        ]));
+        write_batch_paths(&dir, std::slice::from_ref(&odd)).unwrap();
+        // Hand-written garbage: odd digit counts, non-hex, half a unit.
+        fs::write(dir.join("zz-garbage.txt"), "abc\nzzzz\n00410\nf0\n").unwrap();
+        assert_eq!(read_batch_paths(&dir), vec![odd]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_read_batch_paths_claims_each_file_once() {
+        let dir = temp_dir();
+        let first = PathBuf::from(r"C:\first");
+        write_batch_paths(&dir, std::slice::from_ref(&first)).unwrap();
+        assert_eq!(read_batch_paths(&dir), vec![first]);
+        // A second reader (or a later poll) must not get the same path.
+        assert!(read_batch_paths(&dir).is_empty());
+
+        let late = PathBuf::from(r"C:\late");
+        write_batch_paths(&dir, std::slice::from_ref(&late)).unwrap();
+        assert_eq!(read_batch_paths(&dir), vec![late]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_release_and_collect_returns_late_paths_and_frees_scope() {
+        // Regression: a launch that lost the lock race just before the
+        // leader wiped the directory was silently dropped.
+        let dir = temp_dir();
+        let paths_dir = dir.join("paths");
+        let lock_file = dir.join("lock");
+        let lock = try_acquire_lock(&lock_file).unwrap();
+        let late = PathBuf::from(r"C:\late-arrival");
+        write_batch_paths(&paths_dir, std::slice::from_ref(&late)).unwrap();
+        assert!(
+            try_acquire_lock(&lock_file).is_err(),
+            "follower loses the race"
+        );
+
+        assert_eq!(
+            release_and_collect(&paths_dir, &lock_file, Some(lock)),
+            vec![late]
+        );
+        assert!(!paths_dir.exists());
+        // The next launch becomes a leader instead of exiting.
+        assert!(try_acquire_lock(&lock_file).is_ok());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_batch_state_counts_committed_txt_without_metadata() {
         let dir = temp_dir();
         fs::write(dir.join("first.txt"), "00\n").unwrap();
@@ -388,9 +544,19 @@ mod tests {
         let custom = std::env::temp_dir().join(format!("zap-batch-custom-{}", std::process::id()));
         std::env::set_var("ZAP_BATCH_ROOT", &custom);
         // batch_root and derived functions must pick up env at call time
-        assert!(batch_paths_dir().starts_with(&custom));
-        assert!(batch_lock_file().starts_with(&custom));
+        assert!(batch_paths_dir("s").starts_with(&custom));
+        assert!(batch_lock_file("s").starts_with(&custom));
         std::env::remove_var("ZAP_BATCH_ROOT");
+    }
+
+    #[test]
+    fn test_batch_scope_separates_configurations() {
+        let recycle = batch_scope("zapw", "recycle");
+        assert_eq!(recycle, batch_scope("zapw", "recycle"));
+        assert_ne!(recycle, batch_scope("zapw", "delete"));
+        assert_ne!(recycle, batch_scope("zapg", "recycle"));
+        assert_ne!(batch_lock_file(&recycle), batch_lock_file("zapw-other"));
+        assert_ne!(batch_paths_dir(&recycle), batch_paths_dir("zapw-other"));
     }
 
     #[test]

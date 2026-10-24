@@ -232,7 +232,10 @@ impl eframe::App for ZapApp {
         }
 
         let running = self.is_running();
+        // Wait for the Explorer batch to finish arriving: starting earlier
+        // would run on a partial selection the user has not seen.
         let can_start = !running
+            && self.batch_collecting.is_none()
             && !self.items.is_empty()
             && self.thread_error().is_none()
             && (!self.has_dangerous_paths || self.danger_confirmed);
