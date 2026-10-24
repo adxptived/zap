@@ -215,7 +215,6 @@ src/
   stop.rs                  Global graceful-stop signal
   path_utils.rs            Path formatting and dedup helpers
   batch.rs                 Multi-process Explorer batch coordination
-  treemap.rs               Treemap visualization for GUI
   winapi.rs                Windows API helpers
   bin/
     zapg/                  Explorer GUI confirmation dialog

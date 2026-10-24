@@ -1,6 +1,6 @@
 //! Shared directory-size helpers used by dry-run, GUI, and batch output.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Total bytes and entry count of a tree. `entries` counts every file,
 /// link and directory including the root itself — the same unit the
@@ -161,27 +161,11 @@ pub fn format_size(bytes: u64) -> String {
     }
 }
 
-/// Immediate children of `root` with their aggregated sizes, for the
-/// treemap: the rectangles partition the root without double counting.
-/// Child subtrees are sized in parallel with [`tree_stats`].
-pub fn child_sizes(root: &Path) -> std::io::Result<Vec<(PathBuf, u64)>> {
-    use rayon::prelude::*;
-    let children: Vec<PathBuf> = std::fs::read_dir(root)?
-        .filter_map(|entry| entry.ok().map(|e| e.path()))
-        .collect();
-    Ok(children
-        .into_par_iter()
-        .map(|path| {
-            let bytes = tree_stats(&path).bytes;
-            (path, bytes)
-        })
-        .collect())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -219,21 +203,6 @@ mod tests {
                 entries: 1
             }
         );
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn test_child_sizes_partition_root() {
-        let root = temp_dir();
-        let sub = root.join("sub");
-        fs::create_dir_all(sub.join("deeper")).unwrap();
-        fs::write(root.join("top.bin"), vec![0u8; 10]).unwrap();
-        fs::write(sub.join("deeper").join("nested.bin"), vec![0u8; 30]).unwrap();
-
-        let mut entries = child_sizes(&root).unwrap();
-        entries.sort();
-        assert_eq!(entries, vec![(sub, 30), (root.join("top.bin"), 10)]);
 
         let _ = fs::remove_dir_all(&root);
     }

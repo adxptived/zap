@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use eframe::egui::{self, Align, Color32, CornerRadius, Layout, RichText, Stroke};
 use zap::settings::{DefaultMode, Language, MenuLayout};
-use zap::{size, treemap};
+use zap::size;
 
 use crate::app::{should_auto_close, DeleteItem, ItemState, Screen, StatusCounts, ZapApp};
 use crate::i18n::{items_word, pick};
@@ -15,7 +15,6 @@ use crate::{WINDOW_HEIGHT_MAX, WINDOW_HEIGHT_MIN, WINDOW_WIDTH};
 const MARGIN: i8 = 18;
 const ITEM_LIST_MAX_HEIGHT: f32 = 148.0;
 const FAILURE_LIST_MAX_HEIGHT: f32 = 120.0;
-const TREEMAP_HEIGHT: f32 = 260.0;
 const SETTINGS_BODY_MAX_HEIGHT: f32 = 560.0;
 /// How long a successful run stays visible before the dialog closes.
 const SUCCESS_LINGER: Duration = Duration::from_millis(900);
@@ -215,8 +214,7 @@ impl eframe::App for ZapApp {
         let should_repaint = self.is_running()
             || self.total_size_calculating
             || self.batch_session.is_some()
-            || self.batch_collecting.is_some()
-            || self.treemap_collecting;
+            || self.batch_collecting.is_some();
         if should_repaint {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
@@ -259,20 +257,25 @@ impl eframe::App for ZapApp {
                 egui::Frame::central_panel(&ctx.style()).inner_margin(egui::Margin::same(MARGIN)),
             )
             .show(ctx, |ui| {
-                match self.screen {
+                // Measure inside a scope: the panel's own `min_rect` always
+                // spans the whole window, so it could only ever grow — after
+                // the tall settings screen the dialog never shrank back.
+                ui.scope(|ui| match self.screen {
                     Screen::Settings => render_settings(ui, self),
                     Screen::Main if self.items.is_empty() => render_home(ui, ctx, self),
                     Screen::Main => render_dialog(ui, ctx, self, &counts, &progress, can_start),
-                }
-                ui.min_rect().height()
+                })
+                .response
+                .rect
+                .height()
             });
 
         fit_window_to_content(ctx, panel.inner);
     }
 }
 
-/// Size the (non-resizable) window to its content so no state needs a
-/// hand-tuned height constant.
+/// Size the (non-resizable) window to its content — growing *and*
+/// shrinking — so no state needs a hand-tuned height constant.
 fn fit_window_to_content(ctx: &egui::Context, content_height: f32) {
     let target =
         (content_height + 2.0 * f32::from(MARGIN)).clamp(WINDOW_HEIGHT_MIN, WINDOW_HEIGHT_MAX);
@@ -411,11 +414,6 @@ fn render_dialog(
 
     ui.add_space(14.0);
     render_actions(ui, ctx, app, phase, can_start);
-
-    if app.show_treemap {
-        ui.add_space(10.0);
-        render_treemap(ui, app);
-    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1187,31 +1185,17 @@ fn render_actions(
     let pal = Palette::for_ui(ui);
     let lang = app.lang;
     ui.horizontal(|ui| {
-        // Left: secondary tools.
-        if !app.is_running() {
-            if ui
-                .add(egui::Button::new(RichText::new("⚙").color(pal.accent)).frame(false))
-                .on_hover_text(pick(lang, "Settings", "Настройки"))
-                .clicked()
-            {
-                app.open_settings();
-            }
-            let analyzer_label = if app.show_treemap {
-                pick(lang, "Hide space analysis", "Скрыть анализ места")
-            } else {
-                pick(lang, "Space analysis", "Анализ места")
-            };
-            if ui
+        // Left: settings, labelled like on the home screen (a bare gear
+        // was easy to miss). Hidden while a run is active.
+        if !app.is_running()
+            && ui
                 .add(
-                    egui::Button::new(RichText::new(analyzer_label).color(pal.accent)).frame(false),
+                    egui::Button::new(RichText::new(settings_label(lang)).color(pal.accent))
+                        .frame(false),
                 )
                 .clicked()
-            {
-                app.show_treemap = !app.show_treemap;
-                if app.show_treemap {
-                    app.start_treemap_collection();
-                }
-            }
+        {
+            app.open_settings();
         }
 
         // Right: primary + secondary actions.
@@ -1283,28 +1267,6 @@ fn render_actions(
                 }
             }
         });
-    });
-}
-
-fn render_treemap(ui: &mut egui::Ui, app: &mut ZapApp) {
-    let width = ui.available_width();
-    ui.allocate_ui(egui::vec2(width, TREEMAP_HEIGHT), |ui| {
-        ui.set_min_height(TREEMAP_HEIGHT);
-        // Render while holding the lock — the snapshot is only read here,
-        // which avoids cloning every frame. Entries are pre-sorted and
-        // capped by the collection thread; total is pre-computed.
-        let guard = app.treemap_data.lock().unwrap();
-        match guard.as_ref() {
-            Some(snapshot) => {
-                app.treemap_collecting = false;
-                treemap::treemap_ui(ui, &snapshot.entries, snapshot.total);
-            }
-            None => {
-                ui.centered_and_justified(|ui| {
-                    ui.add(egui::Spinner::new());
-                });
-            }
-        }
     });
 }
 

@@ -93,18 +93,6 @@ pub enum WorkerEvent {
     Finished(Duration),
 }
 
-/// Treemap payload prepared once by the collection thread: entries are
-/// pre-sorted by size descending and truncated to the layout cap, and the
-/// total is pre-computed — so per-frame rendering never sorts or sums the
-/// (potentially huge) raw entry list.
-pub struct TreemapSnapshot {
-    pub entries: Vec<(PathBuf, u64)>,
-    pub total: u64,
-}
-
-/// Treemap data shared with the collection thread.
-pub type TreemapData = Arc<Mutex<Option<TreemapSnapshot>>>;
-
 /// Per-root byte sizes computed by the background size thread. Used both for
 /// the size badge (sum) and for byte-weighted progress/ETA: on mixed
 /// selections (a few huge folders + many small files) weighting by bytes is
@@ -159,9 +147,6 @@ pub struct ZapApp {
     pub taskbar: Option<crate::taskbar::TaskbarProgress>,
     #[cfg(windows)]
     pub taskbar_unavailable: bool,
-    pub show_treemap: bool,
-    pub treemap_data: TreemapData,
-    pub treemap_collecting: bool,
     /// Batch result receiver — window opens instantly, batch paths arrive
     /// asynchronously from the background collection thread.
     pub batch_collecting: Option<BatchReceiver>,
@@ -231,9 +216,6 @@ impl ZapApp {
                 .unwrap_or_else(Instant::now),
             has_dangerous_paths: has_dangerous,
             danger_confirmed: false,
-            show_treemap: false,
-            treemap_data: Arc::new(Mutex::new(None)),
-            treemap_collecting: false,
             batch_collecting: None,
             settings: Settings::default(),
             settings_draft: Settings::default(),
@@ -780,10 +762,6 @@ impl ZapApp {
         if let Ok(mut sizes) = self.item_sizes.lock() {
             *sizes = None;
         }
-        if let Ok(mut treemap) = self.treemap_data.lock() {
-            *treemap = None;
-        }
-        self.treemap_collecting = false;
         let generation = self.size_generation.fetch_add(1, Ordering::AcqRel) + 1;
         let size_paths: Vec<PathBuf> = self.items.iter().map(|item| item.path.clone()).collect();
         spawn_size_calculation(
@@ -793,29 +771,6 @@ impl ZapApp {
             generation,
             size_paths,
         );
-        if self.show_treemap {
-            self.start_treemap_collection();
-        }
-    }
-
-    /// Kick off background collection of treemap data (immediate children
-    /// of each selected root with aggregated sizes — no double counting).
-    pub fn start_treemap_collection(&mut self) {
-        if self.treemap_collecting || self.treemap_data.lock().unwrap().is_some() {
-            return;
-        }
-        self.treemap_collecting = true;
-        let data_handle = Arc::clone(&self.treemap_data);
-        let roots: Vec<PathBuf> = self.items.iter().map(|i| i.path.clone()).collect();
-        thread::spawn(move || {
-            let mut entries = collect_treemap_entries(&roots);
-            // Sort/sum once here so every render frame works on a small,
-            // ready-to-layout slice instead of the raw entry list.
-            let total: u64 = entries.iter().map(|(_, sz)| sz).sum();
-            entries.sort_by_key(|(_, sz)| std::cmp::Reverse(*sz));
-            entries.truncate(zap::treemap::MAX_LAYOUT_ITEMS);
-            *data_handle.lock().unwrap() = Some(TreemapSnapshot { entries, total });
-        });
     }
 }
 
@@ -1048,27 +1003,6 @@ fn spawn_size_calculation(
     });
 }
 
-/// Build treemap entries from the selected roots. For each directory root
-/// the *immediate children* are used (sizes aggregated per subtree), so the
-/// rectangles partition the selection without double counting files inside
-/// their parent directories.
-fn collect_treemap_entries(roots: &[PathBuf]) -> Vec<(PathBuf, u64)> {
-    let mut entries = Vec::new();
-    for root in roots {
-        match fs::symlink_metadata(root) {
-            Ok(meta) if meta.is_dir() => match size::child_sizes(root) {
-                // Empty dir — show the root itself.
-                Ok(children) if children.is_empty() => entries.push((root.clone(), 0)),
-                Ok(children) => entries.extend(children),
-                Err(_) => {}
-            },
-            Ok(meta) => entries.push((root.clone(), meta.len())),
-            Err(_) => {}
-        }
-    }
-    entries
-}
-
 pub fn run_delete_path(
     path: &Path,
     threads: Option<usize>,
@@ -1265,50 +1199,6 @@ mod tests {
             !app.danger_confirmed,
             "new dangerous path needs a fresh confirmation"
         );
-    }
-
-    #[test]
-    fn treemap_entries_use_immediate_children_without_double_counting() {
-        let root = std::env::temp_dir().join(format!(
-            "zapg-treemap-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = fs::remove_dir_all(&root);
-        let sub = root.join("sub");
-        fs::create_dir_all(&sub).unwrap();
-        fs::write(root.join("top.bin"), vec![0u8; 10]).unwrap();
-        fs::write(sub.join("nested.bin"), vec![0u8; 30]).unwrap();
-
-        let entries = collect_treemap_entries(std::slice::from_ref(&root));
-        let total: u64 = entries.iter().map(|(_, sz)| sz).sum();
-        assert_eq!(total, 40, "children must partition the root exactly");
-        assert!(entries.iter().any(|(p, sz)| p == &sub && *sz == 30));
-        assert!(entries
-            .iter()
-            .any(|(p, sz)| p.ends_with("top.bin") && *sz == 10));
-        // The root itself must NOT be present alongside its children.
-        assert!(!entries.iter().any(|(p, _)| p == &root));
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn treemap_entries_for_file_root_uses_file_size() {
-        let root =
-            std::env::temp_dir().join(format!("zapg-treemap-file-test-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
-        let file = root.join("alone.bin");
-        fs::write(&file, vec![0u8; 17]).unwrap();
-
-        let entries = collect_treemap_entries(std::slice::from_ref(&file));
-        assert_eq!(entries, vec![(file.clone(), 17)]);
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

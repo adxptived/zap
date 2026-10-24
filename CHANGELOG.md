@@ -4,7 +4,28 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+### Removed
+
+- **Space analysis (treemap) in the deletion dialog** — the dialog is for
+  confirming a deletion; the treemap and its background size walk are gone.
+
 ### Fixed
+
+- **Dialog stayed tall after visiting Settings** — the window could only
+  grow: the content was measured on the central panel, whose size always
+  equals the window. It is now measured on its own, so the window shrinks
+  back as well. The settings link in the dialog is labelled like on the
+  home screen instead of being a bare gear icon.
+- **Secure delete overwrote hard-linked data** outside the deleted folder;
+  hard-linked files are now only unlinked.
+- **Filtered runs (`--include`/`--exclude`) always reported failure**
+  ("directory not empty") although the right files were deleted.
+- **Tree deletion is fully handle-relative**, so a junction swapped in
+  mid-run cannot redirect the traversal or a single delete.
+- **Explorer batches no longer lose late launches**, and paths skipped by
+  Ctrl+C are journaled as cancelled, not deleted.
+- **More protected folders**: OneDrive, Saved Games, Favorites, Links,
+  Contacts, Searches, `.ssh`, relocated profiles and redirected folders.
 
 - **No more UAC prompt on every context-menu action** — zapg and zapw
   manifests requested `requireAdministrator`, so every Explorer action asked

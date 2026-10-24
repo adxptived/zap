@@ -16,6 +16,5 @@ pub mod size;
 pub mod stop;
 #[cfg(windows)]
 mod tree_delete;
-pub mod treemap;
 #[cfg(windows)]
 pub mod winapi;
