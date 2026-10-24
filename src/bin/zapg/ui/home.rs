@@ -25,7 +25,7 @@ pub(super) fn render_home(ui: &mut egui::Ui, ctx: &egui::Context, app: &mut ZapA
     );
     let painter = ui.painter();
     painter.rect_filled(rect, CornerRadius::same(10), pal.card);
-    let dash = Stroke::new(1.5, pal.muted.gamma_multiply(0.6));
+    let dash = Stroke::new(1.5_f32, pal.muted.gamma_multiply(0.6));
     let r = rect.shrink(1.0);
     for (a, b) in [
         (r.left_top(), r.right_top()),

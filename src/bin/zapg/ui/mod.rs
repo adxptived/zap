@@ -162,7 +162,7 @@ fn fit_window_to_content(ctx: &egui::Context, content_height: f32) {
 fn card(fill: Color32, stroke: Color32) -> egui::Frame {
     egui::Frame::default()
         .fill(fill)
-        .stroke(Stroke::new(1.0, stroke))
+        .stroke(Stroke::new(1.0_f32, stroke))
         .corner_radius(CornerRadius::same(8))
         .inner_margin(egui::Margin::symmetric(10, 8))
 }

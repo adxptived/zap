@@ -220,7 +220,7 @@ pub(super) fn section(ui: &mut egui::Ui, pal: &Palette, title: &str) {
     ui.painter().hline(
         rect.x_range(),
         rect.top(),
-        Stroke::new(1.0, pal.card_stroke),
+        Stroke::new(1.0_f32, pal.card_stroke),
     );
     ui.add_space(6.0);
 }
@@ -253,7 +253,7 @@ pub(super) fn render_menu_preview(
                 ui.painter().hline(
                     (rect.left() + 24.0)..=rect.right(),
                     rect.top() + 1.0,
-                    Stroke::new(1.0, pal.card_stroke),
+                    Stroke::new(1.0_f32, pal.card_stroke),
                 );
                 ui.add_space(4.0);
             }

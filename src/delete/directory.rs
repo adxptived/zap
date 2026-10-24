@@ -299,13 +299,16 @@ fn delete_directory_pipeline(path: &Path, bar: Option<ProgressBar>, shred: bool)
         b.set_message(format!("Deleting dirs ({})", scan_result.stats.dirs));
     }
 
+    // A file that could not be removed keeps its ancestors non-empty. That
+    // failure is already reported once; counting every ancestor too would
+    // bury it in a cascade (the Windows tree delete avoids it the same way).
     let dir_errors = AtomicU64::new(0);
     delete_dir_batches(
         &scan_result.dirs_by_depth,
         &dir_errors,
         &failures,
         bar.as_ref(),
-        false,
+        file_errors.load(Ordering::Relaxed) > 0,
     );
 
     finalize(

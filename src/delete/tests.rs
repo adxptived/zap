@@ -362,6 +362,10 @@ fn test_delete_directory_handles_very_deep_tree() {
 }
 
 #[test]
+// Windows semantics: the read-only attribute on a directory does not
+// protect its entries. On Unix a non-writable directory does — exactly
+// as for `rm -rf` — so this case is Windows-only.
+#[cfg(windows)]
 fn test_delete_directory_large_flat_dir_and_readonly_subdirs() {
     let temp = create_test_dir();
     let flat = temp.join("flat");

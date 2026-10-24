@@ -97,12 +97,12 @@ pub(super) fn tune_visuals(mut v: egui::Visuals) -> egui::Visuals {
         v.faint_bg_color = Color32::from_rgb(34, 37, 43);
         v.widgets.inactive.bg_fill = widget;
         v.widgets.inactive.weak_bg_fill = widget;
-        v.widgets.inactive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(62, 66, 76));
+        v.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, Color32::from_rgb(62, 66, 76));
         v.widgets.hovered.bg_fill = hover;
         v.widgets.hovered.weak_bg_fill = hover;
-        v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(56, 60, 70));
-        v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, Color32::from_rgb(222, 224, 230));
-        v.widgets.inactive.fg_stroke = Stroke::new(1.0, Color32::from_rgb(210, 213, 220));
+        v.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, Color32::from_rgb(56, 60, 70));
+        v.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, Color32::from_rgb(222, 224, 230));
+        v.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, Color32::from_rgb(210, 213, 220));
         v.selection.bg_fill = Color32::from_rgb(52, 98, 176);
     } else {
         let panel = Color32::from_rgb(246, 247, 249);
@@ -112,7 +112,7 @@ pub(super) fn tune_visuals(mut v: egui::Visuals) -> egui::Visuals {
         v.widgets.inactive.weak_bg_fill = Color32::from_rgb(232, 235, 240);
         v.widgets.inactive.bg_fill = Color32::from_rgb(232, 235, 240);
         v.widgets.hovered.weak_bg_fill = Color32::from_rgb(222, 226, 233);
-        v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, Color32::from_rgb(32, 35, 42));
+        v.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, Color32::from_rgb(32, 35, 42));
         v.selection.bg_fill = Color32::from_rgb(64, 120, 220);
     }
     v
