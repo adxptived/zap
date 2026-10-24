@@ -4,6 +4,7 @@ pub mod context_menu;
 pub mod delete;
 pub mod filter;
 pub mod journal;
+pub mod messages;
 pub mod parallelism;
 pub mod path_utils;
 pub mod protect;

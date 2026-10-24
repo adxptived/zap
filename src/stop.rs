@@ -85,7 +85,7 @@ mod tests {
 
     #[test]
     fn wait_if_paused_returns_immediately_when_not_paused() {
-        let _guard = SERIAL.lock().unwrap();
+        let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
         reset();
         let start = std::time::Instant::now();
         wait_if_paused();
@@ -94,7 +94,7 @@ mod tests {
 
     #[test]
     fn stop_wins_over_pause() {
-        let _guard = SERIAL.lock().unwrap();
+        let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
         reset();
         request_pause();
         request_stop();
@@ -109,7 +109,7 @@ mod tests {
 
     #[test]
     fn resume_unblocks_paused_wait() {
-        let _guard = SERIAL.lock().unwrap();
+        let _guard = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
         reset();
         request_pause();
         let waiter = std::thread::spawn(wait_if_paused);

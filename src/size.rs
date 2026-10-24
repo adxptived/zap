@@ -2,13 +2,45 @@
 
 use std::path::Path;
 
-/// Total bytes and entry count of a tree. `entries` counts every file,
-/// link and directory including the root itself — the same unit the
-/// deletion progress counter uses, so `removed / entries` is a percentage.
+/// Size and composition of a tree. `entries` counts every file, link and
+/// directory including the root itself — the same unit the deletion
+/// progress counter uses, so `removed / entries` is a percentage — and is
+/// always `files + dirs + links`. Links (symlinks, junctions) are counted,
+/// never followed, and add no bytes.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct TreeStats {
     pub bytes: u64,
     pub entries: u64,
+    pub files: u64,
+    pub dirs: u64,
+    pub links: u64,
+}
+
+impl TreeStats {
+    pub fn file(bytes: u64) -> Self {
+        Self {
+            bytes,
+            entries: 1,
+            files: 1,
+            ..Self::default()
+        }
+    }
+
+    pub fn dir() -> Self {
+        Self {
+            entries: 1,
+            dirs: 1,
+            ..Self::default()
+        }
+    }
+
+    pub fn link() -> Self {
+        Self {
+            entries: 1,
+            links: 1,
+            ..Self::default()
+        }
+    }
 }
 
 impl std::ops::Add for TreeStats {
@@ -17,7 +49,16 @@ impl std::ops::Add for TreeStats {
         Self {
             bytes: self.bytes + other.bytes,
             entries: self.entries + other.entries,
+            files: self.files + other.files,
+            dirs: self.dirs + other.dirs,
+            links: self.links + other.links,
         }
+    }
+}
+
+impl std::ops::AddAssign for TreeStats {
+    fn add_assign(&mut self, other: Self) {
+        *self = *self + other;
     }
 }
 
@@ -28,11 +69,11 @@ pub fn tree_stats(path: &Path) -> TreeStats {
     let Ok(meta) = std::fs::symlink_metadata(path) else {
         return TreeStats::default();
     };
-    if !meta.is_dir() || meta.file_type().is_symlink() {
-        return TreeStats {
-            bytes: if meta.is_file() { meta.len() } else { 0 },
-            entries: 1,
-        };
+    if meta.file_type().is_symlink() {
+        return TreeStats::link();
+    }
+    if !meta.is_dir() {
+        return TreeStats::file(if meta.is_file() { meta.len() } else { 0 });
     }
     #[cfg(windows)]
     {
@@ -48,31 +89,39 @@ pub fn tree_stats(path: &Path) -> TreeStats {
             .into_iter()
             .filter_map(|e| e.ok())
         {
-            stats.entries += 1;
-            if entry.file_type().is_file() {
-                stats.bytes += entry.metadata().map(|m| m.len()).unwrap_or(0);
-            }
+            let ft = entry.file_type();
+            stats += if ft.is_symlink() {
+                TreeStats::link()
+            } else if ft.is_dir() {
+                TreeStats::dir()
+            } else {
+                TreeStats::file(entry.metadata().map(|m| m.len()).unwrap_or(0))
+            };
         }
         stats
+    }
+}
+
+/// Stats contribution of one non-directory listing entry.
+#[cfg(windows)]
+fn leaf_stats(entry: &crate::winapi::RawDirEntry<'_>) -> TreeStats {
+    if entry.is_reparse_point() {
+        TreeStats::link()
+    } else {
+        TreeStats::file(entry.size)
     }
 }
 
 #[cfg(windows)]
 fn tree_stats_dir(dir: &Path, depth: usize) -> TreeStats {
     use rayon::prelude::*;
-    let mut stats = TreeStats {
-        bytes: 0,
-        entries: 1,
-    };
+    let mut stats = TreeStats::dir();
     let mut subdirs = Vec::new();
     let _ = crate::winapi::for_each_dir_entry(dir, |entry| {
         if entry.is_dir() && !entry.is_reparse_point() {
             subdirs.push(crate::winapi::join_wide(dir, entry.name));
         } else {
-            stats.entries += 1;
-            if !entry.is_reparse_point() {
-                stats.bytes += entry.size;
-            }
+            stats += leaf_stats(&entry);
         }
     });
     // Same depth guard as tree_delete: past it, recurse sequentially on
@@ -92,15 +141,12 @@ fn tree_stats_dir(dir: &Path, depth: usize) -> TreeStats {
 fn tree_stats_iterative(mut pending: Vec<std::path::PathBuf>) -> TreeStats {
     let mut stats = TreeStats::default();
     while let Some(dir) = pending.pop() {
-        stats.entries += 1;
+        stats += TreeStats::dir();
         let _ = crate::winapi::for_each_dir_entry(&dir, |entry| {
             if entry.is_dir() && !entry.is_reparse_point() {
                 pending.push(crate::winapi::join_wide(&dir, entry.name));
             } else {
-                stats.entries += 1;
-                if !entry.is_reparse_point() {
-                    stats.bytes += entry.size;
-                }
+                stats += leaf_stats(&entry);
             }
         });
     }
@@ -192,16 +238,39 @@ mod tests {
             stats,
             TreeStats {
                 bytes: 30,
-                entries: 4
+                entries: 4,
+                files: 2,
+                dirs: 2,
+                links: 0,
             }
         );
         assert_eq!(dir_size_recursive(&root), 30);
+        assert_eq!(tree_stats(&root.join("a.bin")), TreeStats::file(10));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_tree_stats_counts_junctions_as_links_without_following() {
+        let root = temp_dir();
+        let target = root.join("target");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("big.bin"), vec![0u8; 100]).unwrap();
+        let tree = root.join("tree");
+        fs::create_dir(&tree).unwrap();
+        let status = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(tree.join("link"))
+            .arg(&target)
+            .output()
+            .unwrap();
+        assert!(status.status.success());
+
+        let stats = tree_stats(&tree);
         assert_eq!(
-            tree_stats(&root.join("a.bin")),
-            TreeStats {
-                bytes: 10,
-                entries: 1
-            }
+            (stats.dirs, stats.links, stats.files, stats.bytes),
+            (1, 1, 0, 0)
         );
 
         let _ = fs::remove_dir_all(&root);

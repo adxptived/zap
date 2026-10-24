@@ -428,8 +428,91 @@ fn is_protected_with(cfg: &ProtectedConfig, path: &Path) -> bool {
 }
 
 #[cfg(not(windows))]
-pub fn is_protected_path(_path: &Path) -> bool {
-    false
+pub fn is_protected_path(path: &Path) -> bool {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    is_protected_unix(path, home.as_deref())
+}
+
+/// Unix system trees: protected together with everything inside them.
+const UNIX_PROTECTED_TREES: &[&str] = &[
+    "/bin",
+    "/boot",
+    "/dev",
+    "/etc",
+    "/lib",
+    "/lib32",
+    "/lib64",
+    "/libx32",
+    "/proc",
+    "/run",
+    "/sbin",
+    "/sys",
+    "/usr",
+    "/System",
+    "/private/etc",
+];
+
+/// Unix folders protected themselves; their contents stay deletable.
+const UNIX_PROTECTED_FOLDERS: &[&str] = &[
+    "/home",
+    "/root",
+    "/opt",
+    "/srv",
+    "/mnt",
+    "/media",
+    "/tmp",
+    "/var",
+    "/var/lib",
+    "/var/log",
+    "/var/tmp",
+    "/Users",
+    "/Library",
+    "/Applications",
+    "/Volumes",
+    "/private",
+    "/private/tmp",
+    "/private/var",
+];
+
+/// Folders of the user's home protected themselves.
+const UNIX_HOME_FOLDERS: &[&str] = &[
+    "Desktop",
+    "Documents",
+    "Downloads",
+    "Pictures",
+    "Music",
+    "Videos",
+    "Movies",
+    "Public",
+    "Templates",
+    ".ssh",
+    ".gnupg",
+    ".config",
+    ".local",
+    ".local/share",
+    "Library",
+];
+
+/// Pure core of the Unix check (`path` is canonical). Compiled on every
+/// platform so its tests run everywhere; only non-Windows builds call it.
+#[cfg_attr(windows, allow(dead_code))]
+fn is_protected_unix(path: &Path, home: Option<&Path>) -> bool {
+    if UNIX_PROTECTED_TREES
+        .iter()
+        .any(|tree| path.starts_with(tree))
+    {
+        return true;
+    }
+    if UNIX_PROTECTED_FOLDERS
+        .iter()
+        .any(|dir| path == Path::new(dir))
+    {
+        return true;
+    }
+    home.filter(|home| home.parent().is_some())
+        .is_some_and(|home| {
+            path == home || UNIX_HOME_FOLDERS.iter().any(|dir| path == home.join(dir))
+        })
 }
 
 #[cfg(test)]
@@ -620,6 +703,34 @@ mod tests {
     fn test_known_folders_of_current_user_are_protected() {
         let documents = known_folders::path(&known_folders::DOCUMENTS).expect("Documents");
         assert!(is_protected_path(Path::new(&documents)), "{documents}");
+    }
+
+    #[test]
+    fn test_unix_protection_rules() {
+        let home = Some(Path::new("/home/bob"));
+        let protected = |p: &str| is_protected_unix(Path::new(p), home);
+        // System trees, including their contents.
+        assert!(protected("/usr"));
+        assert!(protected("/usr/lib/libc.so.6"));
+        assert!(protected("/etc/passwd"));
+        assert!(protected("/boot"));
+        // Folders protected themselves, contents deletable.
+        assert!(protected("/home"));
+        assert!(protected("/var"));
+        assert!(protected("/tmp"));
+        assert!(!protected("/tmp/build-cache"));
+        assert!(!protected("/var/cache/apt/archives"));
+        // The user's home and its well-known folders.
+        assert!(protected("/home/bob"));
+        assert!(protected("/home/bob/Documents"));
+        assert!(protected("/home/bob/.ssh"));
+        assert!(protected("/home/bob/.local/share"));
+        assert!(!protected("/home/bob/Documents/old-project"));
+        assert!(!protected("/home/bob/code/node_modules"));
+        // Component-wise, not textual: /usrdata is not /usr.
+        assert!(!protected("/usrdata"));
+        // A HOME of "/" protects nothing extra.
+        assert!(!is_protected_unix(Path::new("/data"), Some(Path::new("/"))));
     }
 
     #[test]

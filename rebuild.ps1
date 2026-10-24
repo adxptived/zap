@@ -88,6 +88,46 @@ function Copy-RequiredFile {
     Copy-Item -LiteralPath $Source -Destination $Destination -Force
 }
 
+# Optional Authenticode signing. Unsigned binaries trip SmartScreen and make
+# a mass-deletion tool look suspicious to antivirus heuristics. Set
+# ZAP_SIGN_CERT_THUMBPRINT to the SHA-1 thumbprint of a code-signing
+# certificate in the certificate store to enable it; ZAP_SIGN_TIMESTAMP_URL
+# overrides the RFC 3161 timestamp server. Without the variable the build
+# is unchanged and unsigned.
+function Find-SignTool {
+    $Command = Get-Command "signtool.exe" -ErrorAction SilentlyContinue
+    if ($Command) {
+        return $Command.Source
+    }
+
+    $KitsBin = "${env:ProgramFiles(x86)}\Windows Kits\10\bin"
+    $Found = Get-ChildItem -LiteralPath $KitsBin -Filter "signtool.exe" -Recurse -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -match '\\x64\\' } |
+        Sort-Object FullName -Descending |
+        Select-Object -First 1
+    if ($Found) {
+        return $Found.FullName
+    }
+
+    throw "signtool.exe not found. Install the Windows SDK or add signtool to PATH."
+}
+
+function Sign-Files {
+    param([string[]]$Paths)
+
+    $Thumbprint = $env:ZAP_SIGN_CERT_THUMBPRINT
+    if (-not $Thumbprint) {
+        Write-Host "Signing skipped (ZAP_SIGN_CERT_THUMBPRINT is not set)." -ForegroundColor DarkGray
+        return
+    }
+
+    Write-Step "Sign $($Paths.Count) file(s)"
+    $SignTool = Find-SignTool
+    $TimestampUrl = if ($env:ZAP_SIGN_TIMESTAMP_URL) { $env:ZAP_SIGN_TIMESTAMP_URL } else { "http://timestamp.digicert.com" }
+    Invoke-Checked $SignTool "sign" "/sha1" $Thumbprint "/fd" "SHA256" "/tr" $TimestampUrl "/td" "SHA256" "/d" "Zap" @Paths
+    Invoke-Checked $SignTool "verify" "/pa" @Paths
+}
+
 function Build-Debug {
     Write-Step "Cargo debug build"
     Invoke-Checked "cargo" "build"
@@ -126,6 +166,12 @@ function Stage-Binaries {
     Copy-RequiredFile (Join-Path $Root "assets\manifests\zapg.exe.manifest") (Join-Path $BinDir "zapg.exe.manifest")
     Copy-RequiredFile (Join-Path $Root "assets\manifests\zapw.exe.manifest") (Join-Path $BinDir "zapw.exe.manifest")
     Copy-RequiredFile (Join-Path $Root "assets\branding\zap.ico") (Join-Path $BinDir "zap.ico")
+
+    Sign-Files @(
+        (Join-Path $BinDir "zap.exe"),
+        (Join-Path $BinDir "zapw.exe"),
+        (Join-Path $BinDir "zapg.exe")
+    )
 }
 
 function Build-Installer {
@@ -136,6 +182,7 @@ function Build-Installer {
     $Version = (Select-String -Path (Join-Path $Root "Cargo.toml") -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
     Invoke-Checked $InnoCompiler "/DMyAppVersion=$Version" (Join-Path $DistDir "zap.iss")
     Require-File $InstallerPath
+    Sign-Files @($InstallerPath)
 }
 
 function Clean-Artifacts {

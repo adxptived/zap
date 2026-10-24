@@ -12,12 +12,13 @@ Source code is organized under `src/`:
 
 - `main.rs` — Entry point of the `zap` binary: arg parsing dispatch, timing, error summary, batch coordination (`run_batch`).
 - `cli.rs` — CLI argument parser (`parse_args`), help/version output, `CliOptions` / `CliAction` types.
-- `delete.rs` — Core deletion logic: parallel file/dir removal via Rayon, retry on `PermissionDenied` (files, dirs, and symlinks), dry-run, symlink handling, shred, only-empty, recycle dispatch.
+- `delete/` — Deletion engine. `mod.rs`: `DeleteOptions`, `delete_path` (validation, symlinks, only-empty, recycle dispatch) and `recycle_paths_validated`; `directory.rs`: whole-tree deletion (Windows fast path, portable pipeline, filtered runs); `bulk.rs`: many top-level files in one pass; `preview.rs`: `preview_path`, the dry run — same validation and filter semantics as a real run, returns `size::TreeStats`; `retry.rs`: single-entry removal with read-only/lock recovery; `report.rs`: capped failure list and summary; `tests.rs`.
+- `messages.rs` — Engine error texts (`entries_failed`, `LOCKED_HINT`) and their Russian translation (`localize`) for zapg/zapw; errors stay English in the CLI and the journal. Also `plural` for Russian noun forms.
 - `scan.rs` — Directory walking with `jwalk::WalkDir` and entry classification (`EntryKind`: `File`, `Dir { depth }`, `Symlink`). Caches metadata in `ScannedEntry`. Used by filtered runs, dry-run and the non-Windows pipeline.
 - `tree_delete.rs` — Windows fast path for unfiltered directory deletion: each Rayon task lists one directory through a `winapi::DirHandle` and deletes its files; nothing below the root is addressed by path — directories are opened, and entries opened for deletion (`open_entry`, as the type the listing reported), relative to the verified parent handle with `FILE_OPEN_REPARSE_POINT`, so a junction swapped in mid-run can redirect neither the traversal nor a single delete. It then recurses into subdirectories in parallel and removes the directory once empty. Reparse points are unlinked, never traversed; a failure is reported once (no cascade to ancestors).
 - `protect.rs` — Protected-path checks (`is_protected_path`), path sanitization (`sanitize_path`), filesystem-root detection.
 - `filter.rs` — Glob pattern filtering (`--include`/`--exclude`), min-size, newer-than/older-than metadata filtering.
-- `recycle.rs` — Windows Recycle Bin integration via `SHFileOperationW`.
+- `recycle.rs` — Windows Recycle Bin integration via `IFileOperation` (hand-written COM, run on its own STA thread): per-item results through a progress sink, progress and stop support, and items the bin cannot take are skipped with an error instead of being deleted permanently.
 - `shred.rs` — Secure file deletion: overwrite with random data then remove. Hard-linked files (link count > 1) are only unlinked, never overwritten — their data belongs to the other names too.
 - `journal.rs` — Append-only operation journal (`%LOCALAPPDATA%\zap\journal.log`, one rotation), written by all three binaries; `zap --journal [N]` prints it.
 - `parallelism.rs` — Shared worker budget (`worker_count`, scan/delete split, queue capacity) and global Rayon pool setup.
@@ -29,7 +30,7 @@ Source code is organized under `src/`:
 - `batch.rs` — Shared batch-coordination infrastructure for multi-process Explorer integration. Paths are stored losslessly (UTF-16 units as hex on Windows) and decoded through safe constructors only. Reads *claim* batch files (rename, then read), and a leader ends with `release_and_collect` (drop the lock first, then claim late arrivals) so no launch is lost.
 - `winapi.rs` — Windows API helpers (directory enumeration, reparse point detection, POSIX force delete, long-path `\\?\` prefixing).
 - `bin/zapw.rs` — Entry point of the `zapw` (windowless) binary. Silent deletion without console window.
-- `bin/zapg/` — `zapg` (GUI) binary: `main.rs` (args, batch coordination, `--settings`/`--register-menu`/`--unregister-menu`), `app.rs` (state, worker), `ui.rs` (dialog, home and settings screens), `i18n.rs` (English/Russian strings as call-site pairs), `taskbar.rs`.
+- `bin/zapg/` — `zapg` (GUI) binary: `main.rs` (args, batch coordination, `--settings`/`--register-menu`/`--unregister-menu`), `app.rs` (state, worker), `ui/` (`mod.rs` frame loop and shared helpers, `theme.rs`, `home.rs`, `dialog.rs`, `settings.rs`), `i18n.rs` (English/Russian strings as call-site pairs), `taskbar.rs`.
 
 The three binaries are declared explicitly in `Cargo.toml` (`[[bin]] name = "zap"` / `"zapw"` / `"zapg"`), so `cargo build` produces `zap.exe`, `zapw.exe`, and `zapg.exe` directly with no rename step.
 
@@ -97,7 +98,7 @@ important user data.
 
 Test coverage by module:
 - `cli.rs` — argument parsing, flag validation (`--yes`, `--dry-run`, `--threads`), error messages, duplicate paths.
-- `delete.rs` — file/dir deletion, readonly retry, symlink handling, dry-run, error reporting, junction safety (`#[cfg(windows)]` only), idempotency.
+- `delete/tests.rs` — file/dir deletion, readonly retry, symlink handling, preview vs. filtered run, error reporting, junction safety (`#[cfg(windows)]` only), idempotency.
 - `scan.rs` — entry classification (`File`/`Dir`/`Symlink`), symlink/junction detection, root depth=0 inclusion.
 - `protect.rs` — protected-path matching (Windows dirs, user profile dirs, well-known subdirs), filesystem-root detection, path sanitization, symlink-as-non-root.
 - `filter.rs` — glob matching, include/exclude, size and date filtering.
@@ -156,14 +157,17 @@ The tool is destructive by default. Several guards are in place:
 - **Confirmation required** — `--yes` / `--force` must be passed to delete.
 - **Protected paths** — `is_protected_path` blocks system directories (Windows,
   Program Files, Users root, well-known profile subdirs, System Volume Information,
-  Recovery). Non-Windows platforms return `false` (no protection).
+  Recovery), the real profile and known folders. On Unix: system trees
+  (`/usr`, `/etc`, `/boot`, …) with their contents, and `/home`, `/var`,
+  `/tmp`, `$HOME` and its standard folders themselves.
 - **Filesystem root refused** — paths with no parent (e.g. `C:\`) are rejected.
 - **Symlink/junction safety** — `follow_links(false)` in jwalk and the reparse-point attribute check in `tree_delete`; symlinks and
   Windows reparse points are classified as `EntryKind::Symlink` and removed as
   links only, never traversed.
 - **Permission recovery** — `remove_file_with_retry` / `remove_dir_with_retry`
   clear the readonly flag and retry on `PermissionDenied`.
-- **Recycle safety** — `--recycle` is also subject to protection and root guards.
+- **Recycle safety** — `--recycle` is also subject to protection and root
+  guards, and never falls back to permanent deletion.
 
 When modifying deletion logic, preserve these guards. Avoid following untrusted
 paths, preserve explicit user intent for deletion targets, and validate installer
@@ -172,8 +176,13 @@ script changes carefully before release.
 ## Platform Notes
 
 - **Windows** — primary target. Junction and symlink tests require Windows.
-  `is_protected_path` is only effective on Windows; on other platforms it
-  returns `false`.
+- **Linux/macOS** — the CLI builds and is tested in CI. Check locally with
+  `cargo clippy --target x86_64-unknown-linux-gnu --all-targets -- -D warnings`
+  (the CI lint job runs on Ubuntu): Windows-only items need
+  `#[cfg_attr(not(windows), allow(dead_code))]` or similar.
+- **Signing** — set `ZAP_SIGN_CERT_THUMBPRINT` (and optionally
+  `ZAP_SIGN_TIMESTAMP_URL`) before `rebuild.ps1` to Authenticode-sign the
+  binaries and the installer with `signtool`; unset, the build is unsigned.
 - **Symlinks on Windows** — creating symlinks may require Developer Mode or
   elevated privileges. Junctions (`mklink /J`) do not require elevation.
 - The `.cargo/config.toml` may contain target-specific linker settings.

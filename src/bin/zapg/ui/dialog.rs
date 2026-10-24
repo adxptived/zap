@@ -1,389 +1,10 @@
-//! egui theme and rendering for the zapg dialog.
-
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Duration;
-
-use eframe::egui::{self, Align, Color32, CornerRadius, Layout, RichText, Stroke};
-use zap::settings::{DefaultMode, Language, MenuLayout};
-use zap::size;
-
-use crate::app::{should_auto_close, DeleteItem, ItemState, Screen, StatusCounts, ZapApp};
-use crate::i18n::{items_word, pick};
-use crate::{WINDOW_HEIGHT_MAX, WINDOW_HEIGHT_MIN, WINDOW_WIDTH};
-
-const MARGIN: i8 = 18;
-const ITEM_LIST_MAX_HEIGHT: f32 = 148.0;
-const FAILURE_LIST_MAX_HEIGHT: f32 = 120.0;
-const SETTINGS_BODY_MAX_HEIGHT: f32 = 560.0;
-/// How long a successful run stays visible before the dialog closes.
-const SUCCESS_LINGER: Duration = Duration::from_millis(900);
-const CANCELLED: &str = "cancelled by user";
-
-// ---------------------------------------------------------------------------
-// Theme
-// ---------------------------------------------------------------------------
-
-/// Semantic colours, resolved per frame for the active (light/dark) theme.
-struct Palette {
-    danger: Color32,
-    danger_soft: Color32,
-    warn: Color32,
-    success: Color32,
-    accent: Color32,
-    card: Color32,
-    card_stroke: Color32,
-    muted: Color32,
-}
-
-impl Palette {
-    fn for_ui(ui: &egui::Ui) -> Self {
-        if ui.visuals().dark_mode {
-            Self {
-                danger: Color32::from_rgb(232, 84, 84),
-                danger_soft: Color32::from_rgb(64, 34, 38),
-                warn: Color32::from_rgb(236, 176, 64),
-                success: Color32::from_rgb(88, 192, 116),
-                accent: Color32::from_rgb(92, 150, 240),
-                card: Color32::from_rgb(38, 41, 48),
-                card_stroke: Color32::from_rgb(56, 60, 70),
-                muted: Color32::from_rgb(150, 155, 166),
-            }
-        } else {
-            Self {
-                danger: Color32::from_rgb(200, 48, 48),
-                danger_soft: Color32::from_rgb(253, 236, 236),
-                warn: Color32::from_rgb(190, 120, 10),
-                success: Color32::from_rgb(34, 140, 70),
-                accent: Color32::from_rgb(40, 104, 210),
-                card: Color32::from_rgb(255, 255, 255),
-                card_stroke: Color32::from_rgb(222, 225, 231),
-                muted: Color32::from_rgb(105, 110, 122),
-            }
-        }
-    }
-}
-
-pub fn configure_style(ctx: &egui::Context) {
-    install_fonts(ctx);
-    ctx.all_styles_mut(|style| {
-        use egui::{FontFamily, FontId, TextStyle};
-        style.text_styles = [
-            (
-                TextStyle::Heading,
-                FontId::new(18.0, FontFamily::Proportional),
-            ),
-            (TextStyle::Body, FontId::new(13.5, FontFamily::Proportional)),
-            (
-                TextStyle::Button,
-                FontId::new(13.5, FontFamily::Proportional),
-            ),
-            (
-                TextStyle::Small,
-                FontId::new(11.5, FontFamily::Proportional),
-            ),
-            (
-                TextStyle::Monospace,
-                FontId::new(12.5, FontFamily::Monospace),
-            ),
-        ]
-        .into();
-        style.spacing.button_padding = egui::vec2(12.0, 5.0);
-        style.spacing.item_spacing = egui::vec2(8.0, 6.0);
-        style.spacing.interact_size.y = 24.0;
-    });
-    ctx.set_visuals_of(egui::Theme::Dark, tune_visuals(egui::Visuals::dark()));
-    ctx.set_visuals_of(egui::Theme::Light, tune_visuals(egui::Visuals::light()));
-}
-
-fn tune_visuals(mut v: egui::Visuals) -> egui::Visuals {
-    let radius = CornerRadius::same(6);
-    for w in [
-        &mut v.widgets.inactive,
-        &mut v.widgets.hovered,
-        &mut v.widgets.active,
-        &mut v.widgets.open,
-    ] {
-        w.corner_radius = radius;
-    }
-    v.widgets.noninteractive.corner_radius = CornerRadius::same(4);
-    if v.dark_mode {
-        let panel = Color32::from_rgb(28, 30, 36);
-        let widget = Color32::from_rgb(44, 47, 55);
-        let hover = Color32::from_rgb(54, 58, 67);
-        v.panel_fill = panel;
-        v.window_fill = panel;
-        v.extreme_bg_color = Color32::from_rgb(22, 24, 28);
-        v.faint_bg_color = Color32::from_rgb(34, 37, 43);
-        v.widgets.inactive.bg_fill = widget;
-        v.widgets.inactive.weak_bg_fill = widget;
-        v.widgets.inactive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(62, 66, 76));
-        v.widgets.hovered.bg_fill = hover;
-        v.widgets.hovered.weak_bg_fill = hover;
-        v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(56, 60, 70));
-        v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, Color32::from_rgb(222, 224, 230));
-        v.widgets.inactive.fg_stroke = Stroke::new(1.0, Color32::from_rgb(210, 213, 220));
-        v.selection.bg_fill = Color32::from_rgb(52, 98, 176);
-    } else {
-        let panel = Color32::from_rgb(246, 247, 249);
-        v.panel_fill = panel;
-        v.window_fill = panel;
-        v.faint_bg_color = Color32::from_rgb(238, 240, 244);
-        v.widgets.inactive.weak_bg_fill = Color32::from_rgb(232, 235, 240);
-        v.widgets.inactive.bg_fill = Color32::from_rgb(232, 235, 240);
-        v.widgets.hovered.weak_bg_fill = Color32::from_rgb(222, 226, 233);
-        v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, Color32::from_rgb(32, 35, 42));
-        v.selection.bg_fill = Color32::from_rgb(64, 120, 220);
-    }
-    v
-}
-
-/// Use Segoe UI (the Windows UI font) when available: crisper than egui's
-/// bundled font at small sizes and covers Cyrillic/Greek/Latin paths. Segoe
-/// UI Symbol and the bundled fonts stay as fallbacks for symbols.
-fn install_fonts(ctx: &egui::Context) {
-    let mut fonts = egui::FontDefinitions::default();
-    let font_dir = std::env::var_os("WINDIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
-        .join("Fonts");
-    let mut primary = Vec::new();
-    for (name, file) in [
-        ("segoe-ui", "segoeui.ttf"),
-        ("segoe-symbol", "seguisym.ttf"),
-    ] {
-        if let Ok(bytes) = std::fs::read(font_dir.join(file)) {
-            fonts
-                .font_data
-                .insert(name.to_owned(), Arc::new(egui::FontData::from_owned(bytes)));
-            primary.push(name.to_owned());
-        }
-    }
-    let proportional = fonts
-        .families
-        .entry(egui::FontFamily::Proportional)
-        .or_default();
-    for (i, name) in primary.into_iter().enumerate() {
-        proportional.insert(i, name);
-    }
-    ctx.set_fonts(fonts);
-}
-
-// ---------------------------------------------------------------------------
-// Frame
-// ---------------------------------------------------------------------------
-
-impl eframe::App for ZapApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.poll_events();
-        self.poll_batch_collection();
-        self.poll_batch_session();
-
-        // Build status once per frame. The taskbar and the central panel share
-        // it instead of each scanning a potentially huge selection.
-        let counts = self.status_counts();
-        let progress = run_progress(self, &counts);
-        #[cfg(windows)]
-        self.update_taskbar(progress.fraction.unwrap_or(0.0), &counts);
-
-        // Drag & drop: add files/folders dropped onto the window.
-        let dropped: Vec<PathBuf> = ctx.input(|i| {
-            i.raw
-                .dropped_files
-                .iter()
-                .filter_map(|f| f.path.clone())
-                .collect()
-        });
-        if !dropped.is_empty() {
-            self.screen = Screen::Main;
-            self.add_dropped_paths(dropped);
-        }
-        let hovering_files = ctx.input(|i| !i.raw.hovered_files.is_empty());
-        if hovering_files && !self.is_running() {
-            paint_drop_overlay(ctx, self.lang);
-        }
-
-        if self.total_size_calculating {
-            if let Ok(guard) = self.total_size.lock() {
-                if guard.is_some() {
-                    self.total_size_calculating = false;
-                }
-            }
-        }
-
-        let should_repaint = self.is_running()
-            || self.total_size_calculating
-            || self.batch_session.is_some()
-            || self.batch_collecting.is_some();
-        if should_repaint {
-            ctx.request_repaint_after(Duration::from_millis(100));
-        }
-
-        // A clean destructive run shows its result briefly, then closes.
-        if should_auto_close(self, &counts) {
-            let shown = self.finished_at.map(|at| at.elapsed()).unwrap_or_default();
-            if shown >= SUCCESS_LINGER {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            } else {
-                ctx.request_repaint_after(SUCCESS_LINGER - shown);
-            }
-        }
-
-        let running = self.is_running();
-        // Wait for the Explorer batch to finish arriving: starting earlier
-        // would run on a partial selection the user has not seen.
-        let can_start = !running
-            && self.batch_collecting.is_none()
-            && !self.items.is_empty()
-            && self.thread_error().is_none()
-            && (!self.has_dangerous_paths || self.danger_confirmed);
-
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) && !running {
-            if self.screen == Screen::Settings {
-                self.screen = Screen::Main;
-            } else {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            }
-        }
-        if self.screen == Screen::Main
-            && can_start
-            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
-        {
-            self.start();
-        }
-
-        let panel = egui::CentralPanel::default()
-            .frame(
-                egui::Frame::central_panel(&ctx.style()).inner_margin(egui::Margin::same(MARGIN)),
-            )
-            .show(ctx, |ui| {
-                // Measure inside a scope: the panel's own `min_rect` always
-                // spans the whole window, so it could only ever grow — after
-                // the tall settings screen the dialog never shrank back.
-                ui.scope(|ui| match self.screen {
-                    Screen::Settings => render_settings(ui, self),
-                    Screen::Main if self.items.is_empty() => render_home(ui, ctx, self),
-                    Screen::Main => render_dialog(ui, ctx, self, &counts, &progress, can_start),
-                })
-                .response
-                .rect
-                .height()
-            });
-
-        fit_window_to_content(ctx, panel.inner);
-    }
-}
-
-/// Size the (non-resizable) window to its content — growing *and*
-/// shrinking — so no state needs a hand-tuned height constant.
-fn fit_window_to_content(ctx: &egui::Context, content_height: f32) {
-    let target =
-        (content_height + 2.0 * f32::from(MARGIN)).clamp(WINDOW_HEIGHT_MIN, WINDOW_HEIGHT_MAX);
-    let current = ctx.input(|i| i.screen_rect().height());
-    if (current - target).abs() > 1.0 {
-        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
-            WINDOW_WIDTH,
-            target,
-        )));
-    }
-}
-
-// Note: right-to-left button rows are always nested in `ui.horizontal`.
-// At panel level a right-to-left layout claims all remaining height and
-// defeats `fit_window_to_content`.
-
-// ---------------------------------------------------------------------------
-// Home (no selection)
-// ---------------------------------------------------------------------------
-
-fn render_home(ui: &mut egui::Ui, ctx: &egui::Context, app: &mut ZapApp) {
-    let pal = Palette::for_ui(ui);
-    let lang = app.lang;
-    ui.heading(RichText::new("Zap").strong());
-    ui.label(
-        RichText::new(pick(
-            lang,
-            "Fast deletion for Windows.",
-            "Быстрое удаление для Windows.",
-        ))
-        .color(pal.muted),
-    );
-    ui.add_space(12.0);
-
-    // Drop zone.
-    let (rect, _) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), 120.0),
-        egui::Sense::hover(),
-    );
-    let painter = ui.painter();
-    painter.rect_filled(rect, CornerRadius::same(10), pal.card);
-    let dash = Stroke::new(1.5, pal.muted.gamma_multiply(0.6));
-    let r = rect.shrink(1.0);
-    for (a, b) in [
-        (r.left_top(), r.right_top()),
-        (r.right_top(), r.right_bottom()),
-        (r.right_bottom(), r.left_bottom()),
-        (r.left_bottom(), r.left_top()),
-    ] {
-        painter.add(egui::Shape::dashed_line(&[a, b], dash, 6.0, 4.0));
-    }
-    painter.text(
-        rect.center() - egui::vec2(0.0, 10.0),
-        egui::Align2::CENTER_CENTER,
-        pick(
-            lang,
-            "Drop files or folders here",
-            "Перетащите сюда файлы или папки",
-        ),
-        egui::FontId::proportional(15.0),
-        ui.visuals().text_color(),
-    );
-    painter.text(
-        rect.center() + egui::vec2(0.0, 14.0),
-        egui::Align2::CENTER_CENTER,
-        pick(
-            lang,
-            "or right-click them in Explorer → Zap",
-            "или нажмите на них ПКМ в Проводнике → Zap",
-        ),
-        egui::FontId::proportional(12.0),
-        pal.muted,
-    );
-
-    ui.add_space(14.0);
-    ui.horizontal(|ui| {
-        if ui
-            .add(
-                egui::Button::new(RichText::new(settings_label(lang)).color(pal.accent))
-                    .frame(false),
-            )
-            .clicked()
-        {
-            app.open_settings();
-        }
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if ui
-                .add(
-                    egui::Button::new(pick(lang, "Close", "Закрыть"))
-                        .min_size(egui::vec2(96.0, 32.0)),
-                )
-                .clicked()
-            {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            }
-        });
-    });
-}
-
-fn settings_label(lang: Language) -> &'static str {
-    pick(lang, "⚙ Settings", "⚙ Настройки")
-}
+use super::*;
 
 // ---------------------------------------------------------------------------
 // Main dialog
 // ---------------------------------------------------------------------------
 
-fn render_dialog(
+pub(super) fn render_dialog(
     ui: &mut egui::Ui,
     ctx: &egui::Context,
     app: &mut ZapApp,
@@ -417,7 +38,7 @@ fn render_dialog(
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Phase {
+pub(super) enum Phase {
     Ready,
     Running,
     Paused,
@@ -428,7 +49,7 @@ enum Phase {
 }
 
 impl Phase {
-    fn of(app: &ZapApp, counts: &StatusCounts) -> Self {
+    pub(super) fn of(app: &ZapApp, counts: &StatusCounts) -> Self {
         if app.is_running() {
             return if app.is_paused() {
                 Self::Paused
@@ -453,7 +74,7 @@ impl Phase {
 }
 
 #[derive(Clone, Copy)]
-enum Mode {
+pub(super) enum Mode {
     Delete,
     Recycle,
     Shred,
@@ -461,7 +82,7 @@ enum Mode {
 }
 
 impl Mode {
-    fn of(app: &ZapApp) -> Self {
+    pub(super) fn of(app: &ZapApp) -> Self {
         if app.dry_run {
             Self::Preview
         } else if app.recycle {
@@ -474,7 +95,7 @@ impl Mode {
     }
 }
 
-fn render_header(ui: &mut egui::Ui, app: &ZapApp, phase: Phase) {
+pub(super) fn render_header(ui: &mut egui::Ui, app: &ZapApp, phase: Phase) {
     let pal = Palette::for_ui(ui);
     let mode = Mode::of(app);
     let (glyph, color) = match phase {
@@ -522,7 +143,7 @@ fn render_header(ui: &mut egui::Ui, app: &ZapApp, phase: Phase) {
     });
 }
 
-fn paint_badge(ui: &mut egui::Ui, glyph: &str, color: Color32) {
+pub(super) fn paint_badge(ui: &mut egui::Ui, glyph: &str, color: Color32) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(40.0, 40.0), egui::Sense::hover());
     let painter = ui.painter();
     painter.rect_filled(rect, CornerRadius::same(10), color.gamma_multiply(0.18));
@@ -535,7 +156,7 @@ fn paint_badge(ui: &mut egui::Ui, glyph: &str, color: Color32) {
     );
 }
 
-fn title(app: &ZapApp, phase: Phase, mode: Mode) -> String {
+pub(super) fn title(app: &ZapApp, phase: Phase, mode: Mode) -> String {
     let lang = app.lang;
     let ru = lang == Language::Russian;
     let what = match app.items.as_slice() {
@@ -603,7 +224,7 @@ fn title(app: &ZapApp, phase: Phase, mode: Mode) -> String {
 
 /// Second header line: the full path for one item, the shared parent folder
 /// for several items in one place, or a name sample otherwise.
-fn subtitle(items: &[DeleteItem], lang: Language) -> Option<String> {
+pub(super) fn subtitle(items: &[DeleteItem], lang: Language) -> Option<String> {
     match items {
         [] => None,
         [item] => Some(item.path.display().to_string()),
@@ -623,7 +244,7 @@ fn subtitle(items: &[DeleteItem], lang: Language) -> Option<String> {
     }
 }
 
-fn full_selection_text(items: &[DeleteItem], lang: Language) -> String {
+pub(super) fn full_selection_text(items: &[DeleteItem], lang: Language) -> String {
     let mut lines: Vec<String> = items
         .iter()
         .take(30)
@@ -639,7 +260,31 @@ fn full_selection_text(items: &[DeleteItem], lang: Language) -> String {
     lines.join("\n")
 }
 
-fn size_summary(app: &ZapApp) -> Option<String> {
+/// "1 234 files, 56 folders · 1.2 GB" (links only when there are any).
+pub(super) fn preview_summary(stats: &size::TreeStats, lang: Language) -> String {
+    let mut parts = vec![
+        format!(
+            "{} {}",
+            format_count(stats.files),
+            files_word(lang, stats.files)
+        ),
+        format!(
+            "{} {}",
+            format_count(stats.dirs),
+            folders_word(lang, stats.dirs)
+        ),
+    ];
+    if stats.links > 0 {
+        parts.push(format!(
+            "{} {}",
+            format_count(stats.links),
+            links_word(lang, stats.links)
+        ));
+    }
+    format!("{} · {}", parts.join(", "), size::format_size(stats.bytes))
+}
+
+pub(super) fn size_summary(app: &ZapApp) -> Option<String> {
     let guard = app.item_sizes.lock().ok()?;
     let snapshot = guard.as_ref()?;
     Some(format!(
@@ -654,7 +299,7 @@ fn size_summary(app: &ZapApp) -> Option<String> {
 // Selection list
 // ---------------------------------------------------------------------------
 
-fn render_item_list(ui: &mut egui::Ui, app: &mut ZapApp) {
+pub(super) fn render_item_list(ui: &mut egui::Ui, app: &mut ZapApp) {
     let pal = Palette::for_ui(ui);
     let lang = app.lang;
     let editable = !app.is_running() && app.started_at.is_none();
@@ -721,7 +366,9 @@ fn render_item_list(ui: &mut egui::Ui, app: &mut ZapApp) {
                         });
                     });
                     let hover = match &item.state {
-                        ItemState::Failed(err) => format!("{}\n{}", item.path.display(), err),
+                        ItemState::Failed(err) => {
+                            format!("{}\n{}", item.path.display(), localize_error(err, lang))
+                        }
                         _ => item.path.display().to_string(),
                     };
                     row.response.on_hover_text(hover);
@@ -735,7 +382,7 @@ fn render_item_list(ui: &mut egui::Ui, app: &mut ZapApp) {
     }
 }
 
-fn state_icon(state: &ItemState, pal: &Palette) -> (&'static str, Color32) {
+pub(super) fn state_icon(state: &ItemState, pal: &Palette) -> (&'static str, Color32) {
     match state {
         ItemState::Pending => ("○", pal.muted),
         ItemState::Running => ("▶", pal.accent),
@@ -749,7 +396,7 @@ fn state_icon(state: &ItemState, pal: &Palette) -> (&'static str, Color32) {
 // Options
 // ---------------------------------------------------------------------------
 
-fn render_danger_card(ui: &mut egui::Ui, app: &mut ZapApp) {
+pub(super) fn render_danger_card(ui: &mut egui::Ui, app: &mut ZapApp) {
     let pal = Palette::for_ui(ui);
     let lang = app.lang;
     card(pal.danger_soft, pal.danger.gamma_multiply(0.5)).show(ui, |ui| {
@@ -785,7 +432,7 @@ fn render_danger_card(ui: &mut egui::Ui, app: &mut ZapApp) {
     });
 }
 
-fn render_options(ui: &mut egui::Ui, app: &mut ZapApp) {
+pub(super) fn render_options(ui: &mut egui::Ui, app: &mut ZapApp) {
     let pal = Palette::for_ui(ui);
     let lang = app.lang;
 
@@ -873,7 +520,12 @@ fn render_options(ui: &mut egui::Ui, app: &mut ZapApp) {
 }
 
 /// Segmented Delete / Recycle Bin / Shred control. Returns true on change.
-fn mode_switch(ui: &mut egui::Ui, mode: &mut DefaultMode, lang: Language, pal: &Palette) -> bool {
+pub(super) fn mode_switch(
+    ui: &mut egui::Ui,
+    mode: &mut DefaultMode,
+    lang: Language,
+    pal: &Palette,
+) -> bool {
     let mut changed = false;
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
@@ -926,7 +578,7 @@ pub struct RunProgress {
 /// deletion cost is per entry (each one is a kernel open + unlink), so a
 /// folder of 100k tiny files dominates a single 10 GB file — byte weighting
 /// would get the ETA badly wrong.
-fn run_progress(app: &ZapApp, counts: &StatusCounts) -> RunProgress {
+pub(super) fn run_progress(app: &ZapApp, counts: &StatusCounts) -> RunProgress {
     let total_items = app.items.len();
     if total_items == 0 {
         return RunProgress {
@@ -982,7 +634,12 @@ fn run_progress(app: &ZapApp, counts: &StatusCounts) -> RunProgress {
     }
 }
 
-fn render_progress(ui: &mut egui::Ui, app: &mut ZapApp, progress: &RunProgress, phase: Phase) {
+pub(super) fn render_progress(
+    ui: &mut egui::Ui,
+    app: &mut ZapApp,
+    progress: &RunProgress,
+    phase: Phase,
+) {
     let pal = Palette::for_ui(ui);
     let lang = app.lang;
     let fraction = progress.fraction.unwrap_or(0.0);
@@ -1052,7 +709,7 @@ fn render_progress(ui: &mut egui::Ui, app: &mut ZapApp, progress: &RunProgress, 
     });
 }
 
-fn render_success(ui: &mut egui::Ui, app: &ZapApp) {
+pub(super) fn render_success(ui: &mut egui::Ui, app: &ZapApp) {
     let pal = Palette::for_ui(ui);
     let lang = app.lang;
     let elapsed = app.finished.unwrap_or_default().as_secs_f32();
@@ -1064,7 +721,7 @@ fn render_success(ui: &mut egui::Ui, app: &ZapApp) {
                 "Nothing was deleted. Would be removed:",
                 "Ничего не удалено. Будет удалено:"
             ),
-            size_summary(app).unwrap_or_default()
+            preview_summary(&app.preview_total, lang)
         )
     } else {
         format!(
@@ -1076,7 +733,12 @@ fn render_success(ui: &mut egui::Ui, app: &ZapApp) {
     ui.label(RichText::new(text).color(pal.success));
 }
 
-fn render_failures(ui: &mut egui::Ui, app: &ZapApp, counts: &StatusCounts, phase: Phase) {
+pub(super) fn render_failures(
+    ui: &mut egui::Ui,
+    app: &ZapApp,
+    counts: &StatusCounts,
+    phase: Phase,
+) {
     let pal = Palette::for_ui(ui);
     let lang = app.lang;
     let cancelled = cancelled_count(&app.items);
@@ -1117,7 +779,11 @@ fn render_failures(ui: &mut egui::Ui, app: &ZapApp, counts: &StatusCounts, phase
                                 )
                                 .truncate(),
                             );
-                            ui.label(RichText::new(err).small().color(pal.danger));
+                            ui.label(
+                                RichText::new(localize_error(err, lang))
+                                    .small()
+                                    .color(pal.danger),
+                            );
                             ui.add_space(4.0);
                         }
                     }
@@ -1175,7 +841,7 @@ fn render_failures(ui: &mut egui::Ui, app: &ZapApp, counts: &StatusCounts, phase
     }
 }
 
-fn render_actions(
+pub(super) fn render_actions(
     ui: &mut egui::Ui,
     ctx: &egui::Context,
     app: &mut ZapApp,
@@ -1268,400 +934,4 @@ fn render_actions(
             }
         });
     });
-}
-
-// ---------------------------------------------------------------------------
-// Settings screen
-// ---------------------------------------------------------------------------
-
-fn render_settings(ui: &mut egui::Ui, app: &mut ZapApp) {
-    let pal = Palette::for_ui(ui);
-    // Show the draft language immediately so the choice is previewed.
-    let lang = app.settings_draft.language.resolve();
-
-    ui.horizontal(|ui| {
-        if ui
-            .add(egui::Button::new(RichText::new("←").size(16.0)).frame(false))
-            .on_hover_text(pick(lang, "Back (Esc)", "Назад (Esc)"))
-            .clicked()
-        {
-            app.screen = Screen::Main;
-        }
-        ui.heading(RichText::new(pick(lang, "Settings", "Настройки")).strong());
-    });
-    ui.add_space(8.0);
-
-    egui::ScrollArea::vertical()
-        .max_height(SETTINGS_BODY_MAX_HEIGHT)
-        .auto_shrink([false, true])
-        .show(ui, |ui| {
-            let draft = &mut app.settings_draft;
-
-            section(ui, &pal, pick(lang, "General", "Общие"));
-            ui.horizontal(|ui| {
-                ui.label(pick(lang, "Language", "Язык"));
-                let label = |l: Language| match l {
-                    Language::Auto => pick(lang, "System default", "Как в системе"),
-                    Language::English => "English",
-                    Language::Russian => "Русский",
-                };
-                egui::ComboBox::from_id_salt("language")
-                    .selected_text(label(draft.language))
-                    .show_ui(ui, |ui| {
-                        for l in Language::ALL {
-                            ui.selectable_value(&mut draft.language, l, label(l));
-                        }
-                    });
-            });
-
-            ui.add_space(10.0);
-            section(
-                ui,
-                &pal,
-                pick(lang, "Explorer context menu", "Контекстное меню Проводника"),
-            );
-            ui.checkbox(
-                &mut draft.menu.enabled,
-                pick(
-                    lang,
-                    "Add Zap to the right-click menu",
-                    "Добавить Zap в меню по правой кнопке",
-                ),
-            );
-            ui.add_enabled_ui(draft.menu.enabled, |ui| {
-                ui.horizontal(|ui| {
-                    ui.radio_value(
-                        &mut draft.menu.layout,
-                        MenuLayout::Submenu,
-                        pick(lang, "Submenu “Zap ›”", "Подменю «Zap ›»"),
-                    );
-                    ui.radio_value(
-                        &mut draft.menu.layout,
-                        MenuLayout::Flat,
-                        pick(lang, "Items directly in the menu", "Пункты прямо в меню"),
-                    );
-                });
-                ui.checkbox(
-                    &mut draft.menu.icons,
-                    pick(lang, "Show icons", "Показывать иконки"),
-                );
-                ui.label(RichText::new(pick(lang, "Actions:", "Действия:")).color(pal.muted));
-                ui.indent("menu-actions", |ui| {
-                    ui.checkbox(
-                        &mut draft.menu.show_dialog,
-                        pick(
-                            lang,
-                            "Delete with confirmation…",
-                            "Удалить с подтверждением…",
-                        ),
-                    );
-                    ui.checkbox(
-                        &mut draft.menu.show_recycle,
-                        pick(lang, "Move to Recycle Bin", "Переместить в корзину"),
-                    );
-                    ui.checkbox(
-                        &mut draft.menu.show_quick_delete,
-                        pick(
-                            lang,
-                            "Quick delete (no confirmation)",
-                            "Быстрое удаление (без подтверждения)",
-                        ),
-                    );
-                });
-                ui.checkbox(
-                    &mut draft.menu.show_background,
-                    pick(
-                        lang,
-                        "“Delete this folder…” on folder background",
-                        "«Удалить эту папку…» на фоне папки",
-                    ),
-                );
-                ui.checkbox(
-                    &mut draft.menu.shift_only,
-                    pick(lang, "Only when Shift is held", "Только при зажатом Shift"),
-                );
-
-                ui.add_space(4.0);
-                ui.label(
-                    RichText::new(pick(lang, "Preview:", "Как будет выглядеть:")).color(pal.muted),
-                );
-                render_menu_preview(ui, draft, lang, &pal);
-            });
-
-            ui.add_space(10.0);
-            section(ui, &pal, pick(lang, "Deletion dialog", "Окно удаления"));
-            ui.label(
-                RichText::new(pick(lang, "Default action", "Действие по умолчанию"))
-                    .color(pal.muted),
-            );
-            mode_switch(ui, &mut draft.default_mode, lang, &pal);
-            ui.checkbox(
-                &mut draft.auto_close,
-                pick(
-                    lang,
-                    "Close automatically after success",
-                    "Закрывать после успешного удаления",
-                ),
-            );
-            ui.checkbox(
-                &mut draft.notify_failures,
-                pick(
-                    lang,
-                    "Show a message when a quick deletion fails",
-                    "Сообщать об ошибках быстрого удаления",
-                ),
-            );
-            ui.checkbox(
-                &mut draft.journal,
-                pick(lang, "Keep an operation journal", "Вести журнал операций"),
-            );
-            ui.horizontal(|ui| {
-                let mut limited = draft.threads.is_some();
-                if ui
-                    .checkbox(
-                        &mut limited,
-                        pick(lang, "Limit worker threads", "Ограничить число потоков"),
-                    )
-                    .changed()
-                {
-                    draft.threads = limited.then(|| zap::parallelism::worker_count(None));
-                }
-                if let Some(threads) = draft.threads.as_mut() {
-                    ui.add(egui::DragValue::new(threads).range(1..=zap::parallelism::MAX_WORKERS));
-                } else {
-                    ui.label(RichText::new(pick(lang, "auto", "авто")).color(pal.muted));
-                }
-            });
-        });
-
-    ui.add_space(10.0);
-    ui.horizontal(|ui| {
-        if let Some((message, is_error)) = &app.settings_status {
-            let color = if *is_error { pal.danger } else { pal.success };
-            ui.label(RichText::new(message).small().color(color));
-        }
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            let size = egui::vec2(96.0, 32.0);
-            let dirty = app.settings_draft != app.settings;
-            let save = egui::Button::new(
-                RichText::new(pick(lang, "Save", "Сохранить"))
-                    .strong()
-                    .color(Color32::WHITE),
-            )
-            .fill(pal.accent)
-            .min_size(size);
-            if ui.add_enabled(dirty, save).clicked() {
-                app.save_settings();
-            }
-            if ui
-                .add(egui::Button::new(pick(lang, "Back", "Назад")).min_size(size))
-                .clicked()
-            {
-                app.screen = Screen::Main;
-            }
-        });
-    });
-}
-
-fn section(ui: &mut egui::Ui, pal: &Palette, title: &str) {
-    ui.label(RichText::new(title).strong());
-    let rect = ui.available_rect_before_wrap();
-    ui.painter().hline(
-        rect.x_range(),
-        rect.top(),
-        Stroke::new(1.0, pal.card_stroke),
-    );
-    ui.add_space(6.0);
-}
-
-/// Mock of the Explorer menu the current draft would register.
-fn render_menu_preview(
-    ui: &mut egui::Ui,
-    draft: &zap::settings::Settings,
-    lang: Language,
-    pal: &Palette,
-) {
-    let entries = zap::context_menu::preview(draft);
-    card(pal.card, pal.card_stroke).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        if entries.is_empty() {
-            ui.label(
-                RichText::new(pick(
-                    lang,
-                    "(nothing will be added)",
-                    "(ничего не будет добавлено)",
-                ))
-                .small()
-                .color(pal.muted),
-            );
-            return;
-        }
-        for entry in entries {
-            if entry.separator_before {
-                let rect = ui.available_rect_before_wrap();
-                ui.painter().hline(
-                    (rect.left() + 24.0)..=rect.right(),
-                    rect.top() + 1.0,
-                    Stroke::new(1.0, pal.card_stroke),
-                );
-                ui.add_space(4.0);
-            }
-            ui.horizontal(|ui| {
-                ui.add_space(f32::from(entry.depth) * 22.0);
-                let icon = if entry.icon { "⚡" } else { "" };
-                ui.add_sized(
-                    [16.0, 18.0],
-                    egui::Label::new(RichText::new(icon).color(Color32::from_rgb(240, 170, 40))),
-                );
-                ui.label(&entry.label);
-                if entry.submenu {
-                    ui.label(RichText::new("›").color(pal.muted));
-                }
-            });
-        }
-    });
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-fn card(fill: Color32, stroke: Color32) -> egui::Frame {
-    egui::Frame::default()
-        .fill(fill)
-        .stroke(Stroke::new(1.0, stroke))
-        .corner_radius(CornerRadius::same(8))
-        .inner_margin(egui::Margin::symmetric(10, 8))
-}
-
-fn cancelled_count(items: &[DeleteItem]) -> usize {
-    items
-        .iter()
-        .filter(|item| matches!(&item.state, ItemState::Failed(e) if e.contains(CANCELLED)))
-        .count()
-}
-
-/// Remaining-time estimate; None until progress is stable enough.
-fn estimate_eta_secs(fraction: Option<f32>, elapsed: f32) -> Option<f32> {
-    let fraction = fraction?;
-    if !(0.02..1.0).contains(&fraction) || elapsed < 0.5 {
-        return None;
-    }
-    Some(elapsed * (1.0 - fraction) / fraction)
-}
-
-fn format_duration(secs: f32, lang: Language) -> String {
-    let (s, m, h) = if lang == Language::Russian {
-        ("с", "м", "ч")
-    } else {
-        ("s", "m", "h")
-    };
-    if secs < 10.0 {
-        format!("{secs:.1}{s}")
-    } else if secs < 60.0 {
-        format!("{}{s}", secs.round() as u64)
-    } else if secs < 3600.0 {
-        format!("{}{m} {:02}{s}", (secs / 60.0) as u64, (secs % 60.0) as u64)
-    } else {
-        format!(
-            "{}{h} {:02}{m}",
-            (secs / 3600.0) as u64,
-            ((secs % 3600.0) / 60.0) as u64
-        )
-    }
-}
-
-/// `12345` → `12,345`.
-fn format_count(n: u64) -> String {
-    let digits = n.to_string();
-    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
-    for (i, ch) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(ch);
-    }
-    out
-}
-
-fn display_name(path: &Path) -> String {
-    path.file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.display().to_string())
-}
-
-fn compact_text(text: &str, max_len: usize) -> String {
-    if text.chars().count() <= max_len {
-        return text.to_owned();
-    }
-    let prefix: String = text.chars().take(max_len.saturating_sub(1)).collect();
-    format!("{prefix}…")
-}
-
-/// Dim the window and show a hint while files are dragged over it.
-fn paint_drop_overlay(ctx: &egui::Context, lang: Language) {
-    let painter = ctx.layer_painter(egui::LayerId::new(
-        egui::Order::Foreground,
-        egui::Id::new("drop_overlay"),
-    ));
-    let rect = ctx.screen_rect();
-    painter.rect_filled(rect, 0.0, Color32::from_black_alpha(150));
-    painter.text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        pick(lang, "Drop to add to the list", "Отпустите, чтобы добавить"),
-        egui::FontId::proportional(16.0),
-        Color32::WHITE,
-    );
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn format_count_groups_thousands() {
-        assert_eq!(format_count(0), "0");
-        assert_eq!(format_count(999), "999");
-        assert_eq!(format_count(1_000), "1,000");
-        assert_eq!(format_count(1_234_567), "1,234,567");
-    }
-
-    #[test]
-    fn format_duration_picks_readable_units() {
-        let en = Language::English;
-        assert_eq!(format_duration(1.25, en), "1.2s");
-        assert_eq!(format_duration(42.4, en), "42s");
-        assert_eq!(format_duration(125.0, en), "2m 05s");
-        assert_eq!(format_duration(3_720.0, en), "1h 02m");
-        assert_eq!(format_duration(125.0, Language::Russian), "2м 05с");
-    }
-
-    #[test]
-    fn eta_needs_stable_progress() {
-        assert_eq!(estimate_eta_secs(None, 5.0), None);
-        assert_eq!(estimate_eta_secs(Some(0.01), 5.0), None);
-        assert_eq!(estimate_eta_secs(Some(0.5), 0.2), None);
-        assert_eq!(estimate_eta_secs(Some(0.5), 4.0), Some(4.0));
-    }
-
-    #[test]
-    fn subtitle_uses_shared_parent() {
-        let items: Vec<DeleteItem> = [r"C:\work\a", r"C:\work\b"]
-            .iter()
-            .map(|p| DeleteItem {
-                path: PathBuf::from(p),
-                state: ItemState::Pending,
-                progress: None,
-            })
-            .collect();
-        assert_eq!(
-            subtitle(&items, Language::English).as_deref(),
-            Some(r"in C:\work")
-        );
-        assert_eq!(
-            subtitle(&items, Language::Russian).as_deref(),
-            Some(r"в C:\work")
-        );
-    }
 }

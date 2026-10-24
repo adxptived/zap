@@ -123,11 +123,52 @@ fn report_error(path: &Path, err: &std::io::Error) {
     );
 }
 
+/// "12 files, 3 folders, 1.2 MB" — or just the size for a single file.
+fn describe_preview(stats: &size::TreeStats) -> String {
+    if stats.entries == 0 {
+        return "nothing matches the filters".to_owned();
+    }
+    let size = size::format_size(stats.bytes);
+    if stats.entries == 1 && stats.files == 1 {
+        return size;
+    }
+    let mut parts = vec![
+        format!("{} file(s)", stats.files),
+        format!("{} folder(s)", stats.dirs),
+    ];
+    if stats.links > 0 {
+        parts.push(format!("{} link(s)", stats.links));
+    }
+    parts.push(size);
+    parts.join(", ")
+}
+
+/// Print one preview line: what deleting `path` would remove, computed
+/// with the run's own filters (see `delete::preview_path`).
+fn print_preview_line(path: &Path, result: &io::Result<size::TreeStats>) {
+    let protected = protect::is_dangerous_target(path);
+    let tag = if protected { "  [protected]" } else { "" };
+    match result {
+        Ok(stats) => eprintln!(
+            "  {}  {}{}",
+            path.display().bright_yellow(),
+            describe_preview(stats).dimmed(),
+            tag.yellow()
+        ),
+        Err(err) => eprintln!(
+            "  {}  {}",
+            path.display().bright_yellow(),
+            format!("error: {err}").red()
+        ),
+    }
+}
+
 fn confirm_interactive(
     paths: &[PathBuf],
     dry_run: bool,
     recycle: bool,
     show_sizes: bool,
+    filter: &zap::filter::FilterConfig,
 ) -> io::Result<bool> {
     use std::io::IsTerminal;
     // A pure dry-run never reads an answer, so it must work in pipes and CI.
@@ -150,28 +191,48 @@ fn confirm_interactive(
         .bright_white()
     );
 
-    let preview: Vec<&PathBuf> = paths.iter().take(20).collect();
-    if show_sizes {
-        // Compute sizes for the previewed paths in parallel — sequential
-        // dir_size_recursive calls can take seconds each on large trees.
-        // Users can opt out with --no-size-preview when they want the
-        // confirmation prompt to appear immediately for huge directory trees.
+    // An explicit dry run previews every path and prints a total; the
+    // confirmation prompt previews the first 20 so it appears quickly.
+    let preview: Vec<&PathBuf> = if dry_run {
+        paths.iter().collect()
+    } else {
+        paths.iter().take(20).collect()
+    };
+    let mut failed = false;
+    if dry_run || show_sizes {
+        // In parallel — a big tree can take seconds. Users can skip it with
+        // --no-size-preview when the prompt must appear immediately. The
+        // protected-path confirmation comes later, so preview those too.
         use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
-        let sizes: Vec<u64> = preview
+        let results: Vec<io::Result<size::TreeStats>> = preview
             .par_iter()
-            .map(|path| size::dir_size_recursive(path))
+            .map(|path| delete::preview_path(path, filter, true))
             .collect();
 
-        for (path, total) in preview.iter().zip(sizes) {
-            if total > 0 {
-                eprintln!(
-                    "  {}  {}",
-                    path.display().bright_yellow(),
-                    size::format_size(total).dimmed()
-                );
+        let mut total = size::TreeStats::default();
+        let mut hidden = 0usize;
+        for (i, (path, result)) in preview.iter().zip(&results).enumerate() {
+            // Every failure is shown; successes only for the first 20.
+            if i < 20 || result.is_err() {
+                print_preview_line(path, result);
             } else {
-                eprintln!("  {}", path.display().bright_yellow());
+                hidden += 1;
             }
+            match result {
+                Ok(stats) => total += *stats,
+                Err(_) => failed = true,
+            }
+        }
+        if dry_run {
+            if hidden > 0 {
+                eprintln!("  ... {hidden} more path(s)");
+            }
+            eprintln!("\n{} {}", "Total:".bright_white(), describe_preview(&total));
+            return if failed {
+                Err(io::Error::other("some paths cannot be deleted (see above)"))
+            } else {
+                Ok(false)
+            };
         }
     } else {
         for path in &preview {
@@ -184,10 +245,6 @@ fn confirm_interactive(
     }
     if paths.len() > 20 {
         eprintln!("  ... {} more path(s)", paths.len() - 20);
-    }
-
-    if dry_run {
-        return Ok(false);
     }
 
     if recycle {
@@ -303,6 +360,7 @@ fn run_delete(options: &cli::CliOptions, start: Instant) -> bool {
             options.dry_run,
             options.recycle,
             !options.no_size_preview,
+            &options.filter,
         ) {
             Ok(true) => {
                 let mut real_options = options.clone();

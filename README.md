@@ -26,7 +26,7 @@ then pick the safe GUI confirmation flow or the silent immediate-delete action.
 - **Read-only recovery** — read-only attributes are cleared and deletion is retried when possible.
 - **Filter support** — glob pattern filtering, size filtering, and date-based filtering.
 - **Secure deletion** — overwrite files with random data before removing (`--shred`), also available as a checkbox in the GUI.
-- **Recycle Bin** — send to Recycle Bin instead of permanent delete (`--recycle`). Multiple items are moved with a single shell call — one Explorer "Undo" restores everything.
+- **Recycle Bin** — send to Recycle Bin instead of permanent delete (`--recycle`). Multiple items are moved with a single shell call — one Explorer "Undo" restores everything. Anything the bin cannot take (too large, a drive without a bin) is skipped with an error, never deleted permanently.
 
 ## Installation
 
@@ -94,7 +94,7 @@ zap --version
 | Flag | Description |
 | --- | --- |
 | `--yes`, `--force` | Required for destructive terminal deletion. |
-| `--dry-run` | Preview without removing files. |
+| `--dry-run` | Preview without removing files: files, folders and size per path plus a total, computed with the same filters as the real run. Exits with 1 if any path could not be deleted. |
 | `--threads N`, `-j N` | Override the Rayon worker thread count. |
 | `--silent` | Suppress progress output. Used by `zapw.exe`. |
 | `--batch` | Internal Explorer multi-select coordination flag. |
@@ -139,6 +139,9 @@ Zap is destructive, so the deletion engine keeps several guardrails in place:
 - Read-only files and directories are retried after clearing the read-only flag.
 - The GUI keeps the dialog open when deletion fails so the error remains visible.
 - `--recycle` is also subject to protection guards (cannot recycle system paths).
+- On Linux/macOS the CLI protects system trees (`/usr`, `/etc`, `/boot`, …) and
+  the folders `/home`, `/var`, `/tmp`, `$HOME` and its standard subfolders
+  themselves; their contents stay deletable.
 
 Protected examples include:
 
@@ -192,6 +195,12 @@ Useful build scripts:
 | `rebuild-ui.bat` | Interactive build menu for local development. |
 | `rebuild.ps1` | Shared PowerShell build pipeline. |
 
+Code signing is optional: set `ZAP_SIGN_CERT_THUMBPRINT` to the SHA-1
+thumbprint of a code-signing certificate in your certificate store (and
+optionally `ZAP_SIGN_TIMESTAMP_URL`) and `rebuild.ps1` signs `zap.exe`,
+`zapw.exe`, `zapg.exe` and the installer with `signtool` from the Windows
+SDK. Without the variable the build stays unsigned.
+
 Generated paths:
 
 - `target/` — Cargo output.
@@ -205,11 +214,16 @@ Generated paths:
 src/
   main.rs                  Console CLI and batch coordination
   cli.rs                   Argument parser
-  delete.rs                Core deletion engine
+  delete/                  Deletion engine (tree, bulk, preview, retry, report)
+  messages.rs              Engine error texts and their translation
   scan.rs                  Directory walking and entry classification
   protect.rs               Protected path checks
   filter.rs                Glob pattern and metadata filtering
-  recycle.rs               Recycle Bin integration
+  recycle.rs               Recycle Bin integration (IFileOperation)
+  tree_delete.rs           Windows handle-based tree deletion
+  journal.rs               Operation journal
+  settings.rs              User settings
+  context_menu.rs          Explorer context-menu registration
   shred.rs                 Secure deletion (overwrite with random data)
   size.rs                  Directory size calculation
   stop.rs                  Global graceful-stop signal
@@ -220,7 +234,7 @@ src/
     zapg/                  Explorer GUI confirmation dialog
       main.rs              Entry point, args, batch coordinator election
       app.rs               Dialog state and background workers
-      ui.rs                Theme and rendering
+      ui/                  Theme, home, dialog and settings screens
     zapw.rs                Windowless immediate-delete binary
 
 assets/

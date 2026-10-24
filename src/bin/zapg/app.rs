@@ -12,6 +12,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use zap::delete::DeleteOptions;
+use zap::filter::FilterConfig;
 use zap::journal::{self, JournalAction, PathOutcome};
 use zap::settings::{DefaultMode, Language, Settings};
 use zap::{batch, delete, path_utils, protect, size, stop};
@@ -90,6 +91,8 @@ pub enum WorkerEvent {
     Started(PathBuf),
     Progress(PathBuf, ProgressSnapshot),
     Done(PathBuf, Result<(), String>),
+    /// Preview ("check only") result for one selected item.
+    Previewed(size::TreeStats),
     Finished(Duration),
 }
 
@@ -134,6 +137,8 @@ pub struct ZapApp {
     /// ETA and the timer only count active work.
     pub paused_total: Duration,
     pub batch_session: Option<BatchSession>,
+    /// What the last "check only" run found, summed over the selection.
+    pub preview_total: size::TreeStats,
     pub last_batch_poll: Instant,
     pub has_dangerous_paths: bool,
     pub danger_confirmed: bool,
@@ -211,6 +216,7 @@ impl ZapApp {
             paused_at: None,
             paused_total: Duration::ZERO,
             batch_session,
+            preview_total: size::TreeStats::default(),
             last_batch_poll: Instant::now()
                 .checked_sub(Duration::from_secs(1))
                 .unwrap_or_else(Instant::now),
@@ -266,6 +272,24 @@ impl ZapApp {
             (Err(err), _) | (_, Err(err)) => (err.to_string(), true),
         });
         self.apply_settings(draft);
+    }
+
+    /// Open the operation journal in the default text viewer. Reports in
+    /// the settings status line when there is nothing to show yet.
+    pub fn open_journal(&mut self, lang: Language) {
+        let path = journal::journal_path();
+        if !path.exists() {
+            self.settings_status = Some((
+                crate::i18n::pick(lang, "The journal is empty so far.", "Журнал пока пуст.")
+                    .to_owned(),
+                false,
+            ));
+            return;
+        }
+        // `explorer <file>` opens it with the associated application.
+        if let Err(err) = std::process::Command::new("explorer").arg(&path).spawn() {
+            self.settings_status = Some((err.to_string(), true));
+        }
     }
 
     /// Create app with batch results arriving asynchronously — window opens
@@ -385,6 +409,7 @@ impl ZapApp {
             item.state = ItemState::Pending;
             item.progress = None;
         }
+        self.preview_total = size::TreeStats::default();
         thread::spawn(move || {
             let start = Instant::now();
             let mut outcomes: Vec<PathOutcome> = Vec::with_capacity(paths.len());
@@ -405,15 +430,16 @@ impl ZapApp {
                         continue;
                     }
                     let _ = sender.send(WorkerEvent::Started(path.clone()));
-                    let result = run_delete_path(
-                        &path,
-                        threads,
-                        dry_run,
-                        recycle,
-                        shred,
-                        allow_dangerous,
-                        &sender,
-                    );
+                    let result = if dry_run {
+                        // Same validation as the real run; nothing changes.
+                        delete::preview_path(&path, &FilterConfig::default(), allow_dangerous).map(
+                            |stats| {
+                                let _ = sender.send(WorkerEvent::Previewed(stats));
+                            },
+                        )
+                    } else {
+                        run_delete_path(&path, threads, recycle, shred, allow_dangerous, &sender)
+                    };
                     let result = normalize_worker_result(result, dry_run);
                     outcomes.push((path.clone(), result.as_ref().err().cloned()));
                     let _ = sender.send(WorkerEvent::Done(path, result));
@@ -488,6 +514,7 @@ impl ZapApp {
                 WorkerEvent::Progress(path, p) => {
                     apply(&mut self.items, &path, None, Some(Some(p)))
                 }
+                WorkerEvent::Previewed(stats) => self.preview_total += stats,
                 WorkerEvent::Done(path, Ok(())) => {
                     apply(&mut self.items, &path, Some(ItemState::Done), Some(None));
                 }
@@ -565,7 +592,11 @@ impl ZapApp {
         self.items
             .iter()
             .filter_map(|item| match &item.state {
-                ItemState::Failed(err) => Some(format!("{}\n  {}", item.path.display(), err)),
+                ItemState::Failed(err) => Some(format!(
+                    "{}\n  {}",
+                    item.path.display(),
+                    crate::i18n::localize_error(err, self.lang)
+                )),
                 _ => None,
             })
             .collect::<Vec<_>>()
@@ -573,6 +604,7 @@ impl ZapApp {
     }
 
     /// Paths that failed for a reason other than cancellation.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub fn failed_paths(&self) -> Vec<PathBuf> {
         self.items
             .iter()
@@ -1006,15 +1038,11 @@ fn spawn_size_calculation(
 pub fn run_delete_path(
     path: &Path,
     threads: Option<usize>,
-    dry_run: bool,
     recycle: bool,
     shred: bool,
     allow_dangerous: bool,
     sender: &Sender<WorkerEvent>,
 ) -> io::Result<()> {
-    if dry_run {
-        return delete::dry_run_path_silent(path);
-    }
     let bar = indicatif::ProgressBar::hidden();
     let monitor_bar = bar.clone();
     let monitor_path = path.to_path_buf();

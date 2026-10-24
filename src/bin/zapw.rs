@@ -1,7 +1,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 use rayon::prelude::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
@@ -188,7 +188,11 @@ fn notify_failures(failures: &[(PathBuf, String)], lang: Language, recycle: bool
     for (path, err) in failures.iter().take(SHOWN) {
         // The first line of the error is enough; details are in the journal.
         let first_line = err.lines().next().unwrap_or_default();
-        text.push_str(&format!("• {}\n   {}\n", path.display(), first_line));
+        text.push_str(&format!(
+            "• {}\n   {}\n",
+            path.display(),
+            zap::messages::localize(first_line, lang)
+        ));
     }
     if failures.len() > SHOWN {
         let more = failures.len() - SHOWN;
@@ -275,7 +279,7 @@ fn run_silent_delete_outcomes(options: &cli::CliOptions) -> Vec<PathOutcome> {
     #[cfg(windows)]
     if options.recycle && !options.dry_run {
         let errors = delete::recycle_paths_validated(&options.paths, false);
-        let error_index: HashMap<&Path, String> = errors
+        let error_index: std::collections::HashMap<&Path, String> = errors
             .iter()
             .map(|(path, err)| (path.as_path(), err.to_string()))
             .collect();
@@ -288,7 +292,7 @@ fn run_silent_delete_outcomes(options: &cli::CliOptions) -> Vec<PathOutcome> {
 
     let delete_one = |path: &Path| -> PathOutcome {
         let result = if options.dry_run {
-            delete::dry_run_path_silent(path)
+            delete::preview_path(path, &options.filter, false).map(|_| ())
         } else {
             // Build options via `to_delete_options` so recycle/shred/
             // only-empty/filters survive: constructing DeleteOptions

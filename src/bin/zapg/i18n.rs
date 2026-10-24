@@ -13,27 +13,28 @@ pub fn pick(lang: Language, en: &'static str, ru: &'static str) -> &'static str 
     }
 }
 
+pub use zap::messages::{localize as localize_error, plural};
+
 /// "item"/"items" in English; "элемент"/"элемента"/"элементов" in Russian.
 pub fn items_word(lang: Language, n: u64) -> &'static str {
-    match lang {
-        Language::Russian => {
-            let (rem10, rem100) = (n % 10, n % 100);
-            if rem10 == 1 && rem100 != 11 {
-                "элемент"
-            } else if (2..=4).contains(&rem10) && !(12..=14).contains(&rem100) {
-                "элемента"
-            } else {
-                "элементов"
-            }
-        }
-        _ => {
-            if n == 1 {
-                "item"
-            } else {
-                "items"
-            }
-        }
-    }
+    plural(
+        lang,
+        n,
+        ["item", "items"],
+        ["элемент", "элемента", "элементов"],
+    )
+}
+
+pub fn files_word(lang: Language, n: u64) -> &'static str {
+    plural(lang, n, ["file", "files"], ["файл", "файла", "файлов"])
+}
+
+pub fn folders_word(lang: Language, n: u64) -> &'static str {
+    plural(lang, n, ["folder", "folders"], ["папка", "папки", "папок"])
+}
+
+pub fn links_word(lang: Language, n: u64) -> &'static str {
+    plural(lang, n, ["link", "links"], ["ссылка", "ссылки", "ссылок"])
 }
 
 #[cfg(test)]
@@ -52,5 +53,8 @@ mod tests {
         assert_eq!(ru(104), "элемента");
         assert_eq!(items_word(Language::English, 1), "item");
         assert_eq!(items_word(Language::English, 2), "items");
+        assert_eq!(files_word(Language::Russian, 22), "файла");
+        assert_eq!(folders_word(Language::Russian, 1), "папка");
+        assert_eq!(folders_word(Language::English, 0), "folders");
     }
 }

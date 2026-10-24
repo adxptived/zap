@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+### Added
+
+- **"Check only" shows what would go** — the GUI preview reports files,
+  folders, links and size; `--dry-run` prints them per path with a total.
+- **Open journal** link in Settings.
+- **Optional code signing** in `rebuild.ps1` (`ZAP_SIGN_CERT_THUMBPRINT`).
+- **Protected paths on Linux/macOS** — system trees, `/home`, `/var`, `/tmp`,
+  `$HOME` and its standard folders.
+
+### Changed
+
+- **Recycle Bin uses `IFileOperation`** — per-item results, progress, Stop
+  support, no 260-character limit of our own.
+- **Engine errors are translated** in the Russian GUI and in the quick-delete
+  failure notice; English text reads "1 entry", not "1 entries".
+- `delete.rs` and the GUI's `ui.rs` are split into modules.
+
 ### Removed
 
 - **Space analysis (treemap) in the deletion dialog** — the dialog is for
@@ -11,6 +28,12 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **"Move to Recycle Bin" could delete permanently** — items the bin cannot
+  take (too large, network shares, drives without a bin) were destroyed
+  without a prompt. They are now skipped with an error.
+- **`--dry-run` ignored `--include`/`--exclude`/size/date filters** and
+  reported the whole folder.
+- **CI lint failed on Ubuntu** — Windows-only code tripped `dead_code` there.
 - **Dialog stayed tall after visiting Settings** — the window could only
   grow: the content was measured on the central panel, whose size always
   equals the window. It is now measured on its own, so the window shrinks

@@ -22,6 +22,7 @@ const SEPARATOR_BEFORE: u32 = 0x20;
 
 /// Every key Zap (or its predecessor turbo-delete) may have created,
 /// relative to `HKCU\Software\Classes`.
+#[cfg_attr(not(windows), allow(dead_code))]
 const ALL_KNOWN_KEYS: &[&str] = &[
     r"AllFilesystemObjects\shell\zap",
     r"AllFilesystemObjects\shell\zap-1-dialog",
