@@ -97,29 +97,31 @@ struct Labels {
 
 fn labels(language: Language, layout: MenuLayout) -> Labels {
     match (language.resolve(), layout) {
+        // Labels say exactly what happens: "…" = a window opens first;
+        // the quick action states that nothing asks for confirmation.
         (Language::Russian, MenuLayout::Submenu) => Labels {
-            dialog: "Удалить…",
+            dialog: "Удалить с подтверждением…",
             recycle: "Переместить в корзину",
-            quick: "Удалить безвозвратно",
-            background: "Удалить эту папку через Zap…",
+            quick: "Быстрое удаление (без подтверждения)",
+            background: "Zap: удалить текущую папку…",
         },
         (Language::Russian, MenuLayout::Flat) => Labels {
-            dialog: "Удалить через Zap…",
-            recycle: "В корзину через Zap",
-            quick: "Удалить безвозвратно через Zap",
-            background: "Удалить эту папку через Zap…",
+            dialog: "Zap: удалить с подтверждением…",
+            recycle: "Zap: переместить в корзину",
+            quick: "Zap: быстрое удаление (без подтверждения)",
+            background: "Zap: удалить текущую папку…",
         },
         (_, MenuLayout::Submenu) => Labels {
-            dialog: "Delete…",
+            dialog: "Delete with confirmation…",
             recycle: "Move to Recycle Bin",
-            quick: "Delete permanently",
-            background: "Delete this folder with Zap…",
+            quick: "Quick delete (no confirmation)",
+            background: "Zap: Delete current folder…",
         },
         (_, MenuLayout::Flat) => Labels {
-            dialog: "Delete with Zap…",
-            recycle: "Recycle with Zap",
-            quick: "Delete permanently with Zap",
-            background: "Delete this folder with Zap…",
+            dialog: "Zap: Delete with confirmation…",
+            recycle: "Zap: Move to Recycle Bin",
+            quick: "Zap: Quick delete (no confirmation)",
+            background: "Zap: Delete current folder…",
         },
     }
 }
@@ -540,7 +542,7 @@ mod tests {
         let dialog = find(&keys, r"shell\zap-1-dialog").unwrap();
         assert_eq!(
             value(dialog, "MUIVerb"),
-            Some(&RegValue::Str("Delete with Zap…".into()))
+            Some(&RegValue::Str("Zap: Delete with confirmation…".into()))
         );
         assert!(value(dialog, "Extended").is_some());
         assert!(find(&keys, r"shell\zap-2-recycle").is_none());
@@ -579,7 +581,7 @@ mod tests {
         let dialog = find(&keys, r"zap\shell\1-dialog").unwrap();
         assert_eq!(
             value(dialog, "MUIVerb"),
-            Some(&RegValue::Str("Удалить…".into()))
+            Some(&RegValue::Str("Удалить с подтверждением…".into()))
         );
     }
 }

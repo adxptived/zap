@@ -19,7 +19,7 @@ then pick the safe GUI confirmation flow or the silent immediate-delete action.
 ## Features
 
 - **Explorer-first GUI** — `Zap -> Delete...` opens a compact confirmation dialog.
-- **Windowless delete** — `Zap → Delete permanently` deletes the selection without a GUI or terminal window.
+- **Windowless delete** — `Zap → Quick delete (no confirmation)` deletes the selection without a GUI or terminal window.
 - **Multi-select support** — Explorer selections are batched into one coordinated operation.
 - **Fast deletion engine** — on Windows each worker lists a folder with `FindFirstFileExW`, deletes its files right away and recurses into subfolders in parallel (`rayon`); folders are removed as soon as they are empty.
 - **Safety guards** — filesystem roots are refused, protected paths are blocked, and symlinks/junctions are never traversed.
@@ -40,7 +40,7 @@ irm https://raw.githubusercontent.com/adxptived/zap/master/dist/install.ps1 | ie
 The installer adds the Zap submenu to Windows Explorer and installs:
 
 - `zapg.exe` for the default GUI confirmation action.
-- `zapw.exe` for the windowless **Delete permanently** / **Move to Recycle Bin** actions.
+- `zapw.exe` for the windowless **Quick delete** / **Move to Recycle Bin** actions.
 - `zap.exe` for optional terminal use.
 
 To uninstall, use the Start Menu uninstaller. To remove only the Explorer menu,
@@ -56,11 +56,11 @@ Right-click any file or folder and open the **Zap** submenu:
 
 | Menu item | Behavior |
 | --- | --- |
-| **Delete…** | Opens the confirmation dialog. The default and safest flow. |
+| **Delete with confirmation…** | Opens the confirmation dialog. The default and safest flow. |
 | **Move to Recycle Bin** | Recycles immediately, no window. Restorable. |
-| **Delete permanently** | Deletes immediately with no window. A message appears only if something fails. |
+| **Quick delete (no confirmation)** | Deletes permanently and immediately, with no window. A message appears only if something fails. |
 
-Right-clicking the folder background offers **Delete this folder with Zap…**,
+Right-clicking the folder background offers **Zap: Delete current folder…**,
 which always opens the confirmation dialog — it never deletes silently.
 
 ## Settings

@@ -874,9 +874,15 @@ fn mode_switch(ui: &mut egui::Ui, mode: &mut DefaultMode, lang: Language, pal: &
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
         for (value, label) in [
-            (DefaultMode::Delete, pick(lang, "Delete", "Удалить")),
+            (
+                DefaultMode::Delete,
+                pick(lang, "Delete permanently", "Удалить навсегда"),
+            ),
             (DefaultMode::Recycle, pick(lang, "Recycle Bin", "В корзину")),
-            (DefaultMode::Shred, pick(lang, "Shred", "Затереть")),
+            (
+                DefaultMode::Shred,
+                pick(lang, "Shred data", "Затереть данные"),
+            ),
         ] {
             let selected = *mode == value;
             let text_color = if selected {
@@ -1185,9 +1191,9 @@ fn render_actions(
                 app.open_settings();
             }
             let analyzer_label = if app.show_treemap {
-                pick(lang, "Hide disk usage", "Скрыть карту диска")
+                pick(lang, "Hide space analysis", "Скрыть анализ места")
             } else {
-                pick(lang, "Disk usage", "Карта диска")
+                pick(lang, "Space analysis", "Анализ места")
             };
             if ui
                 .add(
@@ -1208,7 +1214,7 @@ fn render_actions(
             match phase {
                 Phase::Running | Phase::Paused => {
                     if ui
-                        .add(egui::Button::new(pick(lang, "Stop", "Стоп")).min_size(size))
+                        .add(egui::Button::new(pick(lang, "Stop", "Остановить")).min_size(size))
                         .clicked()
                     {
                         zap::stop::request_stop();
@@ -1216,7 +1222,7 @@ fn render_actions(
                     let label = if phase == Phase::Paused {
                         pick(lang, "Resume", "Продолжить")
                     } else {
-                        pick(lang, "Pause", "Пауза")
+                        pick(lang, "Pause", "Приостановить")
                     };
                     if ui.add(egui::Button::new(label).min_size(size)).clicked() {
                         app.toggle_pause();
@@ -1229,10 +1235,20 @@ fn render_actions(
                             (pick(lang, "Preview again", "Проверить снова"), pal.accent)
                         }
                         (_, true) => (pick(lang, "Retry", "Повторить"), pal.danger),
-                        (Mode::Preview, _) => (pick(lang, "Preview", "Проверить"), pal.accent),
-                        (Mode::Recycle, _) => (pick(lang, "Recycle", "В корзину"), pal.warn),
-                        (Mode::Shred, _) => (pick(lang, "Shred", "Затереть"), pal.danger),
-                        (Mode::Delete, _) => (pick(lang, "Delete", "Удалить"), pal.danger),
+                        (Mode::Preview, _) => {
+                            (pick(lang, "Run preview", "Выполнить проверку"), pal.accent)
+                        }
+                        (Mode::Recycle, _) => (
+                            pick(lang, "Move to Recycle Bin", "Переместить в корзину"),
+                            pal.warn,
+                        ),
+                        (Mode::Shred, _) => {
+                            (pick(lang, "Shred data", "Затереть данные"), pal.danger)
+                        }
+                        (Mode::Delete, _) => (
+                            pick(lang, "Delete permanently", "Удалить навсегда"),
+                            pal.danger,
+                        ),
                     };
                     let primary =
                         egui::Button::new(RichText::new(label).strong().color(Color32::WHITE))
@@ -1366,8 +1382,8 @@ fn render_settings(ui: &mut egui::Ui, app: &mut ZapApp) {
                         &mut draft.menu.show_dialog,
                         pick(
                             lang,
-                            "Delete… (with confirmation)",
-                            "Удалить… (с подтверждением)",
+                            "Delete with confirmation…",
+                            "Удалить с подтверждением…",
                         ),
                     );
                     ui.checkbox(
@@ -1378,8 +1394,8 @@ fn render_settings(ui: &mut egui::Ui, app: &mut ZapApp) {
                         &mut draft.menu.show_quick_delete,
                         pick(
                             lang,
-                            "Delete permanently (no confirmation)",
-                            "Удалить безвозвратно (без подтверждения)",
+                            "Quick delete (no confirmation)",
+                            "Быстрое удаление (без подтверждения)",
                         ),
                     );
                 });
