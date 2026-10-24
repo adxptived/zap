@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="assets/screenshots/dialog-v1.4.png" width="476" alt="Zap deletion dialog" />
+  <img src="assets/screenshots/dialog-1.4.0.png" width="462" alt="Zap deletion dialog" />
 </p>
 
 Deleting `node_modules`, build output or a huge checkout with Explorer can take
