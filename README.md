@@ -1,185 +1,134 @@
-# Zap
+<p align="center">
+  <img src="assets/branding/zap.png" width="120" alt="Zap" />
+</p>
 
-Fast Windows deletion from Explorer, with a confirmation dialog by default and
-a windowless immediate-delete action when you need it.
+<h1 align="center">Zap</h1>
 
 <p align="center">
-  <img src="assets/branding/zap.png" width="140" alt="Zap logo" />
+  Fast folder and file deletion for Windows, right from Explorer.
 </p>
 
 <p align="center">
-  <img src="assets/screenshots/delete-dialog.png" alt="Zap confirmation dialog" />
+  <a href="https://github.com/adxptived/zap/releases/latest"><img src="https://img.shields.io/github/v/release/adxptived/zap" alt="Latest release" /></a>
+  <a href="https://github.com/adxptived/zap/actions/workflows/ci.yml"><img src="https://github.com/adxptived/zap/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
+  <a href="LICENSE.txt"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="License" /></a>
 </p>
 
-Zap removes large directory trees faster than the default Windows delete flow by
-combining parallel directory scanning with multi-threaded file removal. The main
-workflow is Explorer-first: right-click selected files or folders, choose Zap,
-then pick the safe GUI confirmation flow or the silent immediate-delete action.
+<p align="center">
+  <img src="assets/screenshots/delete-dialog.png" width="476" alt="Zap deletion dialog" />
+</p>
 
-## Features
+Deleting `node_modules`, build output or a huge checkout with Explorer can take
+minutes. Zap does it in seconds: it walks and deletes the tree in parallel and
+removes each folder the moment it is empty. Right-click, confirm, done.
 
-- **Explorer-first GUI** — `Zap -> Delete...` opens a compact confirmation dialog.
-- **Windowless delete** — `Zap → Quick delete (no confirmation)` deletes the selection without a GUI or terminal window.
-- **Multi-select support** — Explorer selections are batched into one coordinated operation.
-- **Fast deletion engine** — on Windows each worker lists a folder with `FindFirstFileExW`, deletes its files right away and recurses into subfolders in parallel (`rayon`); folders are removed as soon as they are empty.
-- **Safety guards** — filesystem roots are refused, protected paths are blocked, and symlinks/junctions are never traversed.
-- **Read-only recovery** — read-only attributes are cleared and deletion is retried when possible.
-- **Filter support** — glob pattern filtering, size filtering, and date-based filtering.
-- **Secure deletion** — overwrite files with random data before removing (`--shred`), also available as a checkbox in the GUI.
-- **Recycle Bin** — send to Recycle Bin instead of permanent delete (`--recycle`). Multiple items are moved with a single shell call — one Explorer "Undo" restores everything. Anything the bin cannot take (too large, a drive without a bin) is skipped with an error, never deleted permanently.
+## Download
 
-## Installation
+| File | |
+| --- | --- |
+| [`Zap-Setup.exe`](https://github.com/adxptived/zap/releases/latest/download/Zap-Setup.exe) | Installs Zap and adds it to the Explorer menu |
+| [`Zap-Portable.zip`](https://github.com/adxptived/zap/releases/latest/download/Zap-Portable.zip) | The same programs, no installation |
 
-Download `Zap-Setup.exe` from the [latest GitHub release](https://github.com/adxptived/zap/releases/latest),
-or install with PowerShell:
+Or from PowerShell:
 
 ```powershell
 irm https://raw.githubusercontent.com/adxptived/zap/master/dist/install.ps1 | iex
 ```
 
-The installer adds the Zap submenu to Windows Explorer and installs:
+The installer is per-user (no admin rights) and puts `zap` on your `PATH`.
+The binaries are not code-signed yet, so Windows SmartScreen may ask once:
+**More info → Run anyway**.
 
-- `zapg.exe` for the default GUI confirmation action.
-- `zapw.exe` for the windowless **Quick delete** / **Move to Recycle Bin** actions.
-- `zap.exe` for optional terminal use.
+## Using it
 
-To uninstall, use the Start Menu uninstaller. To remove only the Explorer menu,
-turn it off in Settings or run:
+Right-click files or folders in Explorer and open **Zap**:
 
-```powershell
-zapg.exe --unregister-menu
-```
-
-## Explorer Usage
-
-Right-click any file or folder and open the **Zap** submenu:
-
-| Menu item | Behavior |
+| Menu item | What happens |
 | --- | --- |
-| **Delete with confirmation…** | Opens the confirmation dialog. The default and safest flow. |
-| **Move to Recycle Bin** | Recycles immediately, no window. Restorable. |
-| **Quick delete (no confirmation)** | Deletes permanently and immediately, with no window. A message appears only if something fails. |
+| **Delete with confirmation…** | Opens the dialog above: size, item count, and a choice of action |
+| **Move to Recycle Bin** | Recycled immediately, restorable with Undo |
+| **Quick delete (no confirmation)** | Deleted permanently and immediately; a message appears only if something fails |
 
-Right-clicking the folder background offers **Zap: Delete current folder…**,
-which always opens the confirmation dialog — it never deletes silently.
+Right-clicking the empty space of a folder offers **Delete current folder…**,
+which always asks first.
 
-## Settings
+In the dialog you can delete permanently, move to the Recycle Bin, or use
+**Secure delete** (overwrite, then delete). **Preview only** shows what would
+be removed without touching anything. You can also drop more files onto the
+window, remove items before starting, pause or stop a run, and copy a failure
+report. If something is locked by another program, **Retry as administrator**
+retries just those items.
 
-Open **Zap Settings** from the Start Menu, the ⚙ button in the dialog, or
-`zapg.exe --settings`. Saving re-registers the Explorer menu immediately.
+### Settings
 
-- **Language** — system default, English or Russian (dialog and menu labels).
-- **Context menu** — on/off, submenu or items directly in the menu, icons on/off,
-  which actions to show, the folder-background entry, Shift-only. A live
-  preview shows exactly what will be registered.
-- **Dialog** — default action (Delete permanently / Recycle Bin / Secure delete), auto-close after
-  success, failure notifications for windowless deletions, operation journal,
-  worker-thread limit.
+Open **Zap Settings** from the Start menu, the dialog, or `zapg --settings`:
 
-Settings are stored in `%APPDATA%\zap\settings.ini` (plain `key = value`).
+- language (system, English, Russian);
+- the Explorer menu: submenu or flat, icons, which actions, Shift-only;
+- the default action, auto-close after success, failure messages, worker threads;
+- the operation journal — every run is logged to `%LOCALAPPDATA%\zap\journal.log`.
 
-The dialog also supports **Preview only**, drag & drop to add items, removing
-items before the run, Pause/Stop, and a copyable failure report.
-## Optional Terminal Usage
+## Safety
 
-The terminal interface is secondary. Use it for scripts, automation, or manual
-debugging.
+Zap deletes for real, so it refuses what it should not touch:
 
-```shell
-zap [FLAGS] [OPTIONS] <path>...
-zap --help
-zap --version
-```
+- **Drive and share roots** (`C:\`, `\\server\share`) — always refused.
+- **System folders** — `C:\Windows`, `Program Files`, `ProgramData` and
+  everything inside them need an explicit extra confirmation.
+- **Profile folders** — `C:\Users`, your profile and its Desktop, Documents,
+  Downloads, AppData, OneDrive and other known folders (also when redirected
+  to another drive) need it too; what is *inside* them stays deletable.
+- **Links are never followed** — symlinks and junctions are removed as links,
+  and the engine opens every folder relative to its parent, so a link swapped
+  in mid-run cannot redirect it elsewhere.
+- **The Recycle Bin never turns into permanent deletion** — anything the bin
+  cannot take (too large, network drive) is skipped with an error.
+- **Secure delete leaves hard links alone** — a file shared with other names
+  is unlinked, not overwritten. On SSDs overwriting is best-effort.
 
-| Flag | Description |
-| --- | --- |
-| `--yes`, `--force` | Required for destructive terminal deletion. |
-| `--dry-run` | Preview without removing files: files, folders and size per path plus a total, computed with the same filters as the real run. Exits with 1 if any path could not be deleted. |
-| `--threads N`, `-j N` | Override the Rayon worker thread count. |
-| `--silent` | Suppress progress output. Used by `zapw.exe`. |
-| `--batch` | Internal Explorer multi-select coordination flag. |
-| `--shred` | Overwrite files with random data before deleting (3 passes). Note: file names/MFT records are not wiped, and on SSDs wear-leveling means overwrites are best-effort. |
-| `--only-empty` | Only delete if the directory is empty. |
-| `--recycle` | Send to Recycle Bin instead of permanent delete (also a checkbox in the GUI dialog and an Explorer context-menu entry). Batched: one shell call / one Undo for the whole selection. |
-| `--no-size-preview` | Show the confirmation prompt immediately without calculating preview sizes. Useful for huge trees where sizing would feel like a hang. |
-| `--include GLOB` | Only delete paths matching glob pattern (repeatable). |
-| `--exclude GLOB` | Skip paths matching glob pattern (repeatable). |
-| `--min-size SIZE` | Only delete files larger than SIZE (bytes, or `10k`, `5mb`, `1.5g`, `2tb`). |
-| `--newer-than WHEN` | Only delete files newer than a date/time (RFC 3339) or age (e.g. `12h`, `30d`). |
-| `--older-than WHEN` | Only delete files older than a date/time (RFC 3339) or age (e.g. `12h`, `30d`). |
-| `--` | Treat every following argument as a path (for names starting with `-`). |
-
-Examples:
-
-```shell
-zap --dry-run "C:\temp\build-output"
-zap --yes "C:\temp\build-output"
-zap --yes --threads 4 "C:\temp\huge-repo"
-zap --no-size-preview "C:\temp\huge-repo"
-zap --yes --shred "C:\temp\secret-files"
-zap --yes --exclude "*.log" --min-size 10mb "C:\temp\project"
-zap --yes -- "-weird-folder-name"
-```
-
-## Performance Notes
-
-For large Explorer or CLI selections made of many top-level files, Zap uses a bulk
-file-root delete path. This avoids creating one worker/progress item per file and
-keeps selections with thousands of files responsive while preserving the same
-file, symlink, cancellation, and error-reporting behavior. Directory roots still
-use the streaming scan/delete pipeline.
-
-## Safety Model
-
-Zap is destructive, so the deletion engine keeps several guardrails in place:
-
-- Drive roots such as `C:\` and `D:\` are always refused.
-- Known system and profile roots are protected.
-- Symlinks and junctions are removed as links only; targets are not traversed.
-- Read-only files and directories are retried after clearing the read-only flag.
-- The GUI keeps the dialog open when deletion fails so the error remains visible.
-- `--recycle` is also subject to protection guards (cannot recycle system paths).
-- On Linux/macOS the CLI protects system trees (`/usr`, `/etc`, `/boot`, …) and
-  the folders `/home`, `/var`, `/tmp`, `$HOME` and its standard subfolders
-  themselves; their contents stay deletable.
-
-Protected examples include:
-
-- `C:\Windows`
-- `C:\Program Files`
-- `C:\ProgramData`
-- `C:\Users`
-- user profile roots and well-known folders such as `Desktop`, `Documents`, `Downloads`, `AppData`
-- `C:\System Volume Information`
-- `C:\Recovery`
-
-## Build From Source
-
-Prerequisites:
-
-- Rust toolchain with the MSVC target.
-- Python with PyInstaller on `PATH`.
-- Inno Setup 6.
-
-```shell
-git clone https://github.com/adxptived/zap.git
-cd zap
-cargo build --profile release-optimized
-```
-
-Build the full Windows release package:
-
-```bat
-rebuild.bat
-```
-
-The installer is written to:
+## Command line
 
 ```text
-dist\output\Zap-Setup.exe
+zap [options] <path>...
 ```
 
-## Development
+Without `--yes` Zap shows what it is about to delete and asks first.
+
+| Option | |
+| --- | --- |
+| `--yes` | Delete without asking |
+| `--dry-run` | Show what would be deleted (files, folders, size), change nothing |
+| `--recycle` | Move to the Recycle Bin |
+| `--shred` | Overwrite files before deleting |
+| `--only-empty` | Delete folders only if they are empty |
+| `--include GLOB`, `--exclude GLOB` | Delete only matching / skip matching paths (repeatable) |
+| `--min-size SIZE` | Only files of at least SIZE (`512k`, `10mb`, `1.5g`) |
+| `--newer-than WHEN`, `--older-than WHEN` | By modification time: a date (`2026-01-01T00:00:00Z`) or an age (`12h`, `30d`) |
+| `--threads N` | Number of worker threads |
+| `--journal [N]` | Show the last N journal entries |
+| `--no-journal` | Do not log this run |
+
+```shell
+zap --dry-run D:\projects\app\node_modules
+zap --yes D:\projects\app\node_modules D:\projects\app\dist
+zap --yes --exclude "*.log" D:\temp\build
+zap --yes --older-than 30d D:\downloads\cache
+```
+
+`zap --help` lists everything. The command-line tool also builds and is
+tested on Linux, where `/usr`, `/etc`, `/home`, your home folder and the like
+are protected the same way.
+
+## Building
+
+Requirements: Rust (MSVC toolchain) and, for the installer, Inno Setup 6.
+
+```shell
+cargo build --release      # zap.exe, zapg.exe, zapw.exe in target\release
+rebuild.bat                # optimized build + installer in dist\output
+```
+
+Before sending changes:
 
 ```shell
 cargo fmt
@@ -187,71 +136,10 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-Useful build scripts:
-
-| Script | Purpose |
-| --- | --- |
-| `rebuild.bat` | Non-interactive full release pipeline. |
-| `rebuild-ui.bat` | Interactive build menu for local development. |
-| `rebuild.ps1` | Shared PowerShell build pipeline. |
-
-Code signing is optional: set `ZAP_SIGN_CERT_THUMBPRINT` to the SHA-1
-thumbprint of a code-signing certificate in your certificate store (and
-optionally `ZAP_SIGN_TIMESTAMP_URL`) and `rebuild.ps1` signs `zap.exe`,
-`zapw.exe`, `zapg.exe` and the installer with `signtool` from the Windows
-SDK. Without the variable the build stays unsigned.
-
-Generated paths:
-
-- `target/` — Cargo output.
-- `build/` — PyInstaller work files.
-- `bin/` — staged release binaries.
-- `dist/output/` — final installer output.
-
-## Project Layout
-
-```text
-src/
-  main.rs                  Console CLI and batch coordination
-  cli.rs                   Argument parser
-  delete/                  Deletion engine (tree, bulk, preview, retry, report)
-  messages.rs              Engine error texts and their translation
-  scan.rs                  Directory walking and entry classification
-  protect.rs               Protected path checks
-  filter.rs                Glob pattern and metadata filtering
-  recycle.rs               Recycle Bin integration (IFileOperation)
-  tree_delete.rs           Windows handle-based tree deletion
-  journal.rs               Operation journal
-  settings.rs              User settings
-  context_menu.rs          Explorer context-menu registration
-  shred.rs                 Secure deletion (overwrite with random data)
-  size.rs                  Directory size calculation
-  stop.rs                  Global graceful-stop signal
-  path_utils.rs            Path formatting and dedup helpers
-  batch.rs                 Multi-process Explorer batch coordination
-  winapi.rs                Windows API helpers
-  bin/
-    zapg/                  Explorer GUI confirmation dialog
-      main.rs              Entry point, args, batch coordinator election
-      app.rs               Dialog state and background workers
-      ui/                  Theme, home, dialog and settings screens
-    zapw.rs                Windowless immediate-delete binary
-
-assets/
-  branding/                Logo and installer icon
-  screenshots/             README and release screenshots
-  manifests/               UAC manifests for Explorer-launched binaries
-
-dist/
-  zap.iss                  Inno Setup installer script
-  install.ps1              Remote install script
-```
-
-## Release Artifact
-
-- Installer: `dist\output\Zap-Setup.exe`
-- SHA256: `01DE05E6F357BA1CF97AF0355E1D63556D3945F811E941EA0BF866DEACE91743`
+Set `ZAP_SIGN_CERT_THUMBPRINT` to have `rebuild.ps1` sign the binaries and the
+installer. Contributor notes and the module map are in [AGENTS.md](AGENTS.md);
+the history is in [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
-Apache-2.0. See [LICENSE.txt](LICENSE.txt).
+[Apache-2.0](LICENSE.txt)

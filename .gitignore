@@ -23,6 +23,8 @@ pytest-cache-files-*/
 # Codex/AI session artifacts
 /.antigravitycli/
 /write_delete.py
-/AUDIT_*.md
+/AUDIT*.md
 /docs/superpowers/
 /.codex-targetf5l4Um/
+# Local AI-tool state
+/.commandcode/
