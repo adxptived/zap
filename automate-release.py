@@ -5,7 +5,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent
-INSTALLER = ROOT / "dist" / "output" / "Zap.exe"
+INSTALLER = ROOT / "dist" / "output" / "Zap-Setup.exe"
 INSTALL_SCRIPT = ROOT / "dist" / "install.ps1"
 
 

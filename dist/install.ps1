@@ -1,9 +1,9 @@
 $ErrorActionPreference = "Stop"
 
 $expectedHash = "03A59F72A5EBAA08B61DF2DA2296FE9A22346DFC2D5F0C7355E5CDF17F02FC68"
-$installerUrl = "https://github.com/adxptived/zap/releases/latest/download/Zap.exe"
+$installerUrl = "https://github.com/adxptived/zap/releases/latest/download/Zap-Setup.exe"
 
-$installerPath = Join-Path $env:TEMP 'Zap.exe'
+$installerPath = Join-Path $env:TEMP 'Zap-Setup.exe'
 Start-BitsTransfer $installerUrl $installerPath -Description 'Downloading Zap from GitHub Releases' -DisplayName 'Downloading Zap' -TransferType Download
 
 if ($expectedHash -eq "__ZAP_SHA256__") {

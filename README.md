@@ -30,7 +30,7 @@ then pick the safe GUI confirmation flow or the silent immediate-delete action.
 
 ## Installation
 
-Download `Zap.exe` from the [latest GitHub release](https://github.com/adxptived/zap/releases/latest),
+Download `Zap-Setup.exe` from the [latest GitHub release](https://github.com/adxptived/zap/releases/latest),
 or install with PowerShell:
 
 ```powershell
@@ -176,7 +176,7 @@ rebuild.bat
 The installer is written to:
 
 ```text
-dist\output\Zap.exe
+dist\output\Zap-Setup.exe
 ```
 
 ## Development
@@ -249,7 +249,7 @@ dist/
 
 ## Release Artifact
 
-- Installer: `dist\output\Zap.exe`
+- Installer: `dist\output\Zap-Setup.exe`
 - SHA256: `01DE05E6F357BA1CF97AF0355E1D63556D3945F811E941EA0BF866DEACE91743`
 
 ## License

@@ -18,7 +18,7 @@ $DistDir = Join-Path $Root "dist"
 $BuildDir = if ($env:ZAP_BUILD_DIR) { $env:ZAP_BUILD_DIR } else { Join-Path $Root "build" }
 $CargoTargetRoot = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $Root "target" }
 $OptimizedTargetDir = Join-Path $CargoTargetRoot "release-optimized"
-$InstallerPath = Join-Path $DistDir "output\Zap.exe"
+$InstallerPath = Join-Path $DistDir "output\Zap-Setup.exe"
 
 function Write-Step {
     param([string]$Message)
