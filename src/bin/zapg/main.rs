@@ -7,6 +7,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod app;
+mod i18n;
 mod taskbar;
 mod ui;
 
@@ -31,7 +32,22 @@ pub const WINDOW_HEIGHT_MAX: f32 = 760.0;
 
 fn main() -> eframe::Result<()> {
     let args = parse_args();
+
+    // Installer / uninstaller hooks: no window, exit code reports success.
+    #[cfg(windows)]
+    if args.register_menu || args.unregister_menu {
+        let result = if args.register_menu {
+            zap::context_menu::MenuTargets::beside_current_exe().and_then(|targets| {
+                zap::context_menu::apply(&zap::settings::Settings::load(), &targets)
+            })
+        } else {
+            zap::context_menu::unregister()
+        };
+        std::process::exit(if result.is_ok() { 0 } else { 1 });
+    }
+
     zap::parallelism::init_global_pool();
+    let settings = zap::settings::Settings::load();
 
     // In batch mode: non-coordinators must exit silently without opening
     // a window. Only the process that wins the lock shows the GUI. The
@@ -82,8 +98,22 @@ fn main() -> eframe::Result<()> {
             } else {
                 ZapApp::new(paths, args.threads, None)
             };
-            app.recycle = args.recycle;
-            app.no_journal = args.no_journal;
+            app.apply_settings(settings);
+            // Explicit command-line flags override the saved defaults.
+            if args.recycle {
+                app.recycle = true;
+                app.shred = false;
+            }
+            if args.no_journal {
+                app.no_journal = true;
+            }
+            if let Some(threads) = args.threads {
+                app.threads_enabled = true;
+                app.threads_text = threads.to_string();
+            }
+            if args.settings {
+                app.open_settings();
+            }
             Ok(Box::new(app))
         }),
     )
@@ -162,6 +192,9 @@ struct GuiArgs {
     batch: bool,
     recycle: bool,
     no_journal: bool,
+    settings: bool,
+    register_menu: bool,
+    unregister_menu: bool,
     threads: Option<usize>,
     paths: Vec<PathBuf>,
 }
@@ -178,6 +211,9 @@ fn parse_args_from(args: impl IntoIterator<Item = std::ffi::OsString>) -> GuiArg
             Some("--batch") => parsed.batch = true,
             Some("--recycle") => parsed.recycle = true,
             Some("--no-journal") => parsed.no_journal = true,
+            Some("--settings") => parsed.settings = true,
+            Some("--register-menu") => parsed.register_menu = true,
+            Some("--unregister-menu") => parsed.unregister_menu = true,
             Some("--threads") | Some("-j") => {
                 if let Some(value) = args.next() {
                     parsed.threads = value

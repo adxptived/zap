@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 use zap::journal::{self, JournalAction, PathOutcome};
+use zap::settings::Language;
 use zap::{batch, cli, delete, path_utils};
 
 /// Internal flag used to distinguish the detached background worker
@@ -122,6 +123,14 @@ fn worker_main(args: Vec<OsString>, batch_already_written: bool) {
         options.dry_run = true;
     }
 
+    let settings = zap::settings::Settings::load();
+    if !settings.journal {
+        options.no_journal = true;
+    }
+    if options.threads.is_none() {
+        options.threads = settings.threads;
+    }
+
     let mut batch_run = None;
 
     if options.batch {
@@ -140,11 +149,89 @@ fn worker_main(args: Vec<OsString>, batch_already_written: bool) {
         }
     }
 
-    let _ = run_silent_delete(&options);
+    let mut failures = run_silent_delete_collect(&options);
 
     if let Some(run) = batch_run {
-        drain_late_batch_paths(&options, run);
+        failures.extend(drain_late_batch_paths(&options, run));
     }
+
+    if settings.notify_failures && !options.dry_run && !failures.is_empty() {
+        notify_failures(&failures, settings.language.resolve(), options.recycle);
+    }
+}
+
+/// Windowless runs have no other way to report errors: without this a
+/// locked file made "Delete permanently" silently do nothing.
+fn notify_failures(failures: &[(PathBuf, String)], lang: Language, recycle: bool) {
+    const SHOWN: usize = 8;
+    let ru = lang == Language::Russian;
+    let mut text = if ru {
+        format!(
+            "Не удалось {} ({}):\n\n",
+            if recycle {
+                "переместить в корзину"
+            } else {
+                "удалить"
+            },
+            failures.len()
+        )
+    } else {
+        format!(
+            "Zap could not {} {} item(s):\n\n",
+            if recycle { "recycle" } else { "delete" },
+            failures.len()
+        )
+    };
+    for (path, err) in failures.iter().take(SHOWN) {
+        // The first line of the error is enough; details are in the journal.
+        let first_line = err.lines().next().unwrap_or_default();
+        text.push_str(&format!("• {}\n   {}\n", path.display(), first_line));
+    }
+    if failures.len() > SHOWN {
+        let more = failures.len() - SHOWN;
+        text.push_str(&if ru {
+            format!("… и ещё {more}\n")
+        } else {
+            format!("… and {more} more\n")
+        });
+    }
+    text.push_str(if ru {
+        "\nЗакройте программы, использующие эти файлы, и повторите."
+    } else {
+        "\nClose programs that use these files, then try again."
+    });
+    show_message_box(&text, "Zap");
+}
+
+#[cfg(windows)]
+fn show_message_box(text: &str, caption: &str) {
+    extern "system" {
+        fn MessageBoxW(
+            hwnd: *mut std::ffi::c_void,
+            text: *const u16,
+            caption: *const u16,
+            kind: u32,
+        ) -> i32;
+    }
+    const MB_ICONWARNING: u32 = 0x30;
+    const MB_SETFOREGROUND: u32 = 0x1_0000;
+    const MB_TOPMOST: u32 = 0x4_0000;
+    let wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
+    let (text, caption) = (wide(text), wide(caption));
+    // SAFETY: both buffers are NUL-terminated and outlive the call.
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            text.as_ptr(),
+            caption.as_ptr(),
+            MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST,
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn show_message_box(text: &str, _caption: &str) {
+    eprintln!("{text}");
 }
 
 /// Whether top-level paths should be deleted in parallel via `par_iter`.
@@ -160,11 +247,19 @@ fn should_parallelize_top_level(options: &cli::CliOptions) -> bool {
             .all(|path| fs::symlink_metadata(path).is_ok_and(|m| !m.is_dir()))
 }
 
+#[cfg(test)]
 fn run_silent_delete(options: &cli::CliOptions) -> bool {
+    run_silent_delete_collect(options).is_empty()
+}
+
+/// Delete, journal, and return the failed paths with their errors.
+fn run_silent_delete_collect(options: &cli::CliOptions) -> Vec<(PathBuf, String)> {
     let outcomes = run_silent_delete_outcomes(options);
-    let ok = outcomes.iter().all(|(_, err)| err.is_none());
     record_journal(options, &outcomes);
-    ok
+    outcomes
+        .into_iter()
+        .filter_map(|(path, err)| err.map(|err| (path, err)))
+        .collect()
 }
 
 /// Delete all paths, returning a per-path outcome (`None` = success) so the
@@ -293,8 +388,9 @@ fn collect_existing_batch_paths() -> Option<BatchRun> {
     })
 }
 
-fn drain_late_batch_paths(options: &cli::CliOptions, run: BatchRun) {
+fn drain_late_batch_paths(options: &cli::CliOptions, run: BatchRun) -> Vec<(PathBuf, String)> {
     let mut processed: HashSet<PathBuf> = options.paths.iter().cloned().collect();
+    let mut failures = Vec::new();
 
     loop {
         wait_for_batch_quiet_fast(&run.paths_dir);
@@ -309,13 +405,14 @@ fn drain_late_batch_paths(options: &cli::CliOptions, run: BatchRun) {
         let mut late_options = options.clone();
         late_options.paths = pending.clone();
         late_options.batch = false;
-        let _ = run_silent_delete(&late_options);
+        failures.extend(run_silent_delete_collect(&late_options));
         processed.extend(pending);
     }
 
     drop(run.lock);
     let _ = fs::remove_dir_all(&run.paths_dir);
     let _ = fs::remove_file(&run.lock_file);
+    failures
 }
 
 fn wait_for_batch_quiet_fast(paths_dir: &Path) {

@@ -8,7 +8,7 @@ a windowless immediate-delete action when you need it.
 </p>
 
 <p align="center">
-  <img src="assets/screenshots/delete-dialog.png" alt="Zap Delete confirmation dialog" />
+  <img src="assets/screenshots/delete-dialog.png" alt="Zap confirmation dialog" />
 </p>
 
 Zap removes large directory trees faster than the default Windows delete flow by
@@ -19,7 +19,7 @@ then pick the safe GUI confirmation flow or the silent immediate-delete action.
 ## Features
 
 - **Explorer-first GUI** — `Zap -> Delete...` opens a compact confirmation dialog.
-- **Windowless delete** — `Zap -> Zap Delete` deletes the selection without a GUI or terminal window.
+- **Windowless delete** — `Zap → Delete permanently` deletes the selection without a GUI or terminal window.
 - **Multi-select support** — Explorer selections are batched into one coordinated operation.
 - **Fast deletion engine** — on Windows each worker lists a folder with `FindFirstFileExW`, deletes its files right away and recurses into subfolders in parallel (`rayon`); folders are removed as soon as they are empty.
 - **Safety guards** — filesystem roots are refused, protected paths are blocked, and symlinks/junctions are never traversed.
@@ -40,32 +40,46 @@ irm https://raw.githubusercontent.com/adxptived/zap/master/dist/install.ps1 | ie
 The installer adds the Zap submenu to Windows Explorer and installs:
 
 - `zapg.exe` for the default GUI confirmation action.
-- `zapw.exe` for the windowless **Zap Delete** action.
+- `zapw.exe` for the windowless **Delete permanently** / **Move to Recycle Bin** actions.
 - `zap.exe` for optional terminal use.
 
-To uninstall, use the Start Menu uninstaller. To remove only the Explorer menu:
+To uninstall, use the Start Menu uninstaller. To remove only the Explorer menu,
+turn it off in Settings or run:
 
 ```powershell
-%APPDATA%\zap\bin\unregister-context-menu.exe
+zapg.exe --unregister-menu
 ```
 
 ## Explorer Usage
 
-After installation, right-click any file, folder, or Explorer background and
-open the **Zap** submenu.
+Right-click any file or folder and open the **Zap** submenu:
 
 | Menu item | Behavior |
 | --- | --- |
-| **Delete...** | Opens the GUI confirmation dialog. This is the default and safest flow. |
-| **Zap Delete** | Deletes immediately with no GUI and no terminal window. |
+| **Delete…** | Opens the confirmation dialog. The default and safest flow. |
+| **Move to Recycle Bin** | Recycles immediately, no window. Restorable. |
+| **Delete permanently** | Deletes immediately with no window. A message appears only if something fails. |
 
-The GUI dialog supports:
+Right-clicking the folder background offers **Delete this folder with Zap…**,
+which always opens the confirmation dialog — it never deletes silently.
 
-- **Preview only** to scan without deleting.
-- **Limit threads** to cap Rayon worker threads.
-- Automatic close after successful destructive deletion.
-- Visible failure state when deletion cannot complete.
+## Settings
 
+Open **Zap Settings** from the Start Menu, the ⚙ button in the dialog, or
+`zapg.exe --settings`. Saving re-registers the Explorer menu immediately.
+
+- **Language** — system default, English or Russian (dialog and menu labels).
+- **Context menu** — on/off, submenu or items directly in the menu, icons on/off,
+  which actions to show, the folder-background entry, Shift-only. A live
+  preview shows exactly what will be registered.
+- **Dialog** — default action (Delete / Recycle Bin / Shred), auto-close after
+  success, failure notifications for windowless deletions, operation journal,
+  worker-thread limit.
+
+Settings are stored in `%APPDATA%\zap\settings.ini` (plain `key = value`).
+
+The dialog also supports **Preview only**, drag & drop to add items, removing
+items before the run, Pause/Stop, and a copyable failure report.
 ## Optional Terminal Usage
 
 The terminal interface is secondary. Use it for scripts, automation, or manual
@@ -218,8 +232,6 @@ assets/
 dist/
   zap.iss                  Inno Setup installer script
   install.ps1              Remote install script
-  register-context-menu.*  Explorer menu registration helpers
-  unregister-context-menu.* Explorer menu removal helpers
 ```
 
 ## Release Artifact

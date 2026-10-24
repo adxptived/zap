@@ -6,6 +6,12 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Folder-background menu could silently delete the open folder** — the
+  background "Zap Delete" entry received `%V` (the folder being viewed) and
+  deleted it without confirmation. The background entry now only opens the
+  confirmation dialog.
+- **Empty-state window did not shrink** — a top-level right-to-left layout
+  claimed the full height; the Close button floated mid-window.
 - **`force_delete` could not open directories** — the POSIX-delete fallback
   lacked `FILE_FLAG_BACKUP_SEMANTICS`, so it always failed on empty
   directories and directory junctions despite being documented for them.
@@ -22,6 +28,21 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Settings** (`%APPDATA%\zap\settings.ini`) with a settings screen in
+  zapg — opened from the ⚙ button, the home screen, the new "Zap Settings"
+  Start Menu shortcut or `zapg --settings`. Language, context menu, default
+  dialog action, auto-close, journal, failure notifications, threads.
+- **Configurable Explorer menu, registered by zapg itself** — submenu or
+  flat layout, icons on/off (text-only menu), per-action visibility,
+  folder-background entry, Shift-only, English/Russian labels, with a live
+  preview. `zapg --register-menu` / `--unregister-menu` replace the
+  PyInstaller-built Python helpers (Python is no longer needed to build).
+- **Russian UI** for the dialog, chosen automatically from the Windows
+  display language or set explicitly.
+- **Home screen** when zapg starts without paths: drop zone and settings.
+- **Failure message for windowless deletions** — "Delete permanently" and
+  "Move to Recycle Bin" used to fail silently (e.g. on a locked file); zapw
+  now shows which items failed and why. Can be turned off in settings.
 - **`zap --journal [N]`** — print the N most recent operation-journal
   entries (default 20) plus the journal location, spanning the rotated
   file when the current journal is short.

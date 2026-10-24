@@ -5,15 +5,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use eframe::egui::{self, Align, Color32, CornerRadius, Layout, RichText, Stroke};
+use zap::settings::{DefaultMode, Language, MenuLayout};
 use zap::{size, treemap};
 
-use crate::app::{should_auto_close, DeleteItem, ItemState, StatusCounts, ZapApp};
+use crate::app::{should_auto_close, DeleteItem, ItemState, Screen, StatusCounts, ZapApp};
+use crate::i18n::{items_word, pick};
 use crate::{WINDOW_HEIGHT_MAX, WINDOW_HEIGHT_MIN, WINDOW_WIDTH};
 
 const MARGIN: i8 = 18;
 const ITEM_LIST_MAX_HEIGHT: f32 = 148.0;
 const FAILURE_LIST_MAX_HEIGHT: f32 = 120.0;
 const TREEMAP_HEIGHT: f32 = 260.0;
+const SETTINGS_BODY_MAX_HEIGHT: f32 = 560.0;
 /// How long a successful run stays visible before the dialog closes.
 const SUCCESS_LINGER: Duration = Duration::from_millis(900);
 const CANCELLED: &str = "cancelled by user";
@@ -137,8 +140,8 @@ fn tune_visuals(mut v: egui::Visuals) -> egui::Visuals {
 }
 
 /// Use Segoe UI (the Windows UI font) when available: crisper than egui's
-/// bundled font at small sizes and covers Cyrillic/Greek/Latin paths. The
-/// bundled fonts stay as fallbacks for symbols and emoji.
+/// bundled font at small sizes and covers Cyrillic/Greek/Latin paths. Segoe
+/// UI Symbol and the bundled fonts stay as fallbacks for symbols.
 fn install_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     let font_dir = std::env::var_os("WINDIR")
@@ -193,11 +196,12 @@ impl eframe::App for ZapApp {
                 .collect()
         });
         if !dropped.is_empty() {
+            self.screen = Screen::Main;
             self.add_dropped_paths(dropped);
         }
         let hovering_files = ctx.input(|i| !i.raw.hovered_files.is_empty());
         if hovering_files && !self.is_running() {
-            paint_drop_overlay(ctx);
+            paint_drop_overlay(ctx, self.lang);
         }
 
         if self.total_size_calculating {
@@ -234,9 +238,16 @@ impl eframe::App for ZapApp {
             && (!self.has_dangerous_paths || self.danger_confirmed);
 
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) && !running {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            if self.screen == Screen::Settings {
+                self.screen = Screen::Main;
+            } else {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
         }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) && can_start {
+        if self.screen == Screen::Main
+            && can_start
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
+        {
             self.start();
         }
 
@@ -245,10 +256,10 @@ impl eframe::App for ZapApp {
                 egui::Frame::central_panel(&ctx.style()).inner_margin(egui::Margin::same(MARGIN)),
             )
             .show(ctx, |ui| {
-                if self.items.is_empty() {
-                    render_empty_state(ui, ctx);
-                } else {
-                    render_dialog(ui, ctx, self, &counts, &progress, can_start);
+                match self.screen {
+                    Screen::Settings => render_settings(ui, self),
+                    Screen::Main if self.items.is_empty() => render_home(ui, ctx, self),
+                    Screen::Main => render_dialog(ui, ctx, self, &counts, &progress, can_start),
                 }
                 ui.min_rect().height()
             });
@@ -271,24 +282,100 @@ fn fit_window_to_content(ctx: &egui::Context, content_height: f32) {
     }
 }
 
-fn render_empty_state(ui: &mut egui::Ui, ctx: &egui::Context) {
-    ui.heading("Nothing to delete");
-    ui.add_space(2.0);
+// Note: right-to-left button rows are always nested in `ui.horizontal`.
+// At panel level a right-to-left layout claims all remaining height and
+// defeats `fit_window_to_content`.
+
+// ---------------------------------------------------------------------------
+// Home (no selection)
+// ---------------------------------------------------------------------------
+
+fn render_home(ui: &mut egui::Ui, ctx: &egui::Context, app: &mut ZapApp) {
+    let pal = Palette::for_ui(ui);
+    let lang = app.lang;
+    ui.heading(RichText::new("Zap").strong());
     ui.label(
-        RichText::new("Drop files or folders here, or use “Delete with Zap” in Explorer.")
-            .color(Palette::for_ui(ui).muted),
+        RichText::new(pick(
+            lang,
+            "Fast deletion for Windows.",
+            "Быстрое удаление для Windows.",
+        ))
+        .color(pal.muted),
     );
+    ui.add_space(12.0);
+
+    // Drop zone.
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), 120.0),
+        egui::Sense::hover(),
+    );
+    let painter = ui.painter();
+    painter.rect_filled(rect, CornerRadius::same(10), pal.card);
+    let dash = Stroke::new(1.5, pal.muted.gamma_multiply(0.6));
+    let r = rect.shrink(1.0);
+    for (a, b) in [
+        (r.left_top(), r.right_top()),
+        (r.right_top(), r.right_bottom()),
+        (r.right_bottom(), r.left_bottom()),
+        (r.left_bottom(), r.left_top()),
+    ] {
+        painter.add(egui::Shape::dashed_line(&[a, b], dash, 6.0, 4.0));
+    }
+    painter.text(
+        rect.center() - egui::vec2(0.0, 10.0),
+        egui::Align2::CENTER_CENTER,
+        pick(
+            lang,
+            "Drop files or folders here",
+            "Перетащите сюда файлы или папки",
+        ),
+        egui::FontId::proportional(15.0),
+        ui.visuals().text_color(),
+    );
+    painter.text(
+        rect.center() + egui::vec2(0.0, 14.0),
+        egui::Align2::CENTER_CENTER,
+        pick(
+            lang,
+            "or right-click them in Explorer → Zap",
+            "или нажмите на них ПКМ в Проводнике → Zap",
+        ),
+        egui::FontId::proportional(12.0),
+        pal.muted,
+    );
+
     ui.add_space(14.0);
-    // Nest the right-to-left layout in a row: at panel level it would claim
-    // all remaining height and defeat fit_window_to_content.
     ui.horizontal(|ui| {
+        if ui
+            .add(
+                egui::Button::new(RichText::new(settings_label(lang)).color(pal.accent))
+                    .frame(false),
+            )
+            .clicked()
+        {
+            app.open_settings();
+        }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if ui.button("Close").clicked() {
+            if ui
+                .add(
+                    egui::Button::new(pick(lang, "Close", "Закрыть"))
+                        .min_size(egui::vec2(96.0, 32.0)),
+                )
+                .clicked()
+            {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
         });
     });
 }
+
+fn settings_label(lang: Language) -> &'static str {
+    pick(lang, "⚙ Settings", "⚙ Настройки")
+}
+
+// ---------------------------------------------------------------------------
+// Main dialog
+// ---------------------------------------------------------------------------
 
 fn render_dialog(
     ui: &mut egui::Ui,
@@ -327,10 +414,6 @@ fn render_dialog(
         render_treemap(ui, app);
     }
 }
-
-// ---------------------------------------------------------------------------
-// Phase & header
-// ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
@@ -414,9 +497,9 @@ fn render_header(ui: &mut egui::Ui, app: &ZapApp, phase: Phase) {
                 egui::Label::new(RichText::new(title(app, phase, mode)).heading().strong())
                     .truncate(),
             );
-            if let Some(subtitle) = subtitle(&app.items) {
+            if let Some(subtitle) = subtitle(&app.items, app.lang) {
                 ui.add(egui::Label::new(RichText::new(subtitle).color(pal.muted)).truncate())
-                    .on_hover_text(full_selection_text(&app.items));
+                    .on_hover_text(full_selection_text(&app.items, app.lang));
             }
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
@@ -426,7 +509,11 @@ fn render_header(ui: &mut egui::Ui, app: &ZapApp, phase: Phase) {
                     }
                     None => {
                         ui.add(egui::Spinner::new().size(11.0));
-                        ui.label(RichText::new("Calculating size…").small().color(pal.muted));
+                        ui.label(
+                            RichText::new(pick(app.lang, "Calculating size…", "Подсчёт размера…"))
+                                .small()
+                                .color(pal.muted),
+                        );
                     }
                 }
             });
@@ -448,49 +535,83 @@ fn paint_badge(ui: &mut egui::Ui, glyph: &str, color: Color32) {
 }
 
 fn title(app: &ZapApp, phase: Phase, mode: Mode) -> String {
+    let lang = app.lang;
+    let ru = lang == Language::Russian;
     let what = match app.items.as_slice() {
-        [item] => format!("“{}”", compact_text(&display_name(&item.path), 30)),
-        items => format!("{} items", items.len()),
+        [item] => format!("«{}»", compact_text(&display_name(&item.path), 30)),
+        items => {
+            let n = items.len() as u64;
+            format!("{n} {}", items_word(lang, n))
+        }
     };
+    let text = |en: String, ru_text: String| if ru { ru_text } else { en };
     match phase {
         Phase::Ready => match mode {
-            Mode::Delete => format!("Delete {what}?"),
-            Mode::Recycle => format!("Move {what} to Recycle Bin?"),
-            Mode::Shred => format!("Shred {what}?"),
-            Mode::Preview => format!("Preview {what}"),
+            Mode::Delete => text(format!("Delete {what}?"), format!("Удалить {what}?")),
+            Mode::Recycle => text(
+                format!("Move {what} to Recycle Bin?"),
+                format!("Переместить {what} в корзину?"),
+            ),
+            Mode::Shred => text(format!("Shred {what}?"), format!("Затереть {what}?")),
+            Mode::Preview => text(format!("Preview {what}"), format!("Проверка: {what}")),
         },
-        Phase::Running => match mode {
-            Mode::Delete => "Deleting…".to_owned(),
-            Mode::Recycle => "Moving to Recycle Bin…".to_owned(),
-            Mode::Shred => "Shredding…".to_owned(),
-            Mode::Preview => "Scanning…".to_owned(),
-        },
-        Phase::Paused => "Paused".to_owned(),
-        Phase::Succeeded => match mode {
-            Mode::Recycle => "Moved to Recycle Bin".to_owned(),
-            Mode::Shred => "Shredded".to_owned(),
-            _ => "Deleted".to_owned(),
-        },
-        Phase::Previewed => "Preview complete".to_owned(),
-        Phase::Failed => "Some items could not be deleted".to_owned(),
-        Phase::Stopped => "Stopped".to_owned(),
+        Phase::Running => pick(
+            lang,
+            match mode {
+                Mode::Delete => "Deleting…",
+                Mode::Recycle => "Moving to Recycle Bin…",
+                Mode::Shred => "Shredding…",
+                Mode::Preview => "Scanning…",
+            },
+            match mode {
+                Mode::Delete => "Удаление…",
+                Mode::Recycle => "Перемещение в корзину…",
+                Mode::Shred => "Затирание…",
+                Mode::Preview => "Проверка…",
+            },
+        )
+        .to_owned(),
+        Phase::Paused => pick(lang, "Paused", "Пауза").to_owned(),
+        Phase::Succeeded => pick(
+            lang,
+            match mode {
+                Mode::Recycle => "Moved to Recycle Bin",
+                Mode::Shred => "Shredded",
+                _ => "Deleted",
+            },
+            match mode {
+                Mode::Recycle => "Перемещено в корзину",
+                Mode::Shred => "Затёрто",
+                _ => "Удалено",
+            },
+        )
+        .to_owned(),
+        Phase::Previewed => pick(lang, "Preview complete", "Проверка завершена").to_owned(),
+        Phase::Failed => pick(
+            lang,
+            "Some items could not be deleted",
+            "Не всё удалось удалить",
+        )
+        .to_owned(),
+        Phase::Stopped => pick(lang, "Stopped", "Остановлено").to_owned(),
     }
 }
 
 /// Second header line: the full path for one item, the shared parent folder
 /// for several items in one place, or a name sample otherwise.
-fn subtitle(items: &[DeleteItem]) -> Option<String> {
+fn subtitle(items: &[DeleteItem], lang: Language) -> Option<String> {
     match items {
         [] => None,
         [item] => Some(item.path.display().to_string()),
         [first, rest @ ..] => {
             let parent = first.path.parent();
             if parent.is_some() && rest.iter().all(|i| i.path.parent() == parent) {
-                Some(format!("in {}", parent?.display()))
+                Some(format!("{} {}", pick(lang, "in", "в"), parent?.display()))
             } else {
                 Some(format!(
-                    "{} and {} more",
+                    "{} {} {}",
                     display_name(&first.path),
+                    pick(lang, "and", "и ещё"),
                     rest.len()
                 ))
             }
@@ -498,14 +619,18 @@ fn subtitle(items: &[DeleteItem]) -> Option<String> {
     }
 }
 
-fn full_selection_text(items: &[DeleteItem]) -> String {
+fn full_selection_text(items: &[DeleteItem], lang: Language) -> String {
     let mut lines: Vec<String> = items
         .iter()
         .take(30)
         .map(|item| item.path.display().to_string())
         .collect();
     if items.len() > 30 {
-        lines.push(format!("… and {} more", items.len() - 30));
+        lines.push(format!(
+            "… {} {}",
+            pick(lang, "and", "и ещё"),
+            items.len() - 30
+        ));
     }
     lines.join("\n")
 }
@@ -517,11 +642,7 @@ fn size_summary(app: &ZapApp) -> Option<String> {
         "{}  ·  {} {}",
         size::format_size(snapshot.total),
         format_count(snapshot.entries),
-        if snapshot.entries == 1 {
-            "item"
-        } else {
-            "items"
-        }
+        items_word(app.lang, snapshot.entries)
     ))
 }
 
@@ -531,6 +652,7 @@ fn size_summary(app: &ZapApp) -> Option<String> {
 
 fn render_item_list(ui: &mut egui::Ui, app: &mut ZapApp) {
     let pal = Palette::for_ui(ui);
+    let lang = app.lang;
     let editable = !app.is_running() && app.started_at.is_none();
     let mut remove: Option<usize> = None;
     // Read sizes under the lock instead of cloning the whole map per frame;
@@ -562,7 +684,11 @@ fn render_item_list(ui: &mut egui::Ui, app: &mut ZapApp) {
                             if editable
                                 && ui
                                     .add(egui::Button::new(RichText::new("✕").small()).frame(false))
-                                    .on_hover_text("Remove from list")
+                                    .on_hover_text(pick(
+                                        lang,
+                                        "Remove from list",
+                                        "Убрать из списка",
+                                    ))
                                     .clicked()
                             {
                                 remove = Some(index);
@@ -570,9 +696,9 @@ fn render_item_list(ui: &mut egui::Ui, app: &mut ZapApp) {
                             match &item.state {
                                 ItemState::Failed(err) => {
                                     let short = if err.contains(CANCELLED) {
-                                        "skipped"
+                                        pick(lang, "skipped", "пропущено")
                                     } else {
-                                        "failed"
+                                        pick(lang, "failed", "ошибка")
                                     };
                                     ui.label(RichText::new(short).small().color(pal.danger));
                                 }
@@ -621,81 +747,157 @@ fn state_icon(state: &ItemState, pal: &Palette) -> (&'static str, Color32) {
 
 fn render_danger_card(ui: &mut egui::Ui, app: &mut ZapApp) {
     let pal = Palette::for_ui(ui);
+    let lang = app.lang;
     card(pal.danger_soft, pal.danger.gamma_multiply(0.5)).show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.label(
-            RichText::new("⚠  System folder selected")
-                .strong()
-                .color(pal.danger),
+            RichText::new(pick(
+                lang,
+                "⚠  System folder selected",
+                "⚠  Выбрана системная папка",
+            ))
+            .strong()
+            .color(pal.danger),
         );
         ui.label(
-            RichText::new(
+            RichText::new(pick(
+                lang,
                 "The selection includes Windows, Program Files or user profile folders. \
                  Deleting them can break the system or lose personal data.",
-            )
+                "В выборе есть папки Windows, Program Files или профиля пользователя. \
+                 Их удаление может сломать систему или уничтожить личные данные.",
+            ))
             .small(),
         );
         ui.add_space(2.0);
-        ui.checkbox(&mut app.danger_confirmed, "I understand, delete anyway");
+        ui.checkbox(
+            &mut app.danger_confirmed,
+            pick(
+                lang,
+                "I understand, delete anyway",
+                "Я понимаю, всё равно удалить",
+            ),
+        );
     });
 }
 
 fn render_options(ui: &mut egui::Ui, app: &mut ZapApp) {
     let pal = Palette::for_ui(ui);
+    let lang = app.lang;
 
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 4.0;
-        let segments = [
-            ("Delete", !app.recycle && !app.shred),
-            ("Recycle Bin", app.recycle),
-            ("Shred", app.shred),
-        ];
-        for (index, (label, selected)) in segments.into_iter().enumerate() {
-            let button = egui::Button::new(RichText::new(label).strong().color(if selected {
-                Color32::WHITE
-            } else {
-                ui.visuals().text_color()
-            }))
-            .fill(if selected {
-                pal.accent
-            } else {
-                ui.visuals().widgets.inactive.weak_bg_fill
-            })
-            .min_size(egui::vec2(0.0, 28.0));
-            if ui.add(button).clicked() {
-                app.recycle = index == 1;
-                app.shred = index == 2;
-            }
-        }
-    });
+    let mut mode = if app.recycle {
+        DefaultMode::Recycle
+    } else if app.shred {
+        DefaultMode::Shred
+    } else {
+        DefaultMode::Delete
+    };
+    if mode_switch(ui, &mut mode, lang, &pal) {
+        app.recycle = mode == DefaultMode::Recycle;
+        app.shred = mode == DefaultMode::Shred;
+    }
 
     ui.add_space(4.0);
     let hint = match Mode::of(app) {
-        Mode::Delete => "Removed immediately — bypasses the Recycle Bin and can’t be restored.",
-        Mode::Recycle => "Items can be restored from the Recycle Bin.",
-        Mode::Shred => "File contents are overwritten before deletion. Slower; unrecoverable.",
-        Mode::Preview => "Nothing will be deleted — Zap only checks what would be removed.",
+        Mode::Delete => pick(
+            lang,
+            "Removed immediately — bypasses the Recycle Bin and can’t be restored.",
+            "Удаляется сразу, минуя корзину. Восстановить будет нельзя.",
+        ),
+        Mode::Recycle => pick(
+            lang,
+            "Items can be restored from the Recycle Bin.",
+            "Можно будет восстановить из корзины.",
+        ),
+        Mode::Shred => pick(
+            lang,
+            "File contents are overwritten before deletion. Slower; unrecoverable.",
+            "Содержимое файлов перезаписывается перед удалением. Медленнее, без возможности восстановления.",
+        ),
+        Mode::Preview => pick(
+            lang,
+            "Nothing will be deleted — Zap only checks what would be removed.",
+            "Ничего не удаляется — Zap только проверит, что будет удалено.",
+        ),
     };
     ui.label(RichText::new(hint).small().color(pal.muted));
 
     ui.add_space(6.0);
-    ui.checkbox(&mut app.dry_run, "Preview only (don’t delete anything)");
+    ui.checkbox(
+        &mut app.dry_run,
+        pick(
+            lang,
+            "Preview only (don’t delete anything)",
+            "Только проверить (ничего не удалять)",
+        ),
+    );
 
-    egui::CollapsingHeader::new(RichText::new("Advanced").color(pal.muted))
-        .id_salt("advanced")
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut app.threads_enabled, "Limit worker threads");
-                ui.add_enabled(
-                    app.threads_enabled,
-                    egui::TextEdit::singleline(&mut app.threads_text).desired_width(40.0),
-                );
-            });
-            if let Some(error) = app.thread_error() {
-                ui.colored_label(pal.danger, error);
-            }
-            ui.checkbox(&mut app.no_journal, "Don’t record this run in the journal");
+    egui::CollapsingHeader::new(
+        RichText::new(pick(lang, "Advanced", "Дополнительно")).color(pal.muted),
+    )
+    .id_salt("advanced")
+    .show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.checkbox(
+                &mut app.threads_enabled,
+                pick(lang, "Limit worker threads", "Ограничить число потоков"),
+            );
+            ui.add_enabled(
+                app.threads_enabled,
+                egui::TextEdit::singleline(&mut app.threads_text).desired_width(40.0),
+            );
         });
+        if app.thread_error().is_some() {
+            ui.colored_label(
+                pal.danger,
+                pick(
+                    lang,
+                    "Thread limit must be between 1 and 64.",
+                    "Число потоков должно быть от 1 до 64.",
+                ),
+            );
+        }
+        ui.checkbox(
+            &mut app.no_journal,
+            pick(
+                lang,
+                "Don’t record this run in the journal",
+                "Не записывать в журнал операций",
+            ),
+        );
+    });
+}
+
+/// Segmented Delete / Recycle Bin / Shred control. Returns true on change.
+fn mode_switch(ui: &mut egui::Ui, mode: &mut DefaultMode, lang: Language, pal: &Palette) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        for (value, label) in [
+            (DefaultMode::Delete, pick(lang, "Delete", "Удалить")),
+            (DefaultMode::Recycle, pick(lang, "Recycle Bin", "В корзину")),
+            (DefaultMode::Shred, pick(lang, "Shred", "Затереть")),
+        ] {
+            let selected = *mode == value;
+            let text_color = if selected {
+                Color32::WHITE
+            } else {
+                ui.visuals().text_color()
+            };
+            let button = egui::Button::new(RichText::new(label).strong().color(text_color))
+                .fill(if selected {
+                    pal.accent
+                } else {
+                    ui.visuals().widgets.inactive.weak_bg_fill
+                })
+                .min_size(egui::vec2(0.0, 28.0));
+            if ui.add(button).clicked() && !selected {
+                *mode = value;
+                changed = true;
+            }
+        }
+    });
+    changed
 }
 
 // ---------------------------------------------------------------------------
@@ -772,6 +974,7 @@ fn run_progress(app: &ZapApp, counts: &StatusCounts) -> RunProgress {
 
 fn render_progress(ui: &mut egui::Ui, app: &mut ZapApp, progress: &RunProgress, phase: Phase) {
     let pal = Palette::for_ui(ui);
+    let lang = app.lang;
     let fraction = progress.fraction.unwrap_or(0.0);
     let bar = egui::ProgressBar::new(fraction)
         .desired_height(14.0)
@@ -796,11 +999,18 @@ fn render_progress(ui: &mut egui::Ui, app: &mut ZapApp, progress: &RunProgress, 
         let elapsed = app.active_elapsed().unwrap_or_default().as_secs_f32();
         let left = match progress.entries {
             Some((done, total)) => {
-                let mut text = format!("{} of {} items", format_count(done), format_count(total));
+                let mut text = format!(
+                    "{} {} {} {}",
+                    format_count(done),
+                    pick(lang, "of", "из"),
+                    format_count(total),
+                    items_word(lang, total)
+                );
                 if elapsed >= 0.5 && done > 0 {
                     text.push_str(&format!(
-                        "  ·  {}/s",
-                        format_count((done as f32 / elapsed) as u64)
+                        "  ·  {}/{}",
+                        format_count((done as f32 / elapsed) as u64),
+                        pick(lang, "s", "с")
                     ));
                 }
                 text
@@ -808,18 +1018,23 @@ fn render_progress(ui: &mut egui::Ui, app: &mut ZapApp, progress: &RunProgress, 
             None => {
                 let counts = app.status_counts();
                 format!(
-                    "{} of {} done",
+                    "{} {} {}",
                     counts.done + counts.failed,
+                    pick(lang, "of", "из"),
                     app.items.len()
                 )
             }
         };
         ui.label(RichText::new(left).small().color(pal.muted));
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            let mut right = format_duration(elapsed);
+            let mut right = format_duration(elapsed, lang);
             if phase == Phase::Running {
                 if let Some(eta) = estimate_eta_secs(progress.fraction, elapsed) {
-                    right = format!("about {} left  ·  {right}", format_duration(eta));
+                    let eta = format_duration(eta, lang);
+                    right = match lang {
+                        Language::Russian => format!("осталось ~{eta}  ·  {right}"),
+                        _ => format!("about {eta} left  ·  {right}"),
+                    };
                 }
             }
             ui.label(RichText::new(right).small().color(pal.muted));
@@ -829,31 +1044,45 @@ fn render_progress(ui: &mut egui::Ui, app: &mut ZapApp, progress: &RunProgress, 
 
 fn render_success(ui: &mut egui::Ui, app: &ZapApp) {
     let pal = Palette::for_ui(ui);
+    let lang = app.lang;
     let elapsed = app.finished.unwrap_or_default().as_secs_f32();
     let text = if app.dry_run {
         format!(
-            "Nothing was deleted. {} would be removed.",
-            size_summary(app).unwrap_or_else(|| "The selection".to_owned())
+            "{} {}",
+            pick(
+                lang,
+                "Nothing was deleted. Would be removed:",
+                "Ничего не удалено. Будет удалено:"
+            ),
+            size_summary(app).unwrap_or_default()
         )
     } else {
-        format!("Finished in {}.", format_duration(elapsed))
+        format!(
+            "{} {}.",
+            pick(lang, "Finished in", "Готово за"),
+            format_duration(elapsed, lang)
+        )
     };
     ui.label(RichText::new(text).color(pal.success));
 }
 
 fn render_failures(ui: &mut egui::Ui, app: &ZapApp, counts: &StatusCounts, phase: Phase) {
     let pal = Palette::for_ui(ui);
+    let lang = app.lang;
     let cancelled = cancelled_count(&app.items);
     let failed = counts.failed - cancelled;
     let mut summary = Vec::new();
     if counts.done > 0 {
-        summary.push(format!("{} done", counts.done));
+        summary.push(format!("{} {}", counts.done, pick(lang, "done", "готово")));
     }
     if failed > 0 {
-        summary.push(format!("{failed} failed"));
+        summary.push(format!("{failed} {}", pick(lang, "failed", "с ошибкой")));
     }
     if cancelled > 0 {
-        summary.push(format!("{cancelled} skipped"));
+        summary.push(format!(
+            "{cancelled} {}",
+            pick(lang, "skipped", "пропущено")
+        ));
     }
     ui.label(RichText::new(summary.join("  ·  ")).strong());
 
@@ -886,17 +1115,23 @@ fn render_failures(ui: &mut egui::Ui, app: &ZapApp, counts: &StatusCounts, phase
         });
         ui.add_space(2.0);
         ui.label(
-            RichText::new(
+            RichText::new(pick(
+                lang,
                 "Tip: close programs that use these files, or run as administrator, then retry.",
-            )
+                "Совет: закройте программы, использующие эти файлы, или запустите от имени администратора и повторите.",
+            ))
             .small()
             .color(pal.muted),
         );
     } else {
         ui.label(
-            RichText::new("The run was stopped; remaining items were left untouched.")
-                .small()
-                .color(pal.muted),
+            RichText::new(pick(
+                lang,
+                "The run was stopped; remaining items were left untouched.",
+                "Операция остановлена, оставшиеся элементы не тронуты.",
+            ))
+            .small()
+            .color(pal.muted),
         );
     }
 }
@@ -909,28 +1144,43 @@ fn render_actions(
     can_start: bool,
 ) {
     let pal = Palette::for_ui(ui);
+    let lang = app.lang;
     ui.horizontal(|ui| {
         // Left: secondary tools.
-        let analyzer_label = if app.show_treemap {
-            "Hide disk usage"
-        } else {
-            "Disk usage"
-        };
-        if ui
-            .add_enabled(
-                !app.is_running(),
-                egui::Button::new(RichText::new(analyzer_label).color(pal.accent)).frame(false),
-            )
-            .clicked()
-        {
-            app.show_treemap = !app.show_treemap;
-            if app.show_treemap {
-                app.start_treemap_collection();
+        if !app.is_running() {
+            if ui
+                .add(egui::Button::new(RichText::new("⚙").color(pal.accent)).frame(false))
+                .on_hover_text(pick(lang, "Settings", "Настройки"))
+                .clicked()
+            {
+                app.open_settings();
+            }
+            let analyzer_label = if app.show_treemap {
+                pick(lang, "Hide disk usage", "Скрыть карту диска")
+            } else {
+                pick(lang, "Disk usage", "Карта диска")
+            };
+            if ui
+                .add(
+                    egui::Button::new(RichText::new(analyzer_label).color(pal.accent)).frame(false),
+                )
+                .clicked()
+            {
+                app.show_treemap = !app.show_treemap;
+                if app.show_treemap {
+                    app.start_treemap_collection();
+                }
             }
         }
         if phase == Phase::Failed
             && ui
-                .add(egui::Button::new(RichText::new("Copy report").color(pal.accent)).frame(false))
+                .add(
+                    egui::Button::new(
+                        RichText::new(pick(lang, "Copy report", "Копировать отчёт"))
+                            .color(pal.accent),
+                    )
+                    .frame(false),
+                )
                 .clicked()
         {
             ctx.copy_text(app.failure_report());
@@ -941,13 +1191,16 @@ fn render_actions(
             let size = egui::vec2(96.0, 32.0);
             match phase {
                 Phase::Running | Phase::Paused => {
-                    if ui.add(egui::Button::new("Stop").min_size(size)).clicked() {
+                    if ui
+                        .add(egui::Button::new(pick(lang, "Stop", "Стоп")).min_size(size))
+                        .clicked()
+                    {
                         zap::stop::request_stop();
                     }
                     let label = if phase == Phase::Paused {
-                        "Resume"
+                        pick(lang, "Resume", "Продолжить")
                     } else {
-                        "Pause"
+                        pick(lang, "Pause", "Пауза")
                     };
                     if ui.add(egui::Button::new(label).min_size(size)).clicked() {
                         app.toggle_pause();
@@ -956,12 +1209,14 @@ fn render_actions(
                 _ => {
                     let finished = app.finished.is_some();
                     let (label, fill) = match (Mode::of(app), finished) {
-                        (_, true) if phase == Phase::Previewed => ("Preview again", pal.accent),
-                        (_, true) => ("Retry", pal.danger),
-                        (Mode::Preview, _) => ("Preview", pal.accent),
-                        (Mode::Recycle, _) => ("Recycle", pal.warn),
-                        (Mode::Shred, _) => ("Shred", pal.danger),
-                        (Mode::Delete, _) => ("Delete", pal.danger),
+                        (_, true) if phase == Phase::Previewed => {
+                            (pick(lang, "Preview again", "Проверить снова"), pal.accent)
+                        }
+                        (_, true) => (pick(lang, "Retry", "Повторить"), pal.danger),
+                        (Mode::Preview, _) => (pick(lang, "Preview", "Проверить"), pal.accent),
+                        (Mode::Recycle, _) => (pick(lang, "Recycle", "В корзину"), pal.warn),
+                        (Mode::Shred, _) => (pick(lang, "Shred", "Затереть"), pal.danger),
+                        (Mode::Delete, _) => (pick(lang, "Delete", "Удалить"), pal.danger),
                     };
                     let primary =
                         egui::Button::new(RichText::new(label).strong().color(Color32::WHITE))
@@ -974,7 +1229,11 @@ fn render_actions(
                     {
                         app.start();
                     }
-                    let close_label = if finished { "Close" } else { "Cancel" };
+                    let close_label = if finished {
+                        pick(lang, "Close", "Закрыть")
+                    } else {
+                        pick(lang, "Cancel", "Отмена")
+                    };
                     if ui
                         .add(egui::Button::new(close_label).min_size(size))
                         .on_hover_text("Esc")
@@ -1011,6 +1270,258 @@ fn render_treemap(ui: &mut egui::Ui, app: &mut ZapApp) {
 }
 
 // ---------------------------------------------------------------------------
+// Settings screen
+// ---------------------------------------------------------------------------
+
+fn render_settings(ui: &mut egui::Ui, app: &mut ZapApp) {
+    let pal = Palette::for_ui(ui);
+    // Show the draft language immediately so the choice is previewed.
+    let lang = app.settings_draft.language.resolve();
+
+    ui.horizontal(|ui| {
+        if ui
+            .add(egui::Button::new(RichText::new("←").size(16.0)).frame(false))
+            .on_hover_text(pick(lang, "Back (Esc)", "Назад (Esc)"))
+            .clicked()
+        {
+            app.screen = Screen::Main;
+        }
+        ui.heading(RichText::new(pick(lang, "Settings", "Настройки")).strong());
+    });
+    ui.add_space(8.0);
+
+    egui::ScrollArea::vertical()
+        .max_height(SETTINGS_BODY_MAX_HEIGHT)
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            let draft = &mut app.settings_draft;
+
+            section(ui, &pal, pick(lang, "General", "Общие"));
+            ui.horizontal(|ui| {
+                ui.label(pick(lang, "Language", "Язык"));
+                let label = |l: Language| match l {
+                    Language::Auto => pick(lang, "System default", "Как в системе"),
+                    Language::English => "English",
+                    Language::Russian => "Русский",
+                };
+                egui::ComboBox::from_id_salt("language")
+                    .selected_text(label(draft.language))
+                    .show_ui(ui, |ui| {
+                        for l in Language::ALL {
+                            ui.selectable_value(&mut draft.language, l, label(l));
+                        }
+                    });
+            });
+
+            ui.add_space(10.0);
+            section(
+                ui,
+                &pal,
+                pick(lang, "Explorer context menu", "Контекстное меню Проводника"),
+            );
+            ui.checkbox(
+                &mut draft.menu.enabled,
+                pick(
+                    lang,
+                    "Add Zap to the right-click menu",
+                    "Добавить Zap в меню по правой кнопке",
+                ),
+            );
+            ui.add_enabled_ui(draft.menu.enabled, |ui| {
+                ui.horizontal(|ui| {
+                    ui.radio_value(
+                        &mut draft.menu.layout,
+                        MenuLayout::Submenu,
+                        pick(lang, "Submenu “Zap ›”", "Подменю «Zap ›»"),
+                    );
+                    ui.radio_value(
+                        &mut draft.menu.layout,
+                        MenuLayout::Flat,
+                        pick(lang, "Items directly in the menu", "Пункты прямо в меню"),
+                    );
+                });
+                ui.checkbox(
+                    &mut draft.menu.icons,
+                    pick(lang, "Show icons", "Показывать иконки"),
+                );
+                ui.label(RichText::new(pick(lang, "Actions:", "Действия:")).color(pal.muted));
+                ui.indent("menu-actions", |ui| {
+                    ui.checkbox(
+                        &mut draft.menu.show_dialog,
+                        pick(
+                            lang,
+                            "Delete… (with confirmation)",
+                            "Удалить… (с подтверждением)",
+                        ),
+                    );
+                    ui.checkbox(
+                        &mut draft.menu.show_recycle,
+                        pick(lang, "Move to Recycle Bin", "Переместить в корзину"),
+                    );
+                    ui.checkbox(
+                        &mut draft.menu.show_quick_delete,
+                        pick(
+                            lang,
+                            "Delete permanently (no confirmation)",
+                            "Удалить безвозвратно (без подтверждения)",
+                        ),
+                    );
+                });
+                ui.checkbox(
+                    &mut draft.menu.show_background,
+                    pick(
+                        lang,
+                        "“Delete this folder…” on folder background",
+                        "«Удалить эту папку…» на фоне папки",
+                    ),
+                );
+                ui.checkbox(
+                    &mut draft.menu.shift_only,
+                    pick(lang, "Only when Shift is held", "Только при зажатом Shift"),
+                );
+
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(pick(lang, "Preview:", "Как будет выглядеть:")).color(pal.muted),
+                );
+                render_menu_preview(ui, draft, lang, &pal);
+            });
+
+            ui.add_space(10.0);
+            section(ui, &pal, pick(lang, "Deletion dialog", "Окно удаления"));
+            ui.label(
+                RichText::new(pick(lang, "Default action", "Действие по умолчанию"))
+                    .color(pal.muted),
+            );
+            mode_switch(ui, &mut draft.default_mode, lang, &pal);
+            ui.checkbox(
+                &mut draft.auto_close,
+                pick(
+                    lang,
+                    "Close automatically after success",
+                    "Закрывать после успешного удаления",
+                ),
+            );
+            ui.checkbox(
+                &mut draft.notify_failures,
+                pick(
+                    lang,
+                    "Show a message when a quick deletion fails",
+                    "Сообщать об ошибках быстрого удаления",
+                ),
+            );
+            ui.checkbox(
+                &mut draft.journal,
+                pick(lang, "Keep an operation journal", "Вести журнал операций"),
+            );
+            ui.horizontal(|ui| {
+                let mut limited = draft.threads.is_some();
+                if ui
+                    .checkbox(
+                        &mut limited,
+                        pick(lang, "Limit worker threads", "Ограничить число потоков"),
+                    )
+                    .changed()
+                {
+                    draft.threads = limited.then(|| zap::parallelism::worker_count(None));
+                }
+                if let Some(threads) = draft.threads.as_mut() {
+                    ui.add(egui::DragValue::new(threads).range(1..=zap::parallelism::MAX_WORKERS));
+                } else {
+                    ui.label(RichText::new(pick(lang, "auto", "авто")).color(pal.muted));
+                }
+            });
+        });
+
+    ui.add_space(10.0);
+    ui.horizontal(|ui| {
+        if let Some((message, is_error)) = &app.settings_status {
+            let color = if *is_error { pal.danger } else { pal.success };
+            ui.label(RichText::new(message).small().color(color));
+        }
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let size = egui::vec2(96.0, 32.0);
+            let dirty = app.settings_draft != app.settings;
+            let save = egui::Button::new(
+                RichText::new(pick(lang, "Save", "Сохранить"))
+                    .strong()
+                    .color(Color32::WHITE),
+            )
+            .fill(pal.accent)
+            .min_size(size);
+            if ui.add_enabled(dirty, save).clicked() {
+                app.save_settings();
+            }
+            if ui
+                .add(egui::Button::new(pick(lang, "Back", "Назад")).min_size(size))
+                .clicked()
+            {
+                app.screen = Screen::Main;
+            }
+        });
+    });
+}
+
+fn section(ui: &mut egui::Ui, pal: &Palette, title: &str) {
+    ui.label(RichText::new(title).strong());
+    let rect = ui.available_rect_before_wrap();
+    ui.painter().hline(
+        rect.x_range(),
+        rect.top(),
+        Stroke::new(1.0, pal.card_stroke),
+    );
+    ui.add_space(6.0);
+}
+
+/// Mock of the Explorer menu the current draft would register.
+fn render_menu_preview(
+    ui: &mut egui::Ui,
+    draft: &zap::settings::Settings,
+    lang: Language,
+    pal: &Palette,
+) {
+    let entries = zap::context_menu::preview(draft);
+    card(pal.card, pal.card_stroke).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        if entries.is_empty() {
+            ui.label(
+                RichText::new(pick(
+                    lang,
+                    "(nothing will be added)",
+                    "(ничего не будет добавлено)",
+                ))
+                .small()
+                .color(pal.muted),
+            );
+            return;
+        }
+        for entry in entries {
+            if entry.separator_before {
+                let rect = ui.available_rect_before_wrap();
+                ui.painter().hline(
+                    (rect.left() + 24.0)..=rect.right(),
+                    rect.top() + 1.0,
+                    Stroke::new(1.0, pal.card_stroke),
+                );
+                ui.add_space(4.0);
+            }
+            ui.horizontal(|ui| {
+                ui.add_space(f32::from(entry.depth) * 22.0);
+                let icon = if entry.icon { "⚡" } else { "" };
+                ui.add_sized(
+                    [16.0, 18.0],
+                    egui::Label::new(RichText::new(icon).color(Color32::from_rgb(240, 170, 40))),
+                );
+                ui.label(&entry.label);
+                if entry.submenu {
+                    ui.label(RichText::new("›").color(pal.muted));
+                }
+            });
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -1038,16 +1549,21 @@ fn estimate_eta_secs(fraction: Option<f32>, elapsed: f32) -> Option<f32> {
     Some(elapsed * (1.0 - fraction) / fraction)
 }
 
-fn format_duration(secs: f32) -> String {
+fn format_duration(secs: f32, lang: Language) -> String {
+    let (s, m, h) = if lang == Language::Russian {
+        ("с", "м", "ч")
+    } else {
+        ("s", "m", "h")
+    };
     if secs < 10.0 {
-        format!("{secs:.1}s")
+        format!("{secs:.1}{s}")
     } else if secs < 60.0 {
-        format!("{}s", secs.round() as u64)
+        format!("{}{s}", secs.round() as u64)
     } else if secs < 3600.0 {
-        format!("{}m {:02}s", (secs / 60.0) as u64, (secs % 60.0) as u64)
+        format!("{}{m} {:02}{s}", (secs / 60.0) as u64, (secs % 60.0) as u64)
     } else {
         format!(
-            "{}h {:02}m",
+            "{}{h} {:02}{m}",
             (secs / 3600.0) as u64,
             ((secs % 3600.0) / 60.0) as u64
         )
@@ -1082,7 +1598,7 @@ fn compact_text(text: &str, max_len: usize) -> String {
 }
 
 /// Dim the window and show a hint while files are dragged over it.
-fn paint_drop_overlay(ctx: &egui::Context) {
+fn paint_drop_overlay(ctx: &egui::Context, lang: Language) {
     let painter = ctx.layer_painter(egui::LayerId::new(
         egui::Order::Foreground,
         egui::Id::new("drop_overlay"),
@@ -1092,7 +1608,7 @@ fn paint_drop_overlay(ctx: &egui::Context) {
     painter.text(
         rect.center(),
         egui::Align2::CENTER_CENTER,
-        "Drop to add to the list",
+        pick(lang, "Drop to add to the list", "Отпустите, чтобы добавить"),
         egui::FontId::proportional(16.0),
         Color32::WHITE,
     );
@@ -1112,10 +1628,12 @@ mod tests {
 
     #[test]
     fn format_duration_picks_readable_units() {
-        assert_eq!(format_duration(1.25), "1.2s");
-        assert_eq!(format_duration(42.4), "42s");
-        assert_eq!(format_duration(125.0), "2m 05s");
-        assert_eq!(format_duration(3_720.0), "1h 02m");
+        let en = Language::English;
+        assert_eq!(format_duration(1.25, en), "1.2s");
+        assert_eq!(format_duration(42.4, en), "42s");
+        assert_eq!(format_duration(125.0, en), "2m 05s");
+        assert_eq!(format_duration(3_720.0, en), "1h 02m");
+        assert_eq!(format_duration(125.0, Language::Russian), "2м 05с");
     }
 
     #[test]
@@ -1136,6 +1654,13 @@ mod tests {
                 progress: None,
             })
             .collect();
-        assert_eq!(subtitle(&items).as_deref(), Some(r"in C:\work"));
+        assert_eq!(
+            subtitle(&items, Language::English).as_deref(),
+            Some(r"in C:\work")
+        );
+        assert_eq!(
+            subtitle(&items, Language::Russian).as_deref(),
+            Some(r"в C:\work")
+        );
     }
 }

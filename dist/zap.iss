@@ -43,9 +43,11 @@ Source: "..\bin\zapg.exe"; DestDir: "{app}\bin"; Flags: ignoreversion
 Source: "..\bin\zapg.exe.manifest"; DestDir: "{app}\bin"; Flags: ignoreversion
 Source: "..\bin\zapw.exe.manifest"; DestDir: "{app}\bin"; Flags: ignoreversion
 Source: "..\bin\zap.ico"; DestDir: "{app}\bin"; Flags: ignoreversion
-Source: "..\bin\register-context-menu.exe"; DestDir: "{app}\bin"; Flags: ignoreversion
-Source: "..\bin\unregister-context-menu.exe"; DestDir: "{app}\bin"; Flags: ignoreversion
 ; NOTE: Don't use "Flags: ignoreversion" on any shared system files
+
+[Icons]
+Name: "{group}\Zap"; Filename: "{app}\bin\zapg.exe"
+Name: "{group}\Zap Settings"; Filename: "{app}\bin\zapg.exe"; Parameters: "--settings"
 
 [Code]
 procedure CurStepChanged(CurStep: TSetupStep);
@@ -61,7 +63,7 @@ begin
 end;
 
 [Run]
-Filename: "{app}\bin\register-context-menu.exe"; Flags: runascurrentuser;
+Filename: "{app}\bin\zapg.exe"; Parameters: "--register-menu"; Flags: runascurrentuser waituntilterminated
 
 [UninstallRun]
-Filename: "{app}\bin\unregister-context-menu.exe"; Flags: runascurrentuser; RunOnceId: "UnregisterZapContextMenu"
+Filename: "{app}\bin\zapg.exe"; Parameters: "--unregister-menu"; Flags: runascurrentuser waituntilterminated; RunOnceId: "UnregisterZapContextMenu"

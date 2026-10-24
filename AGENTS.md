@@ -20,13 +20,15 @@ Source code is organized under `src/`:
 - `recycle.rs` — Windows Recycle Bin integration via `SHFileOperationW`.
 - `shred.rs` — Secure file deletion: overwrite with random data then remove.
 - `size.rs` — Size/entry counting (`tree_stats`, `dir_size_recursive`, `child_sizes` for the treemap). On Windows sizes come from directory listings: no per-file open, which costs about as much kernel time as deleting the file.
+- `settings.rs` — User settings (`%APPDATA%\zap\settings.ini`, `key = value`): language, context-menu layout/icons/items, default dialog mode, auto-close, journal, failure notifications, threads. Missing/broken file falls back to defaults.
+- `context_menu.rs` — Explorer context-menu registration under `HKCU\Software\Classes` built from settings. `plan()` is pure and unit-tested; `apply()` removes every known Zap key first. The folder-background entry only ever opens the dialog. Invoked via `zapg.exe --register-menu` / `--unregister-menu` (installer) and the settings screen.
 - `stop.rs` — Global Ctrl+C signal handler (`install_handler`, `is_stop_requested`).
 - `path_utils.rs` — Path formatting helpers (`progress_name`, `compact_path`, `dedup_paths`).
 - `batch.rs` — Shared batch-coordination infrastructure for multi-process Explorer integration.
 - `treemap.rs` — Squarified treemap layout for GUI visualization.
 - `winapi.rs` — Windows API helpers (directory enumeration, reparse point detection, POSIX force delete, long-path `\\?\` prefixing).
 - `bin/zapw.rs` — Entry point of the `zapw` (windowless) binary. Silent deletion without console window.
-- `bin/zapg.rs` — Entry point of the `zapg` (GUI dialog) binary. Provides an egui confirmation dialog for the **Delete...** context menu item.
+- `bin/zapg/` — `zapg` (GUI) binary: `main.rs` (args, batch coordination, `--settings`/`--register-menu`/`--unregister-menu`), `app.rs` (state, worker), `ui.rs` (dialog, home and settings screens), `i18n.rs` (English/Russian strings as call-site pairs), `taskbar.rs`.
 
 The three binaries are declared explicitly in `Cargo.toml` (`[[bin]] name = "zap"` / `"zapw"` / `"zapg"`), so `cargo build` produces `zap.exe`, `zapw.exe`, and `zapg.exe` directly with no rename step.
 

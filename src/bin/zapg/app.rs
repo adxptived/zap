@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use zap::delete::DeleteOptions;
 use zap::journal::{self, JournalAction, PathOutcome};
+use zap::settings::{DefaultMode, Language, Settings};
 use zap::{batch, delete, path_utils, protect, size, stop};
 
 use crate::MAX_THREADS;
@@ -150,6 +151,21 @@ pub struct ZapApp {
     /// Batch result receiver — window opens instantly, batch paths arrive
     /// asynchronously from the background collection thread.
     pub batch_collecting: Option<BatchReceiver>,
+    /// Persisted settings as last saved.
+    pub settings: Settings,
+    /// Working copy edited on the settings screen.
+    pub settings_draft: Settings,
+    /// Result of the last settings save: (message, is_error).
+    pub settings_status: Option<(String, bool)>,
+    pub screen: Screen,
+    /// UI language, resolved from the settings (never `Auto`).
+    pub lang: Language,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Screen {
+    Main,
+    Settings,
 }
 
 impl ZapApp {
@@ -205,7 +221,55 @@ impl ZapApp {
             treemap_data: Arc::new(Mutex::new(None)),
             treemap_collecting: false,
             batch_collecting: None,
+            settings: Settings::default(),
+            settings_draft: Settings::default(),
+            settings_status: None,
+            screen: Screen::Main,
+            lang: Language::English,
         }
+    }
+
+    /// Adopt persisted settings: language, preselected mode and run options.
+    /// Command-line flags applied afterwards still win.
+    pub fn apply_settings(&mut self, settings: Settings) {
+        self.lang = settings.language.resolve();
+        if !self.is_running() && self.started_at.is_none() {
+            self.recycle = settings.default_mode == DefaultMode::Recycle;
+            self.shred = settings.default_mode == DefaultMode::Shred;
+            self.no_journal = !settings.journal;
+            if let Some(threads) = settings.threads {
+                self.threads_enabled = true;
+                self.threads_text = threads.to_string();
+            }
+        }
+        self.settings_draft = settings.clone();
+        self.settings = settings;
+    }
+
+    pub fn open_settings(&mut self) {
+        self.settings_draft = self.settings.clone();
+        self.settings_status = None;
+        self.screen = Screen::Settings;
+    }
+
+    /// Persist the draft and re-register the Explorer menu to match it.
+    pub fn save_settings(&mut self) {
+        let draft = self.settings_draft.clone();
+        let saved = draft.save();
+        #[cfg(windows)]
+        let menu = zap::context_menu::MenuTargets::beside_current_exe()
+            .and_then(|targets| zap::context_menu::apply(&draft, &targets));
+        #[cfg(not(windows))]
+        let menu: io::Result<()> = Ok(());
+        let lang = draft.language.resolve();
+        self.settings_status = Some(match (saved, menu) {
+            (Ok(()), Ok(())) => (
+                crate::i18n::pick(lang, "Settings saved.", "Настройки сохранены.").to_owned(),
+                false,
+            ),
+            (Err(err), _) | (_, Err(err)) => (err.to_string(), true),
+        });
+        self.apply_settings(draft);
     }
 
     /// Create app with batch results arriving asynchronously — window opens
@@ -936,7 +1000,12 @@ pub fn normalize_worker_result(result: io::Result<()>, dry_run: bool) -> Result<
 }
 
 pub fn should_auto_close(app: &ZapApp, counts: &StatusCounts) -> bool {
-    app.finished.is_some() && !app.dry_run && counts.failed == 0 && counts.done > 0
+    app.settings.auto_close
+        && app.screen == Screen::Main
+        && app.finished.is_some()
+        && !app.dry_run
+        && counts.failed == 0
+        && counts.done > 0
 }
 
 #[cfg(test)]

@@ -16,7 +16,6 @@ $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $BinDir = Join-Path $Root "bin"
 $DistDir = Join-Path $Root "dist"
 $BuildDir = if ($env:ZAP_BUILD_DIR) { $env:ZAP_BUILD_DIR } else { Join-Path $Root "build" }
-$PyInstallerDistDir = Join-Path $BuildDir "pyinstaller-dist"
 $CargoTargetRoot = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $Root "target" }
 $OptimizedTargetDir = Join-Path $CargoTargetRoot "release-optimized"
 $InstallerPath = Join-Path $DistDir "output\Zap.exe"
@@ -117,24 +116,6 @@ function Run-Lint {
     Invoke-Checked "cargo" "clippy" "--all-targets" "--" "-D" "warnings"
 }
 
-function Package-Helpers {
-    Write-Step "PyInstaller helper executables"
-    $PyInstaller = Require-Command "pyinstaller.exe"
-    New-Item -ItemType Directory -Force -Path $DistDir, $BuildDir, $PyInstallerDistDir | Out-Null
-
-    $CommonArgs = @(
-        "--noconfirm",
-        "--onefile",
-        "--distpath", $PyInstallerDistDir,
-        "--workpath", $BuildDir,
-        "--specpath", $BuildDir,
-        "--icon", (Join-Path $Root "assets\branding\zap.ico")
-    )
-
-    Invoke-Checked $PyInstaller @CommonArgs "--name" "register-context-menu" (Join-Path $DistDir "register-context-menu.py")
-    Invoke-Checked $PyInstaller @CommonArgs "--name" "unregister-context-menu" (Join-Path $DistDir "unregister-context-menu.py")
-}
-
 function Stage-Binaries {
     Write-Step "Stage binaries in bin"
     New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
@@ -144,8 +125,6 @@ function Stage-Binaries {
     Copy-RequiredFile (Join-Path $OptimizedTargetDir "zapg.exe") (Join-Path $BinDir "zapg.exe")
     Copy-RequiredFile (Join-Path $Root "assets\manifests\zapg.exe.manifest") (Join-Path $BinDir "zapg.exe.manifest")
     Copy-RequiredFile (Join-Path $Root "assets\manifests\zapw.exe.manifest") (Join-Path $BinDir "zapw.exe.manifest")
-    Copy-RequiredFile (Join-Path $PyInstallerDistDir "register-context-menu.exe") (Join-Path $BinDir "register-context-menu.exe")
-    Copy-RequiredFile (Join-Path $PyInstallerDistDir "unregister-context-menu.exe") (Join-Path $BinDir "unregister-context-menu.exe")
     Copy-RequiredFile (Join-Path $Root "assets\branding\zap.ico") (Join-Path $BinDir "zap.ico")
 }
 
@@ -180,11 +159,11 @@ try {
     if ($OptimizedBuild) { Build-Optimized }
     if ($Test) { Run-Tests }
     if ($Lint) { Run-Lint }
-    if ($PackageHelpers) { Package-Helpers; Stage-Binaries }
+    # Context-menu registration is built into zapg.exe; -PackageHelpers now only stages binaries.
+    if ($PackageHelpers) { Stage-Binaries }
     if ($Installer) { Build-Installer }
     if ($Full) {
         Build-Optimized
-        Package-Helpers
         Stage-Binaries
         Build-Installer
     }
