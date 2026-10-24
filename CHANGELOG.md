@@ -6,6 +6,14 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **No more UAC prompt on every context-menu action** — zapg and zapw
+  manifests requested `requireAdministrator`, so every Explorer action asked
+  for elevation, drag & drop into the (elevated) dialog was blocked by UIPI,
+  and the installer could not run the menu registration (error 740). Both
+  now run `asInvoker` and are long-path aware; when items fail, the dialog
+  offers **Retry as administrator** for just those items.
+- **Installer reused the old "Turbo Delete" Start Menu group** — shortcuts
+  now go to "Zap" and the legacy group and Python helpers are removed.
 - **Folder-background menu could silently delete the open folder** — the
   background "Zap Delete" entry received `%V` (the folder being viewed) and
   deleted it without confirmation. The background entry now only opens the

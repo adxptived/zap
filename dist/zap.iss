@@ -19,6 +19,8 @@ AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
 DefaultDirName={localappdata}\Programs\Zap
 DefaultGroupName={#MyAppName}
+; Older installs used the "Turbo Delete" group; never reuse it.
+UsePreviousGroup=no
 LicenseFile=..\LICENSE.txt
 OutputDir=..\dist\output
 OutputBaseFilename=Zap
@@ -44,6 +46,13 @@ Source: "..\bin\zapg.exe.manifest"; DestDir: "{app}\bin"; Flags: ignoreversion
 Source: "..\bin\zapw.exe.manifest"; DestDir: "{app}\bin"; Flags: ignoreversion
 Source: "..\bin\zap.ico"; DestDir: "{app}\bin"; Flags: ignoreversion
 ; NOTE: Don't use "Flags: ignoreversion" on any shared system files
+
+[InstallDelete]
+; Python helpers replaced by zapg.exe --register-menu / --unregister-menu
+Type: files; Name: "{app}\bin\register-context-menu.exe"
+Type: files; Name: "{app}\bin\unregister-context-menu.exe"
+; Start Menu group of the pre-rename "Turbo Delete" installs
+Type: filesandordirs; Name: "{userprograms}\Turbo Delete"
 
 [Icons]
 Name: "{group}\Zap"; Filename: "{app}\bin\zapg.exe"

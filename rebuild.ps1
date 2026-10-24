@@ -132,7 +132,9 @@ function Build-Installer {
     Write-Step "Inno Setup installer"
     $InnoCompiler = Find-InnoCompiler
     New-Item -ItemType Directory -Force -Path (Join-Path $DistDir "output") | Out-Null
-    Invoke-Checked $InnoCompiler (Join-Path $DistDir "zap.iss")
+    # Keep the installer version in sync with Cargo.toml.
+    $Version = (Select-String -Path (Join-Path $Root "Cargo.toml") -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+    Invoke-Checked $InnoCompiler "/DMyAppVersion=$Version" (Join-Path $DistDir "zap.iss")
     Require-File $InstallerPath
 }
 

@@ -104,6 +104,10 @@ fn main() -> eframe::Result<()> {
                 app.recycle = true;
                 app.shred = false;
             }
+            if args.shred && !args.recycle {
+                app.shred = true;
+                app.recycle = false;
+            }
             if args.no_journal {
                 app.no_journal = true;
             }
@@ -191,6 +195,7 @@ fn try_become_coordinator(own_paths: &[PathBuf]) -> CoordinatorOutcome {
 struct GuiArgs {
     batch: bool,
     recycle: bool,
+    shred: bool,
     no_journal: bool,
     settings: bool,
     register_menu: bool,
@@ -210,6 +215,7 @@ fn parse_args_from(args: impl IntoIterator<Item = std::ffi::OsString>) -> GuiArg
         match arg.to_str() {
             Some("--batch") => parsed.batch = true,
             Some("--recycle") => parsed.recycle = true,
+            Some("--shred") => parsed.shred = true,
             Some("--no-journal") => parsed.no_journal = true,
             Some("--settings") => parsed.settings = true,
             Some("--register-menu") => parsed.register_menu = true,

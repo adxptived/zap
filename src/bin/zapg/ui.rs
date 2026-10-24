@@ -1123,6 +1123,35 @@ fn render_failures(ui: &mut egui::Ui, app: &ZapApp, counts: &StatusCounts, phase
             .small()
             .color(pal.muted),
         );
+        ui.horizontal(|ui| {
+            let link = |text: &str| {
+                egui::Button::new(RichText::new(text).small().color(pal.accent)).frame(false)
+            };
+            if ui
+                .add(link(pick(lang, "Copy report", "Копировать отчёт")))
+                .clicked()
+            {
+                ui.ctx().copy_text(app.failure_report());
+            }
+            #[cfg(windows)]
+            if !crate::app::elevation::is_elevated()
+                && ui
+                    .add(link(pick(
+                        lang,
+                        "🛡 Retry as administrator",
+                        "🛡 Повторить от имени администратора",
+                    )))
+                    .on_hover_text(pick(
+                        lang,
+                        "Retry only the failed items with administrator rights (UAC prompt).",
+                        "Повторить только неудавшиеся элементы с правами администратора (запрос UAC).",
+                    ))
+                    .clicked()
+                && app.retry_failed_elevated().is_ok()
+            {
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        });
     } else {
         ui.label(
             RichText::new(pick(
@@ -1171,19 +1200,6 @@ fn render_actions(
                     app.start_treemap_collection();
                 }
             }
-        }
-        if phase == Phase::Failed
-            && ui
-                .add(
-                    egui::Button::new(
-                        RichText::new(pick(lang, "Copy report", "Копировать отчёт"))
-                            .color(pal.accent),
-                    )
-                    .frame(false),
-                )
-                .clicked()
-        {
-            ctx.copy_text(app.failure_report());
         }
 
         // Right: primary + secondary actions.

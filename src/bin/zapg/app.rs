@@ -578,6 +578,45 @@ impl ZapApp {
             .join("\n")
     }
 
+    /// Paths that failed for a reason other than cancellation.
+    pub fn failed_paths(&self) -> Vec<PathBuf> {
+        self.items
+            .iter()
+            .filter(|item| {
+                matches!(&item.state, ItemState::Failed(err) if !err.contains("cancelled by user"))
+            })
+            .map(|item| item.path.clone())
+            .collect()
+    }
+
+    /// Relaunch zapg elevated (UAC prompt) with only the failed paths and
+    /// the same mode. Zap runs unelevated by default so drag & drop works
+    /// and Explorer actions need no prompt; elevation is opt-in, per run.
+    #[cfg(windows)]
+    pub fn retry_failed_elevated(&self) -> io::Result<()> {
+        let mut args = Vec::new();
+        if self.recycle {
+            args.push("--recycle".to_owned());
+        }
+        if self.shred {
+            args.push("--shred".to_owned());
+        }
+        if self.no_journal {
+            args.push("--no-journal".to_owned());
+        }
+        let mut length = 0;
+        for path in self.failed_paths() {
+            let arg = quote_arg(&path.display().to_string());
+            // Stay well under the 32k command-line limit.
+            length += arg.len() + 1;
+            if length > 30_000 {
+                break;
+            }
+            args.push(arg);
+        }
+        elevation::run_elevated(&std::env::current_exe()?, &args.join(" "))
+    }
+
     /// Remove one item from the selection before a run starts.
     pub fn remove_item(&mut self, index: usize) {
         if self.is_running() || index >= self.items.len() {
@@ -769,6 +808,90 @@ impl ZapApp {
             entries.truncate(zap::treemap::MAX_LAYOUT_ITEMS);
             *data_handle.lock().unwrap() = Some(TreemapSnapshot { entries, total });
         });
+    }
+}
+
+/// Quote one argument for the Windows command-line parser: backslashes
+/// before a quote (or the closing quote) must be doubled.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn quote_arg(arg: &str) -> String {
+    let mut out = String::with_capacity(arg.len() + 2);
+    out.push('"');
+    let mut backslashes = 0;
+    for ch in arg.chars() {
+        match ch {
+            '\\' => backslashes += 1,
+            '"' => {
+                out.extend(std::iter::repeat_n('\\', backslashes * 2 + 1));
+                out.push('"');
+                backslashes = 0;
+                continue;
+            }
+            _ => {}
+        }
+        if ch != '\\' {
+            out.extend(std::iter::repeat_n('\\', backslashes));
+            backslashes = 0;
+            out.push(ch);
+        }
+    }
+    out.extend(std::iter::repeat_n('\\', backslashes * 2));
+    out.push('"');
+    out
+}
+
+#[cfg(windows)]
+pub mod elevation {
+    use std::ffi::c_void;
+    use std::io;
+    use std::path::Path;
+
+    #[link(name = "shell32")]
+    extern "system" {
+        fn IsUserAnAdmin() -> i32;
+        fn ShellExecuteW(
+            hwnd: *mut c_void,
+            operation: *const u16,
+            file: *const u16,
+            parameters: *const u16,
+            directory: *const u16,
+            show: i32,
+        ) -> isize;
+    }
+
+    fn wide(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    pub fn is_elevated() -> bool {
+        // SAFETY: no arguments.
+        unsafe { IsUserAnAdmin() != 0 }
+    }
+
+    pub fn run_elevated(exe: &Path, params: &str) -> io::Result<()> {
+        const SW_SHOWNORMAL: i32 = 1;
+        let (verb, file, params) = (
+            wide("runas"),
+            wide(&exe.display().to_string()),
+            wide(params),
+        );
+        // SAFETY: all strings are NUL-terminated and outlive the call.
+        let result = unsafe {
+            ShellExecuteW(
+                std::ptr::null_mut(),
+                verb.as_ptr(),
+                file.as_ptr(),
+                params.as_ptr(),
+                std::ptr::null(),
+                SW_SHOWNORMAL,
+            )
+        };
+        // Values <= 32 are errors (5 = the user declined the UAC prompt).
+        if result > 32 {
+            Ok(())
+        } else {
+            Err(io::Error::from_raw_os_error(result as i32))
+        }
     }
 }
 
@@ -1038,6 +1161,13 @@ mod tests {
         assert!(!should_bulk_delete_file_roots(&many, true, false));
         assert!(!should_bulk_delete_file_roots(&many, false, true));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn quote_arg_follows_windows_rules() {
+        assert_eq!(quote_arg(r"C:\a b\c"), r#""C:\a b\c""#);
+        assert_eq!(quote_arg(r"C:\dir\"), r#""C:\dir\\""#);
+        assert_eq!(quote_arg(r#"a"b"#), r#""a\"b""#);
     }
 
     #[test]
