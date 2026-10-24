@@ -552,7 +552,10 @@ fn title(app: &ZapApp, phase: Phase, mode: Mode) -> String {
                 format!("Move {what} to Recycle Bin?"),
                 format!("Переместить {what} в корзину?"),
             ),
-            Mode::Shred => text(format!("Shred {what}?"), format!("Затереть {what}?")),
+            Mode::Shred => text(
+                format!("Securely delete {what}?"),
+                format!("Удалить {what} с перезаписью?"),
+            ),
             Mode::Preview => text(format!("Preview {what}"), format!("Проверка: {what}")),
         },
         Phase::Running => pick(
@@ -560,13 +563,13 @@ fn title(app: &ZapApp, phase: Phase, mode: Mode) -> String {
             match mode {
                 Mode::Delete => "Deleting…",
                 Mode::Recycle => "Moving to Recycle Bin…",
-                Mode::Shred => "Shredding…",
+                Mode::Shred => "Overwriting and deleting…",
                 Mode::Preview => "Scanning…",
             },
             match mode {
                 Mode::Delete => "Удаление…",
                 Mode::Recycle => "Перемещение в корзину…",
-                Mode::Shred => "Затирание…",
+                Mode::Shred => "Перезапись и удаление…",
                 Mode::Preview => "Проверка…",
             },
         )
@@ -576,12 +579,12 @@ fn title(app: &ZapApp, phase: Phase, mode: Mode) -> String {
             lang,
             match mode {
                 Mode::Recycle => "Moved to Recycle Bin",
-                Mode::Shred => "Shredded",
+                Mode::Shred => "Securely deleted",
                 _ => "Deleted",
             },
             match mode {
                 Mode::Recycle => "Перемещено в корзину",
-                Mode::Shred => "Затёрто",
+                Mode::Shred => "Удалено с перезаписью",
                 _ => "Удалено",
             },
         )
@@ -811,8 +814,8 @@ fn render_options(ui: &mut egui::Ui, app: &mut ZapApp) {
         ),
         Mode::Shred => pick(
             lang,
-            "File contents are overwritten before deletion. Slower; unrecoverable.",
-            "Содержимое файлов перезаписывается перед удалением. Медленнее, без возможности восстановления.",
+            "Contents are overwritten 3 times, then deleted, so recovery tools cannot restore them. Slower; not guaranteed on SSDs.",
+            "Содержимое трижды перезаписывается, затем файлы удаляются — восстановить их нельзя даже специальными программами. Медленнее; на SSD не гарантируется.",
         ),
         Mode::Preview => pick(
             lang,
@@ -881,7 +884,7 @@ fn mode_switch(ui: &mut egui::Ui, mode: &mut DefaultMode, lang: Language, pal: &
             (DefaultMode::Recycle, pick(lang, "Recycle Bin", "В корзину")),
             (
                 DefaultMode::Shred,
-                pick(lang, "Shred data", "Затереть данные"),
+                pick(lang, "Secure delete", "Удалить с перезаписью"),
             ),
         ] {
             let selected = *mode == value;
@@ -1242,9 +1245,10 @@ fn render_actions(
                             pick(lang, "Move to Recycle Bin", "Переместить в корзину"),
                             pal.warn,
                         ),
-                        (Mode::Shred, _) => {
-                            (pick(lang, "Shred data", "Затереть данные"), pal.danger)
-                        }
+                        (Mode::Shred, _) => (
+                            pick(lang, "Secure delete", "Удалить с перезаписью"),
+                            pal.danger,
+                        ),
                         (Mode::Delete, _) => (
                             pick(lang, "Delete permanently", "Удалить навсегда"),
                             pal.danger,

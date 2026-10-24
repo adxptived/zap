@@ -72,7 +72,7 @@ Open **Zap Settings** from the Start Menu, the ⚙ button in the dialog, or
 - **Context menu** — on/off, submenu or items directly in the menu, icons on/off,
   which actions to show, the folder-background entry, Shift-only. A live
   preview shows exactly what will be registered.
-- **Dialog** — default action (Delete / Recycle Bin / Shred), auto-close after
+- **Dialog** — default action (Delete permanently / Recycle Bin / Secure delete), auto-close after
   success, failure notifications for windowless deletions, operation journal,
   worker-thread limit.
 
