@@ -180,6 +180,8 @@ pub struct StreamScanResult {
 /// Directory entries are collected and returned in `StreamScanResult`.
 ///
 /// `bar` is ticked every `SCAN_PROGRESS_UPDATE_INTERVAL` entries when set.
+/// Windows uses `tree_delete` instead; this backs the portable pipeline.
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn scan_into_channel(
     path: &Path,
     file_tx: &crossbeam_channel::Sender<ScannedEntry>,

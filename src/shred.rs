@@ -23,7 +23,10 @@ impl ShredPermit {
         let mut active = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         while *active >= MAX_CONCURRENT_SHREDS {
             if crate::stop::is_stop_requested() {
-                return Err(io::Error::new(io::ErrorKind::Interrupted, "shred cancelled"));
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "shred cancelled",
+                ));
             }
             let waited = signal
                 .wait_timeout(active, std::time::Duration::from_millis(100))
@@ -78,7 +81,10 @@ pub fn shred_file(path: &Path, passes: usize) -> io::Result<()> {
     for pass in 0..passes {
         crate::stop::wait_if_paused();
         if crate::stop::is_stop_requested() {
-            return Err(io::Error::new(io::ErrorKind::Interrupted, "shred cancelled"));
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "shred cancelled",
+            ));
         }
         file.seek(SeekFrom::Start(0))?;
         let mut written = 0u64;
@@ -86,7 +92,10 @@ pub fn shred_file(path: &Path, passes: usize) -> io::Result<()> {
         while written < len {
             crate::stop::wait_if_paused();
             if crate::stop::is_stop_requested() {
-                return Err(io::Error::new(io::ErrorKind::Interrupted, "shred cancelled"));
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "shred cancelled",
+                ));
             }
             let chunk = ((len - written) as usize).min(buf.len());
             if pass < passes - 1 {

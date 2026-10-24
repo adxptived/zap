@@ -19,6 +19,7 @@ const WORKER_QUIET_POLLS: usize = 20; // 500 ms after Explorer stops adding path
 const WORKER_MAX_POLLS: usize = 120; // 3 s cap if Explorer keeps launching items
 
 fn main() {
+    zap::parallelism::init_global_pool();
     let raw_args: Vec<OsString> = std::env::args_os().skip(1).collect();
 
     // If --zapw-worker is present, we ARE the background worker -- do the real work.

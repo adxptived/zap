@@ -6,6 +6,11 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **`force_delete` could not open directories** — the POSIX-delete fallback
+  lacked `FILE_FLAG_BACKUP_SEMANTICS`, so it always failed on empty
+  directories and directory junctions despite being documented for them.
+- **Win32 helpers now handle paths longer than 260 characters** by adding
+  the `\\?\` prefix, matching what the Rust standard library does.
 - **zapw now journals context-menu deletions** — the Explorer context-menu
   worker (the most common deletion surface) previously never wrote to the
   operation journal; it now records per-path outcomes for direct, batch,
@@ -25,8 +30,41 @@ All notable changes to this project will be documented in this file.
   no longer lingers in directory metadata; best-effort with a safe
   fallback to plain removal.
 
+### Changed
+
+- **Redesigned zapg dialog** — Segoe UI font, tuned light and dark themes,
+  a Delete / Recycle Bin / Shred mode switch instead of three checkboxes,
+  thread limit and journal opt-out moved under "Advanced". The selection
+  list with per-item sizes is visible before the run (items can be removed),
+  progress shows percent, items/s and time left, and failures are listed
+  with their errors plus a "Copy report" button. The window fits its
+  content instead of using fixed heights; a successful run shows its result
+  briefly before closing.
+- **Real progress for folder deletions in the GUI** — the background size
+  pass now also counts entries, so deleting a single large folder shows a
+  percentage and ETA instead of an empty bar until completion. Progress and
+  ETA are weighted by entry count, which tracks deletion time far better
+  than bytes.
+- **Default worker pool capped at 8 threads** — measured wall time is flat
+  past ~8 workers, while extra threads only took CPU from other programs.
+  `--threads` still overrides it.
+- CLI prints `Done in N.NNs` instead of a bare number.
+
 ### Performance
 
+- **New Windows tree-delete engine** — unfiltered directory deletion now
+  lists each folder with `FindFirstFileExW` (large fetch, no short names),
+  deletes files immediately and recurses in parallel, removing each folder
+  as soon as it is empty. Replaces the scan thread + two channels + per-depth
+  directory barriers, drops one `GetFileAttributesW` per directory, and
+  handles read-only entries in one POSIX-delete call. A locked file is now
+  reported once instead of cascading errors up every parent folder.
+- **Size calculation ~45× faster on Windows** — sizes are read from
+  directory listings instead of opening every file (`metadata()` per file
+  cost as much kernel time as deleting it). On a 40k-file tree the CLI size
+  preview dropped from 4.6 s to 0.1 s, and the GUI's background size pass
+  no longer competes with the deletion for kernel time. The treemap uses the
+  same path.
 - **Faster shred** — the overwrite buffer grew from 64 KiB to 1 MiB
   (capped at the file size), cutting syscall count ~16x on large files,
   and the RNG handle is reused across chunks instead of re-created per

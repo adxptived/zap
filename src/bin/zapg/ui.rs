@@ -1,75 +1,178 @@
 //! egui theme and rendering for the zapg dialog.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
-use eframe::egui;
+use eframe::egui::{self, Align, Color32, CornerRadius, Layout, RichText, Stroke};
 use zap::{size, treemap};
 
 use crate::app::{should_auto_close, DeleteItem, ItemState, StatusCounts, ZapApp};
-use crate::{WINDOW_HEIGHT_DANGEROUS, WINDOW_HEIGHT_NORMAL, WINDOW_HEIGHT_TREEMAP, WINDOW_WIDTH};
+use crate::{WINDOW_HEIGHT_MAX, WINDOW_HEIGHT_MIN, WINDOW_WIDTH};
 
-/// Extra window height for the per-item status list during multi-item runs.
-const ITEM_LIST_HEIGHT: f32 = 88.0;
+const MARGIN: i8 = 18;
+const ITEM_LIST_MAX_HEIGHT: f32 = 148.0;
+const FAILURE_LIST_MAX_HEIGHT: f32 = 120.0;
+const TREEMAP_HEIGHT: f32 = 260.0;
+/// How long a successful run stays visible before the dialog closes.
+const SUCCESS_LINGER: Duration = Duration::from_millis(900);
+const CANCELLED: &str = "cancelled by user";
+
+// ---------------------------------------------------------------------------
+// Theme
+// ---------------------------------------------------------------------------
+
+/// Semantic colours, resolved per frame for the active (light/dark) theme.
+struct Palette {
+    danger: Color32,
+    danger_soft: Color32,
+    warn: Color32,
+    success: Color32,
+    accent: Color32,
+    card: Color32,
+    card_stroke: Color32,
+    muted: Color32,
+}
+
+impl Palette {
+    fn for_ui(ui: &egui::Ui) -> Self {
+        if ui.visuals().dark_mode {
+            Self {
+                danger: Color32::from_rgb(232, 84, 84),
+                danger_soft: Color32::from_rgb(64, 34, 38),
+                warn: Color32::from_rgb(236, 176, 64),
+                success: Color32::from_rgb(88, 192, 116),
+                accent: Color32::from_rgb(92, 150, 240),
+                card: Color32::from_rgb(38, 41, 48),
+                card_stroke: Color32::from_rgb(56, 60, 70),
+                muted: Color32::from_rgb(150, 155, 166),
+            }
+        } else {
+            Self {
+                danger: Color32::from_rgb(200, 48, 48),
+                danger_soft: Color32::from_rgb(253, 236, 236),
+                warn: Color32::from_rgb(190, 120, 10),
+                success: Color32::from_rgb(34, 140, 70),
+                accent: Color32::from_rgb(40, 104, 210),
+                card: Color32::from_rgb(255, 255, 255),
+                card_stroke: Color32::from_rgb(222, 225, 231),
+                muted: Color32::from_rgb(105, 110, 122),
+            }
+        }
+    }
+}
 
 pub fn configure_style(ctx: &egui::Context) {
-    let mut style = (*ctx.style()).clone();
-    let widget_radius = egui::CornerRadius::same(6);
-    style.visuals.widgets.inactive.corner_radius = widget_radius;
-    style.visuals.widgets.hovered.corner_radius = widget_radius;
-    style.visuals.widgets.active.corner_radius = widget_radius;
-    style.visuals.widgets.open.corner_radius = widget_radius;
-    style.visuals.widgets.noninteractive.corner_radius = egui::CornerRadius::same(4);
-    style.spacing.button_padding = egui::vec2(10.0, 4.0);
-    style.spacing.item_spacing = egui::vec2(8.0, 6.0);
-    ctx.set_style(style);
+    install_fonts(ctx);
+    ctx.all_styles_mut(|style| {
+        use egui::{FontFamily, FontId, TextStyle};
+        style.text_styles = [
+            (
+                TextStyle::Heading,
+                FontId::new(18.0, FontFamily::Proportional),
+            ),
+            (TextStyle::Body, FontId::new(13.5, FontFamily::Proportional)),
+            (
+                TextStyle::Button,
+                FontId::new(13.5, FontFamily::Proportional),
+            ),
+            (
+                TextStyle::Small,
+                FontId::new(11.5, FontFamily::Proportional),
+            ),
+            (
+                TextStyle::Monospace,
+                FontId::new(12.5, FontFamily::Monospace),
+            ),
+        ]
+        .into();
+        style.spacing.button_padding = egui::vec2(12.0, 5.0);
+        style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+        style.spacing.interact_size.y = 24.0;
+    });
+    ctx.set_visuals_of(egui::Theme::Dark, tune_visuals(egui::Visuals::dark()));
+    ctx.set_visuals_of(egui::Theme::Light, tune_visuals(egui::Visuals::light()));
 }
 
-fn apply_dark_theme(ctx: &egui::Context) {
-    let mut style = (*ctx.style()).clone();
-    if !style.visuals.dark_mode {
-        return;
+fn tune_visuals(mut v: egui::Visuals) -> egui::Visuals {
+    let radius = CornerRadius::same(6);
+    for w in [
+        &mut v.widgets.inactive,
+        &mut v.widgets.hovered,
+        &mut v.widgets.active,
+        &mut v.widgets.open,
+    ] {
+        w.corner_radius = radius;
     }
-    let panel_bg = egui::Color32::from_rgb(30, 32, 38);
-    if style.visuals.panel_fill == panel_bg {
-        return;
+    v.widgets.noninteractive.corner_radius = CornerRadius::same(4);
+    if v.dark_mode {
+        let panel = Color32::from_rgb(28, 30, 36);
+        let widget = Color32::from_rgb(44, 47, 55);
+        let hover = Color32::from_rgb(54, 58, 67);
+        v.panel_fill = panel;
+        v.window_fill = panel;
+        v.extreme_bg_color = Color32::from_rgb(22, 24, 28);
+        v.faint_bg_color = Color32::from_rgb(34, 37, 43);
+        v.widgets.inactive.bg_fill = widget;
+        v.widgets.inactive.weak_bg_fill = widget;
+        v.widgets.inactive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(62, 66, 76));
+        v.widgets.hovered.bg_fill = hover;
+        v.widgets.hovered.weak_bg_fill = hover;
+        v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(56, 60, 70));
+        v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, Color32::from_rgb(222, 224, 230));
+        v.widgets.inactive.fg_stroke = Stroke::new(1.0, Color32::from_rgb(210, 213, 220));
+        v.selection.bg_fill = Color32::from_rgb(52, 98, 176);
+    } else {
+        let panel = Color32::from_rgb(246, 247, 249);
+        v.panel_fill = panel;
+        v.window_fill = panel;
+        v.faint_bg_color = Color32::from_rgb(238, 240, 244);
+        v.widgets.inactive.weak_bg_fill = Color32::from_rgb(232, 235, 240);
+        v.widgets.inactive.bg_fill = Color32::from_rgb(232, 235, 240);
+        v.widgets.hovered.weak_bg_fill = Color32::from_rgb(222, 226, 233);
+        v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, Color32::from_rgb(32, 35, 42));
+        v.selection.bg_fill = Color32::from_rgb(64, 120, 220);
     }
-
-    let widget_bg = egui::Color32::from_rgb(42, 45, 52);
-    let widget_bg_hover = egui::Color32::from_rgb(52, 56, 64);
-    let widget_bg_active = egui::Color32::from_rgb(58, 62, 72);
-    let text_color = egui::Color32::from_rgb(220, 222, 228);
-    let weak_text = egui::Color32::from_rgb(150, 154, 164);
-    let stroke_color = egui::Color32::from_rgb(70, 74, 84);
-
-    style.visuals.panel_fill = panel_bg;
-    style.visuals.window_fill = panel_bg;
-    style.visuals.extreme_bg_color = egui::Color32::from_rgb(24, 26, 30);
-    style.visuals.faint_bg_color = egui::Color32::from_rgb(36, 38, 44);
-    style.visuals.widgets.inactive.bg_fill = widget_bg;
-    style.visuals.widgets.inactive.weak_bg_fill = widget_bg;
-    style.visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, stroke_color);
-    style.visuals.widgets.hovered.bg_fill = widget_bg_hover;
-    style.visuals.widgets.hovered.weak_bg_fill = widget_bg_hover;
-    style.visuals.widgets.hovered.bg_stroke =
-        egui::Stroke::new(1.0, egui::Color32::from_rgb(90, 95, 108));
-    style.visuals.widgets.active.bg_fill = widget_bg_active;
-    style.visuals.widgets.active.weak_bg_fill = widget_bg_active;
-    style.visuals.widgets.noninteractive.bg_fill = panel_bg;
-    style.visuals.widgets.noninteractive.weak_bg_fill = panel_bg;
-    style.visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, stroke_color);
-    style.visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, text_color);
-    style.visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, weak_text);
-    style.visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, text_color);
-    style.visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, text_color);
-    style.visuals.selection.bg_fill = egui::Color32::from_rgb(50, 100, 180);
-    style.visuals.selection.stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(140, 180, 240));
-    ctx.set_style(style);
+    v
 }
+
+/// Use Segoe UI (the Windows UI font) when available: crisper than egui's
+/// bundled font at small sizes and covers Cyrillic/Greek/Latin paths. The
+/// bundled fonts stay as fallbacks for symbols and emoji.
+fn install_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    let font_dir = std::env::var_os("WINDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
+        .join("Fonts");
+    let mut primary = Vec::new();
+    for (name, file) in [
+        ("segoe-ui", "segoeui.ttf"),
+        ("segoe-symbol", "seguisym.ttf"),
+    ] {
+        if let Ok(bytes) = std::fs::read(font_dir.join(file)) {
+            fonts
+                .font_data
+                .insert(name.to_owned(), Arc::new(egui::FontData::from_owned(bytes)));
+            primary.push(name.to_owned());
+        }
+    }
+    let proportional = fonts
+        .families
+        .entry(egui::FontFamily::Proportional)
+        .or_default();
+    for (i, name) in primary.into_iter().enumerate() {
+        proportional.insert(i, name);
+    }
+    ctx.set_fonts(fonts);
+}
+
+// ---------------------------------------------------------------------------
+// Frame
+// ---------------------------------------------------------------------------
 
 impl eframe::App for ZapApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        apply_dark_theme(ctx);
         self.poll_events();
         self.poll_batch_collection();
         self.poll_batch_session();
@@ -77,14 +180,12 @@ impl eframe::App for ZapApp {
         // Build status once per frame. The taskbar and the central panel share
         // it instead of each scanning a potentially huge selection.
         let counts = self.status_counts();
+        let progress = run_progress(self, &counts);
         #[cfg(windows)]
-        {
-            let fraction = aggregate_progress(self, &counts);
-            self.update_taskbar(fraction, &counts);
-        }
+        self.update_taskbar(progress.fraction.unwrap_or(0.0), &counts);
 
         // Drag & drop: add files/folders dropped onto the window.
-        let dropped: Vec<std::path::PathBuf> = ctx.input(|i| {
+        let dropped: Vec<PathBuf> = ctx.input(|i| {
             i.raw
                 .dropped_files
                 .iter()
@@ -97,27 +198,6 @@ impl eframe::App for ZapApp {
         let hovering_files = ctx.input(|i| !i.raw.hovered_files.is_empty());
         if hovering_files && !self.is_running() {
             paint_drop_overlay(ctx);
-        }
-
-        let show_item_list = self.items.len() > 1 && (self.is_running() || self.finished.is_some());
-
-        // Resize window for the current content.
-        let mut target_h = if self.show_treemap {
-            WINDOW_HEIGHT_TREEMAP
-        } else if self.has_dangerous_paths {
-            WINDOW_HEIGHT_DANGEROUS
-        } else {
-            WINDOW_HEIGHT_NORMAL
-        };
-        if show_item_list && !self.show_treemap {
-            target_h += ITEM_LIST_HEIGHT;
-        }
-        let current = ctx.input(|i| i.screen_rect().height());
-        if (current - target_h).abs() > 2.0 {
-            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::Vec2::new(
-                WINDOW_WIDTH,
-                target_h,
-            )));
         }
 
         if self.total_size_calculating {
@@ -137,307 +217,781 @@ impl eframe::App for ZapApp {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
 
+        // A clean destructive run shows its result briefly, then closes.
+        if should_auto_close(self, &counts) {
+            let shown = self.finished_at.map(|at| at.elapsed()).unwrap_or_default();
+            if shown >= SUCCESS_LINGER {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            } else {
+                ctx.request_repaint_after(SUCCESS_LINGER - shown);
+            }
+        }
+
         let running = self.is_running();
-        let finished = self.finished.is_some();
         let can_start = !running
+            && !self.items.is_empty()
             && self.thread_error().is_none()
             && (!self.has_dangerous_paths || self.danger_confirmed);
 
-        let esc_pressed =
-            ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
-        if esc_pressed && !running {
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) && !running {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
-        let enter_pressed =
-            ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
-        if enter_pressed && can_start && !self.items.is_empty() {
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) && can_start {
             self.start();
         }
 
-        egui::CentralPanel::default()
-            .frame(egui::Frame::default().inner_margin(egui::Margin::same(16)))
+        let panel = egui::CentralPanel::default()
+            .frame(
+                egui::Frame::central_panel(&ctx.style()).inner_margin(egui::Margin::same(MARGIN)),
+            )
             .show(ctx, |ui| {
                 if self.items.is_empty() {
                     render_empty_state(ui, ctx);
-                    return;
+                } else {
+                    render_dialog(ui, ctx, self, &counts, &progress, can_start);
                 }
-                if should_auto_close(self, &counts) {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    return;
-                }
-                render_prompt(ui, self, &counts);
-                if show_item_list {
-                    ui.add_space(6.0);
-                    render_item_list(ui, &self.items);
-                }
-                ui.add_space(10.0);
-                render_options(ui, self);
-                ui.add_space(10.0);
-                render_actions(ui, ctx, self, running, finished, can_start);
-
-                ui.add_space(6.0);
-                render_treemap_section(ui, self);
+                ui.min_rect().height()
             });
+
+        fit_window_to_content(ctx, panel.inner);
+    }
+}
+
+/// Size the (non-resizable) window to its content so no state needs a
+/// hand-tuned height constant.
+fn fit_window_to_content(ctx: &egui::Context, content_height: f32) {
+    let target =
+        (content_height + 2.0 * f32::from(MARGIN)).clamp(WINDOW_HEIGHT_MIN, WINDOW_HEIGHT_MAX);
+    let current = ctx.input(|i| i.screen_rect().height());
+    if (current - target).abs() > 1.0 {
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+            WINDOW_WIDTH,
+            target,
+        )));
     }
 }
 
 fn render_empty_state(ui: &mut egui::Ui, ctx: &egui::Context) {
-    ui.heading("No paths were provided");
-    ui.label("Open Zap from the Windows Explorer context menu.");
-    ui.add_space(12.0);
-    if ui.button("Close").clicked() {
-        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-    }
-}
-
-fn render_prompt(ui: &mut egui::Ui, app: &ZapApp, counts: &StatusCounts) {
-    let total = app.items.len();
-    let progress = aggregate_progress(app, counts);
-
+    ui.heading("Nothing to delete");
+    ui.add_space(2.0);
+    ui.label(
+        RichText::new("Drop files or folders here, or use “Delete with Zap” in Explorer.")
+            .color(Palette::for_ui(ui).muted),
+    );
+    ui.add_space(14.0);
+    // Nest the right-to-left layout in a row: at panel level it would claim
+    // all remaining height and defeat fit_window_to_content.
     ui.horizontal(|ui| {
-        let warn_color = egui::Color32::from_rgb(230, 170, 40);
-        ui.label(egui::RichText::new("\u{26A0}").size(26.0).color(warn_color));
-        ui.add_space(6.0);
-        ui.vertical(|ui| {
-            ui.heading(
-                egui::RichText::new(selection_title(total, app.dry_run, app.recycle, app.shred))
-                    .size(16.0)
-                    .strong(),
-            );
-            let mut detail = selection_detail(&app.items);
-            if let Some(sz) = app.total_size.lock().ok().and_then(|g| *g) {
-                detail.push_str(&format!("  ({})", size::format_size(sz)));
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if ui.button("Close").clicked() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
-            ui.label(egui::RichText::new(detail).size(12.0));
         });
     });
+}
 
-    if app.has_dangerous_paths && !app.danger_confirmed {
-        ui.add_space(6.0);
-        ui.label(
-            egui::RichText::new("\u{26A0} Contains system paths — check below")
-                .size(12.0)
-                .color(egui::Color32::from_rgb(230, 170, 40)),
-        );
+fn render_dialog(
+    ui: &mut egui::Ui,
+    ctx: &egui::Context,
+    app: &mut ZapApp,
+    counts: &StatusCounts,
+    progress: &RunProgress,
+    can_start: bool,
+) {
+    let phase = Phase::of(app, counts);
+    render_header(ui, app, phase);
+
+    if app.items.len() > 1 || matches!(phase, Phase::Failed | Phase::Stopped) {
+        ui.add_space(10.0);
+        render_item_list(ui, app);
     }
 
-    if app.started_at.is_some() || app.finished.is_some() {
-        ui.add_space(6.0);
-        ui.label(egui::RichText::new(status_text(counts, app)).size(12.0));
-        ui.add_space(4.0);
-        let pb = egui::ProgressBar::new(progress)
-            .animate(app.is_running())
-            .desired_height(10.0);
-        ui.add(pb);
-    } else {
-        ui.add_space(6.0);
-        let hint = if app.recycle {
-            "Items will be moved to the Recycle Bin and can be restored."
-        } else if app.shred {
-            "Files are overwritten before deletion. This cannot be undone."
-        } else {
-            "Deletion is permanent. Drive roots are refused."
-        };
-        ui.label(egui::RichText::new(hint).size(12.0).weak());
+    if app.has_dangerous_paths && phase == Phase::Ready {
+        ui.add_space(10.0);
+        render_danger_card(ui, app);
+    }
+
+    ui.add_space(12.0);
+    match phase {
+        Phase::Ready => render_options(ui, app),
+        Phase::Running | Phase::Paused => render_progress(ui, app, progress, phase),
+        Phase::Succeeded | Phase::Previewed => render_success(ui, app),
+        Phase::Failed | Phase::Stopped => render_failures(ui, app, counts, phase),
+    }
+
+    ui.add_space(14.0);
+    render_actions(ui, ctx, app, phase, can_start);
+
+    if app.show_treemap {
+        ui.add_space(10.0);
+        render_treemap(ui, app);
     }
 }
 
-/// Scrollable per-item status list shown during multi-item runs so the
-/// user can see exactly which paths succeeded, failed, or are in flight.
-fn render_item_list(ui: &mut egui::Ui, items: &[DeleteItem]) {
-    egui::ScrollArea::vertical()
-        .max_height(ITEM_LIST_HEIGHT - 8.0)
-        .auto_shrink([false, true])
-        .show(ui, |ui| {
-            for item in items {
-                ui.horizontal(|ui| {
-                    let (icon, color) = match &item.state {
-                        ItemState::Pending => ("\u{25CB}", egui::Color32::from_rgb(150, 154, 164)),
-                        ItemState::Running => ("\u{25B6}", egui::Color32::from_rgb(80, 140, 220)),
-                        ItemState::Done => ("\u{2713}", egui::Color32::from_rgb(80, 180, 100)),
-                        ItemState::Failed(_) => ("\u{2715}", egui::Color32::from_rgb(210, 70, 70)),
-                    };
-                    ui.label(egui::RichText::new(icon).size(11.0).color(color));
-                    let name = item
-                        .path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_else(|| item.path.display().to_string());
-                    ui.label(egui::RichText::new(compact_text(&name, 40)).size(11.0));
-                    if let ItemState::Failed(err) = &item.state {
-                        ui.label(
-                            egui::RichText::new(compact_text(err, 36))
-                                .size(11.0)
-                                .color(color),
-                        );
-                    }
-                });
+// ---------------------------------------------------------------------------
+// Phase & header
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Ready,
+    Running,
+    Paused,
+    Succeeded,
+    Previewed,
+    Failed,
+    Stopped,
+}
+
+impl Phase {
+    fn of(app: &ZapApp, counts: &StatusCounts) -> Self {
+        if app.is_running() {
+            return if app.is_paused() {
+                Self::Paused
+            } else {
+                Self::Running
+            };
+        }
+        if app.finished.is_none() {
+            return Self::Ready;
+        }
+        let cancelled = cancelled_count(&app.items);
+        if counts.failed > cancelled {
+            Self::Failed
+        } else if cancelled > 0 {
+            Self::Stopped
+        } else if app.dry_run {
+            Self::Previewed
+        } else {
+            Self::Succeeded
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Mode {
+    Delete,
+    Recycle,
+    Shred,
+    Preview,
+}
+
+impl Mode {
+    fn of(app: &ZapApp) -> Self {
+        if app.dry_run {
+            Self::Preview
+        } else if app.recycle {
+            Self::Recycle
+        } else if app.shred {
+            Self::Shred
+        } else {
+            Self::Delete
+        }
+    }
+}
+
+fn render_header(ui: &mut egui::Ui, app: &ZapApp, phase: Phase) {
+    let pal = Palette::for_ui(ui);
+    let mode = Mode::of(app);
+    let (glyph, color) = match phase {
+        Phase::Succeeded | Phase::Previewed => ("✓", pal.success),
+        Phase::Failed => ("!", pal.danger),
+        Phase::Stopped => ("■", pal.warn),
+        Phase::Running | Phase::Paused => ("…", pal.accent),
+        Phase::Ready => match mode {
+            Mode::Delete | Mode::Shred => ("!", pal.danger),
+            Mode::Recycle => ("↺", pal.warn),
+            Mode::Preview => ("?", pal.accent),
+        },
+    };
+
+    ui.horizontal(|ui| {
+        paint_badge(ui, glyph, color);
+        ui.add_space(4.0);
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
+            ui.add(
+                egui::Label::new(RichText::new(title(app, phase, mode)).heading().strong())
+                    .truncate(),
+            );
+            if let Some(subtitle) = subtitle(&app.items) {
+                ui.add(egui::Label::new(RichText::new(subtitle).color(pal.muted)).truncate())
+                    .on_hover_text(full_selection_text(&app.items));
             }
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                match size_summary(app) {
+                    Some(text) => {
+                        ui.label(RichText::new(text).small().color(pal.muted));
+                    }
+                    None => {
+                        ui.add(egui::Spinner::new().size(11.0));
+                        ui.label(RichText::new("Calculating size…").small().color(pal.muted));
+                    }
+                }
+            });
         });
+    });
+}
+
+fn paint_badge(ui: &mut egui::Ui, glyph: &str, color: Color32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(40.0, 40.0), egui::Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, CornerRadius::same(10), color.gamma_multiply(0.18));
+    painter.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        glyph,
+        egui::FontId::proportional(21.0),
+        color,
+    );
+}
+
+fn title(app: &ZapApp, phase: Phase, mode: Mode) -> String {
+    let what = match app.items.as_slice() {
+        [item] => format!("“{}”", compact_text(&display_name(&item.path), 30)),
+        items => format!("{} items", items.len()),
+    };
+    match phase {
+        Phase::Ready => match mode {
+            Mode::Delete => format!("Delete {what}?"),
+            Mode::Recycle => format!("Move {what} to Recycle Bin?"),
+            Mode::Shred => format!("Shred {what}?"),
+            Mode::Preview => format!("Preview {what}"),
+        },
+        Phase::Running => match mode {
+            Mode::Delete => "Deleting…".to_owned(),
+            Mode::Recycle => "Moving to Recycle Bin…".to_owned(),
+            Mode::Shred => "Shredding…".to_owned(),
+            Mode::Preview => "Scanning…".to_owned(),
+        },
+        Phase::Paused => "Paused".to_owned(),
+        Phase::Succeeded => match mode {
+            Mode::Recycle => "Moved to Recycle Bin".to_owned(),
+            Mode::Shred => "Shredded".to_owned(),
+            _ => "Deleted".to_owned(),
+        },
+        Phase::Previewed => "Preview complete".to_owned(),
+        Phase::Failed => "Some items could not be deleted".to_owned(),
+        Phase::Stopped => "Stopped".to_owned(),
+    }
+}
+
+/// Second header line: the full path for one item, the shared parent folder
+/// for several items in one place, or a name sample otherwise.
+fn subtitle(items: &[DeleteItem]) -> Option<String> {
+    match items {
+        [] => None,
+        [item] => Some(item.path.display().to_string()),
+        [first, rest @ ..] => {
+            let parent = first.path.parent();
+            if parent.is_some() && rest.iter().all(|i| i.path.parent() == parent) {
+                Some(format!("in {}", parent?.display()))
+            } else {
+                Some(format!(
+                    "{} and {} more",
+                    display_name(&first.path),
+                    rest.len()
+                ))
+            }
+        }
+    }
+}
+
+fn full_selection_text(items: &[DeleteItem]) -> String {
+    let mut lines: Vec<String> = items
+        .iter()
+        .take(30)
+        .map(|item| item.path.display().to_string())
+        .collect();
+    if items.len() > 30 {
+        lines.push(format!("… and {} more", items.len() - 30));
+    }
+    lines.join("\n")
+}
+
+fn size_summary(app: &ZapApp) -> Option<String> {
+    let guard = app.item_sizes.lock().ok()?;
+    let snapshot = guard.as_ref()?;
+    Some(format!(
+        "{}  ·  {} {}",
+        size::format_size(snapshot.total),
+        format_count(snapshot.entries),
+        if snapshot.entries == 1 {
+            "item"
+        } else {
+            "items"
+        }
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// Selection list
+// ---------------------------------------------------------------------------
+
+fn render_item_list(ui: &mut egui::Ui, app: &mut ZapApp) {
+    let pal = Palette::for_ui(ui);
+    let editable = !app.is_running() && app.started_at.is_none();
+    let mut remove: Option<usize> = None;
+    // Read sizes under the lock instead of cloning the whole map per frame;
+    // only the visible rows (`show_rows`) look anything up.
+    let sizes_guard = app.item_sizes.lock().ok();
+    let sizes = sizes_guard.as_ref().and_then(|g| g.as_ref());
+
+    card(pal.card, pal.card_stroke).show(ui, |ui| {
+        egui::ScrollArea::vertical()
+            .max_height(ITEM_LIST_MAX_HEIGHT)
+            .auto_shrink([false, true])
+            .show_rows(ui, 22.0, app.items.len(), |ui, range| {
+                for index in range {
+                    let item = &app.items[index];
+                    let row = ui.horizontal(|ui| {
+                        ui.set_min_height(22.0);
+                        let (icon, color) = state_icon(&item.state, &pal);
+                        ui.label(RichText::new(icon).color(color));
+                        let right_width = 84.0;
+                        let name_width = (ui.available_width() - right_width).max(40.0);
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(name_width, 20.0),
+                            Layout::left_to_right(Align::Center),
+                            |ui| {
+                                ui.add(egui::Label::new(display_name(&item.path)).truncate());
+                            },
+                        );
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if editable
+                                && ui
+                                    .add(egui::Button::new(RichText::new("✕").small()).frame(false))
+                                    .on_hover_text("Remove from list")
+                                    .clicked()
+                            {
+                                remove = Some(index);
+                            }
+                            match &item.state {
+                                ItemState::Failed(err) => {
+                                    let short = if err.contains(CANCELLED) {
+                                        "skipped"
+                                    } else {
+                                        "failed"
+                                    };
+                                    ui.label(RichText::new(short).small().color(pal.danger));
+                                }
+                                _ => {
+                                    if let Some(stats) =
+                                        sizes.and_then(|s| s.by_path.get(&item.path))
+                                    {
+                                        ui.label(
+                                            RichText::new(size::format_size(stats.bytes))
+                                                .small()
+                                                .color(pal.muted),
+                                        );
+                                    }
+                                }
+                            }
+                        });
+                    });
+                    let hover = match &item.state {
+                        ItemState::Failed(err) => format!("{}\n{}", item.path.display(), err),
+                        _ => item.path.display().to_string(),
+                    };
+                    row.response.on_hover_text(hover);
+                }
+            });
+    });
+
+    drop(sizes_guard);
+    if let Some(index) = remove {
+        app.remove_item(index);
+    }
+}
+
+fn state_icon(state: &ItemState, pal: &Palette) -> (&'static str, Color32) {
+    match state {
+        ItemState::Pending => ("○", pal.muted),
+        ItemState::Running => ("▶", pal.accent),
+        ItemState::Done => ("✓", pal.success),
+        ItemState::Failed(err) if err.contains(CANCELLED) => ("–", pal.warn),
+        ItemState::Failed(_) => ("✕", pal.danger),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Options
+// ---------------------------------------------------------------------------
+
+fn render_danger_card(ui: &mut egui::Ui, app: &mut ZapApp) {
+    let pal = Palette::for_ui(ui);
+    card(pal.danger_soft, pal.danger.gamma_multiply(0.5)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.label(
+            RichText::new("⚠  System folder selected")
+                .strong()
+                .color(pal.danger),
+        );
+        ui.label(
+            RichText::new(
+                "The selection includes Windows, Program Files or user profile folders. \
+                 Deleting them can break the system or lose personal data.",
+            )
+            .small(),
+        );
+        ui.add_space(2.0);
+        ui.checkbox(&mut app.danger_confirmed, "I understand, delete anyway");
+    });
 }
 
 fn render_options(ui: &mut egui::Ui, app: &mut ZapApp) {
-    ui.add_enabled_ui(!app.is_running(), |ui| {
-        ui.checkbox(&mut app.dry_run, "Preview only");
-        if ui
-            .checkbox(&mut app.recycle, "Move to Recycle Bin (recoverable)")
-            .changed()
-            && app.recycle
-        {
-            // Recycle and shred are mutually exclusive: shredded data
-            // cannot be restored from the bin.
-            app.shred = false;
-        }
-        if ui
-            .checkbox(&mut app.shred, "Shred (overwrite data, unrecoverable)")
-            .changed()
-            && app.shred
-        {
-            app.recycle = false;
-        }
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut app.threads_enabled, "Limit threads");
-            ui.add_enabled(
-                app.threads_enabled,
-                egui::TextEdit::singleline(&mut app.threads_text).desired_width(46.0),
-            );
-        });
-        if let Some(error) = app.thread_error() {
-            ui.colored_label(ui.visuals().error_fg_color, error);
-        }
-        if app.has_dangerous_paths {
-            ui.add_space(6.0);
-            ui.label(
-                egui::RichText::new("System folder selected")
-                    .size(12.0)
-                    .color(egui::Color32::from_rgb(200, 60, 60)),
-            );
-            ui.checkbox(&mut app.danger_confirmed, "I understand — delete anyway");
+    let pal = Palette::for_ui(ui);
+
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        let segments = [
+            ("Delete", !app.recycle && !app.shred),
+            ("Recycle Bin", app.recycle),
+            ("Shred", app.shred),
+        ];
+        for (index, (label, selected)) in segments.into_iter().enumerate() {
+            let button = egui::Button::new(RichText::new(label).strong().color(if selected {
+                Color32::WHITE
+            } else {
+                ui.visuals().text_color()
+            }))
+            .fill(if selected {
+                pal.accent
+            } else {
+                ui.visuals().widgets.inactive.weak_bg_fill
+            })
+            .min_size(egui::vec2(0.0, 28.0));
+            if ui.add(button).clicked() {
+                app.recycle = index == 1;
+                app.shred = index == 2;
+            }
         }
     });
+
+    ui.add_space(4.0);
+    let hint = match Mode::of(app) {
+        Mode::Delete => "Removed immediately — bypasses the Recycle Bin and can’t be restored.",
+        Mode::Recycle => "Items can be restored from the Recycle Bin.",
+        Mode::Shred => "File contents are overwritten before deletion. Slower; unrecoverable.",
+        Mode::Preview => "Nothing will be deleted — Zap only checks what would be removed.",
+    };
+    ui.label(RichText::new(hint).small().color(pal.muted));
+
+    ui.add_space(6.0);
+    ui.checkbox(&mut app.dry_run, "Preview only (don’t delete anything)");
+
+    egui::CollapsingHeader::new(RichText::new("Advanced").color(pal.muted))
+        .id_salt("advanced")
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut app.threads_enabled, "Limit worker threads");
+                ui.add_enabled(
+                    app.threads_enabled,
+                    egui::TextEdit::singleline(&mut app.threads_text).desired_width(40.0),
+                );
+            });
+            if let Some(error) = app.thread_error() {
+                ui.colored_label(pal.danger, error);
+            }
+            ui.checkbox(&mut app.no_journal, "Don’t record this run in the journal");
+        });
+}
+
+// ---------------------------------------------------------------------------
+// Progress & results
+// ---------------------------------------------------------------------------
+
+/// Selection-wide progress, computed once per frame.
+pub struct RunProgress {
+    /// 0..=1, or None when nothing meaningful is known yet.
+    pub fraction: Option<f32>,
+    /// Entries processed so far and the total, when the size pass knows it.
+    pub entries: Option<(u64, u64)>,
+}
+
+/// Progress weighted by entry counts from the background size pass:
+/// deletion cost is per entry (each one is a kernel open + unlink), so a
+/// folder of 100k tiny files dominates a single 10 GB file — byte weighting
+/// would get the ETA badly wrong.
+fn run_progress(app: &ZapApp, counts: &StatusCounts) -> RunProgress {
+    let total_items = app.items.len();
+    if total_items == 0 {
+        return RunProgress {
+            fraction: None,
+            entries: None,
+        };
+    }
+    // Bulk file-root runs report selection-wide progress: use it directly.
+    if let Some(p) = app.items.iter().find_map(|item| {
+        matches!(item.state, ItemState::Running)
+            .then_some(item.progress.as_ref())
+            .flatten()
+            .filter(|p| p.bulk)
+    }) {
+        let len = p.length.unwrap_or(total_items as u64).max(1);
+        return RunProgress {
+            fraction: Some((p.position as f32 / len as f32).clamp(0.0, 1.0)),
+            entries: Some((p.position, len)),
+        };
+    }
+
+    if let Some(snapshot) = app.item_sizes.lock().ok().as_ref().and_then(|g| g.as_ref()) {
+        if snapshot.entries > 0 {
+            let mut done: u64 = 0;
+            for item in &app.items {
+                let entries = snapshot.by_path.get(&item.path).map_or(1, |s| s.entries);
+                match &item.state {
+                    ItemState::Done | ItemState::Failed(_) => done += entries,
+                    ItemState::Running => {
+                        let position = item.progress.as_ref().map_or(0, |p| match p.length {
+                            Some(len) if len > 0 => {
+                                (p.position as f64 / len as f64 * entries as f64) as u64
+                            }
+                            _ => p.position,
+                        });
+                        done += position.min(entries);
+                    }
+                    ItemState::Pending => {}
+                }
+            }
+            let done = done.min(snapshot.entries);
+            return RunProgress {
+                fraction: Some(done as f32 / snapshot.entries as f32),
+                entries: Some((done, snapshot.entries)),
+            };
+        }
+    }
+
+    let finished = (counts.done + counts.failed) as f32;
+    RunProgress {
+        fraction: (finished > 0.0).then(|| finished / total_items as f32),
+        entries: None,
+    }
+}
+
+fn render_progress(ui: &mut egui::Ui, app: &mut ZapApp, progress: &RunProgress, phase: Phase) {
+    let pal = Palette::for_ui(ui);
+    let fraction = progress.fraction.unwrap_or(0.0);
+    let bar = egui::ProgressBar::new(fraction)
+        .desired_height(14.0)
+        .fill(if phase == Phase::Paused {
+            pal.warn
+        } else {
+            pal.accent
+        })
+        .animate(phase == Phase::Running && progress.fraction.is_none());
+    let bar = if progress.fraction.is_some() {
+        bar.text(
+            RichText::new(format!("{:.0}%", fraction * 100.0))
+                .small()
+                .color(Color32::WHITE),
+        )
+    } else {
+        bar
+    };
+    ui.add(bar);
+
+    ui.horizontal(|ui| {
+        let elapsed = app.active_elapsed().unwrap_or_default().as_secs_f32();
+        let left = match progress.entries {
+            Some((done, total)) => {
+                let mut text = format!("{} of {} items", format_count(done), format_count(total));
+                if elapsed >= 0.5 && done > 0 {
+                    text.push_str(&format!(
+                        "  ·  {}/s",
+                        format_count((done as f32 / elapsed) as u64)
+                    ));
+                }
+                text
+            }
+            None => {
+                let counts = app.status_counts();
+                format!(
+                    "{} of {} done",
+                    counts.done + counts.failed,
+                    app.items.len()
+                )
+            }
+        };
+        ui.label(RichText::new(left).small().color(pal.muted));
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let mut right = format_duration(elapsed);
+            if phase == Phase::Running {
+                if let Some(eta) = estimate_eta_secs(progress.fraction, elapsed) {
+                    right = format!("about {} left  ·  {right}", format_duration(eta));
+                }
+            }
+            ui.label(RichText::new(right).small().color(pal.muted));
+        });
+    });
+}
+
+fn render_success(ui: &mut egui::Ui, app: &ZapApp) {
+    let pal = Palette::for_ui(ui);
+    let elapsed = app.finished.unwrap_or_default().as_secs_f32();
+    let text = if app.dry_run {
+        format!(
+            "Nothing was deleted. {} would be removed.",
+            size_summary(app).unwrap_or_else(|| "The selection".to_owned())
+        )
+    } else {
+        format!("Finished in {}.", format_duration(elapsed))
+    };
+    ui.label(RichText::new(text).color(pal.success));
+}
+
+fn render_failures(ui: &mut egui::Ui, app: &ZapApp, counts: &StatusCounts, phase: Phase) {
+    let pal = Palette::for_ui(ui);
+    let cancelled = cancelled_count(&app.items);
+    let failed = counts.failed - cancelled;
+    let mut summary = Vec::new();
+    if counts.done > 0 {
+        summary.push(format!("{} done", counts.done));
+    }
+    if failed > 0 {
+        summary.push(format!("{failed} failed"));
+    }
+    if cancelled > 0 {
+        summary.push(format!("{cancelled} skipped"));
+    }
+    ui.label(RichText::new(summary.join("  ·  ")).strong());
+
+    if phase == Phase::Failed {
+        ui.add_space(4.0);
+        card(pal.danger_soft, pal.danger.gamma_multiply(0.4)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            egui::ScrollArea::vertical()
+                .max_height(FAILURE_LIST_MAX_HEIGHT)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    for item in &app.items {
+                        if let ItemState::Failed(err) = &item.state {
+                            if err.contains(CANCELLED) {
+                                continue;
+                            }
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(item.path.display().to_string())
+                                        .small()
+                                        .strong(),
+                                )
+                                .truncate(),
+                            );
+                            ui.label(RichText::new(err).small().color(pal.danger));
+                            ui.add_space(4.0);
+                        }
+                    }
+                });
+        });
+        ui.add_space(2.0);
+        ui.label(
+            RichText::new(
+                "Tip: close programs that use these files, or run as administrator, then retry.",
+            )
+            .small()
+            .color(pal.muted),
+        );
+    } else {
+        ui.label(
+            RichText::new("The run was stopped; remaining items were left untouched.")
+                .small()
+                .color(pal.muted),
+        );
+    }
 }
 
 fn render_actions(
     ui: &mut egui::Ui,
     ctx: &egui::Context,
     app: &mut ZapApp,
-    running: bool,
-    finished: bool,
+    phase: Phase,
     can_start: bool,
 ) {
-    let is_dark = ui.visuals().dark_mode;
-    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-        let label = if app.dry_run {
-            "Preview"
-        } else if finished {
-            "Run again"
-        } else if app.recycle {
-            "Recycle"
-        } else if app.shred {
-            "Shred"
+    let pal = Palette::for_ui(ui);
+    ui.horizontal(|ui| {
+        // Left: secondary tools.
+        let analyzer_label = if app.show_treemap {
+            "Hide disk usage"
         } else {
-            "Delete"
+            "Disk usage"
         };
-        let fill = if app.dry_run {
-            if is_dark {
-                egui::Color32::from_rgb(56, 120, 210)
-            } else {
-                egui::Color32::from_rgb(45, 110, 205)
-            }
-        } else if app.recycle {
-            if is_dark {
-                egui::Color32::from_rgb(190, 130, 35)
-            } else {
-                egui::Color32::from_rgb(200, 130, 25)
-            }
-        } else if is_dark {
-            egui::Color32::from_rgb(200, 60, 60)
-        } else {
-            egui::Color32::from_rgb(210, 50, 50)
-        };
-        let btn_radius = egui::CornerRadius::same(8);
-        let start_btn = egui::Button::new(
-            egui::RichText::new(label)
-                .size(14.0)
-                .strong()
-                .color(egui::Color32::WHITE),
-        )
-        .fill(fill)
-        .corner_radius(btn_radius)
-        .min_size(egui::vec2(108.0, 34.0));
-        if ui.add_enabled(can_start, start_btn).clicked() {
-            app.start();
-        }
-        ui.add_space(8.0);
-        let cancel_fill = if is_dark {
-            egui::Color32::from_rgb(60, 63, 68)
-        } else {
-            egui::Color32::from_rgb(225, 228, 232)
-        };
-        let cancel_text = if is_dark {
-            egui::Color32::from_rgb(210, 212, 216)
-        } else {
-            egui::Color32::from_rgb(50, 54, 60)
-        };
-        let cancel_btn = egui::Button::new(
-            egui::RichText::new(if finished { "Close" } else { "Cancel" })
-                .size(14.0)
-                .color(cancel_text),
-        )
-        .fill(cancel_fill)
-        .corner_radius(btn_radius)
-        .min_size(egui::vec2(92.0, 34.0));
-        if running {
-            // While a run is active this button becomes a working Stop:
-            // it raises the graceful-stop flag checked by the deletion
-            // loops and the worker thread.
-            let stop_btn =
-                egui::Button::new(egui::RichText::new("Stop").size(14.0).color(cancel_text))
-                    .fill(cancel_fill)
-                    .corner_radius(btn_radius)
-                    .min_size(egui::vec2(92.0, 34.0));
-            if ui.add(stop_btn).clicked() {
-                zap::stop::request_stop();
-            }
-            ui.add_space(8.0);
-            // Pause blocks all deletion loops at their next checkpoint;
-            // Resume releases them. Stop still works while paused.
-            let pause_label = if app.is_paused() { "Resume" } else { "Pause" };
-            let pause_btn = egui::Button::new(
-                egui::RichText::new(pause_label)
-                    .size(14.0)
-                    .color(cancel_text),
+        if ui
+            .add_enabled(
+                !app.is_running(),
+                egui::Button::new(RichText::new(analyzer_label).color(pal.accent)).frame(false),
             )
-            .fill(cancel_fill)
-            .corner_radius(btn_radius)
-            .min_size(egui::vec2(92.0, 34.0));
-            if ui.add(pause_btn).clicked() {
-                app.toggle_pause();
+            .clicked()
+        {
+            app.show_treemap = !app.show_treemap;
+            if app.show_treemap {
+                app.start_treemap_collection();
             }
-        } else if ui.add(cancel_btn).clicked() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
+        if phase == Phase::Failed
+            && ui
+                .add(egui::Button::new(RichText::new("Copy report").color(pal.accent)).frame(false))
+                .clicked()
+        {
+            ctx.copy_text(app.failure_report());
+        }
+
+        // Right: primary + secondary actions.
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let size = egui::vec2(96.0, 32.0);
+            match phase {
+                Phase::Running | Phase::Paused => {
+                    if ui.add(egui::Button::new("Stop").min_size(size)).clicked() {
+                        zap::stop::request_stop();
+                    }
+                    let label = if phase == Phase::Paused {
+                        "Resume"
+                    } else {
+                        "Pause"
+                    };
+                    if ui.add(egui::Button::new(label).min_size(size)).clicked() {
+                        app.toggle_pause();
+                    }
+                }
+                _ => {
+                    let finished = app.finished.is_some();
+                    let (label, fill) = match (Mode::of(app), finished) {
+                        (_, true) if phase == Phase::Previewed => ("Preview again", pal.accent),
+                        (_, true) => ("Retry", pal.danger),
+                        (Mode::Preview, _) => ("Preview", pal.accent),
+                        (Mode::Recycle, _) => ("Recycle", pal.warn),
+                        (Mode::Shred, _) => ("Shred", pal.danger),
+                        (Mode::Delete, _) => ("Delete", pal.danger),
+                    };
+                    let primary =
+                        egui::Button::new(RichText::new(label).strong().color(Color32::WHITE))
+                            .fill(fill)
+                            .min_size(size);
+                    if ui
+                        .add_enabled(can_start, primary)
+                        .on_hover_text("Enter")
+                        .clicked()
+                    {
+                        app.start();
+                    }
+                    let close_label = if finished { "Close" } else { "Cancel" };
+                    if ui
+                        .add(egui::Button::new(close_label).min_size(size))
+                        .on_hover_text("Esc")
+                        .clicked()
+                    {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                }
+            }
+        });
     });
 }
 
-fn render_treemap_section(ui: &mut egui::Ui, app: &mut ZapApp) {
-    let toggle_label = if app.show_treemap {
-        "\u{25B2} Hide disk analyzer"
-    } else {
-        "\u{25BC} Show disk analyzer"
-    };
-    if ui
-        .add_enabled(!app.is_running(), egui::Button::new(toggle_label))
-        .clicked()
-    {
-        app.show_treemap = !app.show_treemap;
-        if app.show_treemap {
-            app.start_treemap_collection();
-        }
-    }
-
-    if app.show_treemap {
-        ui.add_space(4.0);
+fn render_treemap(ui: &mut egui::Ui, app: &mut ZapApp) {
+    let width = ui.available_width();
+    ui.allocate_ui(egui::vec2(width, TREEMAP_HEIGHT), |ui| {
+        ui.set_min_height(TREEMAP_HEIGHT);
         // Render while holding the lock — the snapshot is only read here,
         // which avoids cloning every frame. Entries are pre-sorted and
         // capped by the collection thread; total is pre-computed.
@@ -448,209 +1002,83 @@ fn render_treemap_section(ui: &mut egui::Ui, app: &mut ZapApp) {
                 treemap::treemap_ui(ui, &snapshot.entries, snapshot.total);
             }
             None => {
-                treemap::treemap_ui(ui, &[], 0);
+                ui.centered_and_justified(|ui| {
+                    ui.add(egui::Spinner::new());
+                });
             }
         }
-    }
-}
-
-fn selection_title(total: usize, dry_run: bool, recycle: bool, shred: bool) -> String {
-    let action = if dry_run {
-        "Preview"
-    } else if recycle {
-        "Recycle"
-    } else if shred {
-        "Shred"
-    } else {
-        "Delete"
-    };
-    match total {
-        1 => format!("{action} this item?"),
-        _ => format!("{action} these {total} items?"),
-    }
-}
-
-fn selection_detail(items: &[DeleteItem]) -> String {
-    match items {
-        [] => String::new(),
-        [item] => compact_path(&item.path),
-        [first, rest @ ..] => format!("{} and {} more", compact_path(&first.path), rest.len()),
-    }
-}
-
-fn compact_path(path: &Path) -> String {
-    let text = path.display().to_string();
-    const MAX_LEN: usize = 52;
-    if text.chars().count() <= MAX_LEN {
-        return text;
-    }
-    let suffix: String = text
-        .chars()
-        .rev()
-        .take(MAX_LEN - 3)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    format!("...{suffix}")
-}
-
-fn status_text(counts: &StatusCounts, app: &ZapApp) -> String {
-    let finished_cnt = counts.done + counts.failed;
-    let total = app.items.len();
-    let elapsed = app.active_elapsed();
-    let mut text = if app.is_paused() {
-        format!("Paused - {finished_cnt}/{total} complete")
-    } else {
-        format!("{finished_cnt}/{total} complete")
-    };
-    if counts.failed > 0 {
-        text.push_str(&format!(", {} failed", counts.failed));
-        if let Some(error) = first_failure(&app.items) {
-            text.push_str(": ");
-            text.push_str(&compact_text(error, 64));
-        }
-    }
-    if let Some(d) = elapsed {
-        text.push_str(&format!(" - {:.1}s", d.as_secs_f32()));
-    }
-    if app.is_running() && !app.is_paused() {
-        if let Some(eta) = estimate_eta_secs(app, counts) {
-            text.push_str(&format!(" - ETA ~{}", format_eta(eta)));
-        }
-    }
-    if let Some(msg) = active_progress_message(&app.items) {
-        text.push_str(" - ");
-        text.push_str(msg);
-    }
-    text
-}
-
-/// Remaining-time estimate from byte-weighted progress and active elapsed
-/// time. Byte weighting matters on mixed selections: deleting 90 small files
-/// out of 100 means little if the 10 remaining are the multi-GB folders.
-/// Returns None until enough progress exists for a stable estimate.
-fn estimate_eta_secs(app: &ZapApp, counts: &StatusCounts) -> Option<f32> {
-    let fraction = byte_weighted_progress(app, counts).unwrap_or_else(|| {
-        // Sizes not computed yet — fall back to the count-based fraction.
-        aggregate_progress(app, counts)
     });
-    if !(0.02..1.0).contains(&fraction) {
-        return None;
-    }
-    let elapsed = app.active_elapsed()?.as_secs_f32();
-    if elapsed < 0.5 {
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn card(fill: Color32, stroke: Color32) -> egui::Frame {
+    egui::Frame::default()
+        .fill(fill)
+        .stroke(Stroke::new(1.0, stroke))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(egui::Margin::symmetric(10, 8))
+}
+
+fn cancelled_count(items: &[DeleteItem]) -> usize {
+    items
+        .iter()
+        .filter(|item| matches!(&item.state, ItemState::Failed(e) if e.contains(CANCELLED)))
+        .count()
+}
+
+/// Remaining-time estimate; None until progress is stable enough.
+fn estimate_eta_secs(fraction: Option<f32>, elapsed: f32) -> Option<f32> {
+    let fraction = fraction?;
+    if !(0.02..1.0).contains(&fraction) || elapsed < 0.5 {
         return None;
     }
     Some(elapsed * (1.0 - fraction) / fraction)
 }
 
-fn format_eta(secs: f32) -> String {
-    if secs < 60.0 {
-        format!("{}s", secs.ceil() as u64)
+fn format_duration(secs: f32) -> String {
+    if secs < 10.0 {
+        format!("{secs:.1}s")
+    } else if secs < 60.0 {
+        format!("{}s", secs.round() as u64)
     } else if secs < 3600.0 {
-        format!("{}m {}s", (secs / 60.0) as u64, (secs % 60.0) as u64)
+        format!("{}m {:02}s", (secs / 60.0) as u64, (secs % 60.0) as u64)
     } else {
         format!(
-            "{}h {}m",
+            "{}h {:02}m",
             (secs / 3600.0) as u64,
             ((secs % 3600.0) / 60.0) as u64
         )
     }
 }
 
-/// Selection-wide progress weighted by per-root byte sizes (computed by the
-/// background size pass). Completed items contribute their full size, the
-/// running item its internal fraction. Returns None until sizes are known
-/// or when the selection is all zero-sized.
-fn byte_weighted_progress(app: &ZapApp, _counts: &StatusCounts) -> Option<f32> {
-    let guard = app.item_sizes.lock().ok()?;
-    let sizes = guard.as_ref()?;
-    let total = sizes.total;
-    if total == 0 {
-        return None;
-    }
-    // The size thread pre-builds the map and total, so per frame this is a
-    // single O(items) pass with O(1) lookups — no per-frame index rebuild.
-    let mut done_bytes: f64 = 0.0;
-    for item in &app.items {
-        let size = sizes.by_path.get(&item.path).copied().unwrap_or(0) as f64;
-        match &item.state {
-            ItemState::Done | ItemState::Failed(_) => done_bytes += size,
-            ItemState::Running => {
-                done_bytes += size * item_progress_fraction(item) as f64;
-            }
-            ItemState::Pending => {}
+/// `12345` → `12,345`.
+fn format_count(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
         }
+        out.push(ch);
     }
-    Some((done_bytes / total as f64).clamp(0.0, 1.0) as f32)
+    out
 }
 
-fn aggregate_progress(app: &ZapApp, counts: &StatusCounts) -> f32 {
-    let total = app.items.len();
-    if total == 0 {
-        return 0.0;
-    }
-    // Prefer byte-weighted progress when the background size pass has
-    // finished: on mixed selections it reflects real remaining work far
-    // better than counting every item equally.
-    if let Some(fraction) = byte_weighted_progress(app, counts) {
-        return fraction;
-    }
-    // Bulk file-root runs report selection-wide progress: use it directly.
-    // Weighting it per running item would keep the bar near zero for the
-    // whole run and then jump to 100% at the end.
-    let bulk = app.items.iter().find(|item| {
-        matches!(item.state, ItemState::Running) && item.progress.as_ref().is_some_and(|p| p.bulk)
-    });
-    if let Some(item) = bulk {
-        return item_progress_fraction(item);
-    }
-    let mut completed = (counts.done + counts.failed) as f32;
-    for item in &app.items {
-        if matches!(item.state, ItemState::Running) {
-            completed += item_progress_fraction(item);
-        }
-    }
-    (completed / total as f32).clamp(0.0, 1.0)
-}
-
-fn item_progress_fraction(item: &DeleteItem) -> f32 {
-    let Some(progress) = &item.progress else {
-        return 0.0;
-    };
-    let Some(length) = progress.length else {
-        return 0.0;
-    };
-    if length == 0 {
-        return 0.0;
-    }
-    (progress.position as f32 / length as f32).clamp(0.0, 1.0)
-}
-
-fn active_progress_message(items: &[DeleteItem]) -> Option<&str> {
-    items.iter().find_map(|item| {
-        if !matches!(item.state, ItemState::Running) {
-            return None;
-        }
-        let msg = item.progress.as_ref()?.message.trim();
-        (!msg.is_empty()).then_some(msg)
-    })
-}
-
-fn first_failure(items: &[DeleteItem]) -> Option<&str> {
-    items.iter().find_map(|item| match &item.state {
-        ItemState::Failed(e) => Some(e.as_str()),
-        _ => None,
-    })
+fn display_name(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
 }
 
 fn compact_text(text: &str, max_len: usize) -> String {
     if text.chars().count() <= max_len {
         return text.to_owned();
     }
-    let prefix: String = text.chars().take(max_len.saturating_sub(3)).collect();
-    format!("{prefix}...")
+    let prefix: String = text.chars().take(max_len.saturating_sub(1)).collect();
+    format!("{prefix}…")
 }
 
 /// Dim the window and show a hint while files are dragged over it.
@@ -660,12 +1088,54 @@ fn paint_drop_overlay(ctx: &egui::Context) {
         egui::Id::new("drop_overlay"),
     ));
     let rect = ctx.screen_rect();
-    painter.rect_filled(rect, 0.0, egui::Color32::from_black_alpha(120));
+    painter.rect_filled(rect, 0.0, Color32::from_black_alpha(150));
     painter.text(
         rect.center(),
         egui::Align2::CENTER_CENTER,
         "Drop to add to the list",
         egui::FontId::proportional(16.0),
-        egui::Color32::WHITE,
+        Color32::WHITE,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_count_groups_thousands() {
+        assert_eq!(format_count(0), "0");
+        assert_eq!(format_count(999), "999");
+        assert_eq!(format_count(1_000), "1,000");
+        assert_eq!(format_count(1_234_567), "1,234,567");
+    }
+
+    #[test]
+    fn format_duration_picks_readable_units() {
+        assert_eq!(format_duration(1.25), "1.2s");
+        assert_eq!(format_duration(42.4), "42s");
+        assert_eq!(format_duration(125.0), "2m 05s");
+        assert_eq!(format_duration(3_720.0), "1h 02m");
+    }
+
+    #[test]
+    fn eta_needs_stable_progress() {
+        assert_eq!(estimate_eta_secs(None, 5.0), None);
+        assert_eq!(estimate_eta_secs(Some(0.01), 5.0), None);
+        assert_eq!(estimate_eta_secs(Some(0.5), 0.2), None);
+        assert_eq!(estimate_eta_secs(Some(0.5), 4.0), Some(4.0));
+    }
+
+    #[test]
+    fn subtitle_uses_shared_parent() {
+        let items: Vec<DeleteItem> = [r"C:\work\a", r"C:\work\b"]
+            .iter()
+            .map(|p| DeleteItem {
+                path: PathBuf::from(p),
+                state: ItemState::Pending,
+                progress: None,
+            })
+            .collect();
+        assert_eq!(subtitle(&items).as_deref(), Some(r"in C:\work"));
+    }
 }

@@ -15,6 +15,7 @@ static CONSOLE_ALLOCATED: AtomicBool = AtomicBool::new(false);
 
 fn main() {
     stop::install_handler();
+    zap::parallelism::init_global_pool();
     let start = Instant::now();
 
     let action = cli::parse_args(std::env::args_os().skip(1)).unwrap_or_else(|err| {
@@ -88,10 +89,8 @@ fn write_error_log(errors: &[(PathBuf, std::io::Error)]) -> Option<PathBuf> {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let log_path = std::env::temp_dir().join(format!(
-        "zap-errors-{}-{nonce}.log",
-        std::process::id()
-    ));
+    let log_path =
+        std::env::temp_dir().join(format!("zap-errors-{}-{nonce}.log", std::process::id()));
     let file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -350,7 +349,10 @@ fn run_delete(options: &cli::CliOptions, start: Instant) -> bool {
 
     if errors.is_empty() {
         if !options.silent {
-            println!("{}", format!("{elapsed:.3}s").color(elapsed_color(elapsed)));
+            println!(
+                "Done in {}",
+                format!("{elapsed:.2}s").color(elapsed_color(elapsed))
+            );
         }
         true
     } else {
@@ -439,12 +441,8 @@ fn run_bulk_file_roots(
         Some(bar)
     };
 
-    let summary = delete::delete_file_roots_bulk(
-        files,
-        options.shred,
-        allow_dangerous,
-        bar.as_ref(),
-    );
+    let summary =
+        delete::delete_file_roots_bulk(files, options.shred, allow_dangerous, bar.as_ref());
     if let Some(bar) = bar {
         if summary.errors.is_empty() {
             bar.finish_with_message(format!("Deleted {} files", summary.deleted));

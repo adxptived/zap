@@ -99,8 +99,10 @@ pub type TreemapData = Arc<Mutex<Option<TreemapSnapshot>>>;
 /// progress code does O(1) lookups instead of rebuilding an index and
 /// re-summing thousands of entries on every repaint.
 pub struct SizeSnapshot {
-    pub by_path: std::collections::HashMap<PathBuf, u64>,
+    pub by_path: std::collections::HashMap<PathBuf, size::TreeStats>,
     pub total: u64,
+    /// Total entries (files, links, directories) across the selection.
+    pub entries: u64,
 }
 
 pub type ItemSizes = Arc<Mutex<Option<SizeSnapshot>>>;
@@ -113,6 +115,9 @@ pub struct ZapApp {
     pub receiver: Option<Receiver<WorkerEvent>>,
     pub started_at: Option<Instant>,
     pub finished: Option<Duration>,
+    /// Wall-clock moment the last run ended; drives the short success
+    /// confirmation shown before the dialog closes itself.
+    pub finished_at: Option<Instant>,
     pub total_size_calculating: bool,
     pub total_size: Arc<Mutex<Option<u64>>>,
     /// Generation guard prevents an obsolete background traversal from
@@ -183,6 +188,7 @@ impl ZapApp {
             receiver: None,
             started_at: None,
             finished: None,
+            finished_at: None,
             total_size_calculating: true,
             total_size,
             size_generation,
@@ -316,6 +322,7 @@ impl ZapApp {
         self.receiver = Some(receiver);
         self.started_at = Some(Instant::now());
         self.finished = None;
+        self.finished_at = None;
         for item in &mut self.items {
             item.state = ItemState::Pending;
             item.progress = None;
@@ -324,13 +331,8 @@ impl ZapApp {
             let start = Instant::now();
             let mut outcomes: Vec<PathOutcome> = Vec::with_capacity(paths.len());
             if should_bulk_delete_file_roots(&paths, dry_run, recycle) {
-                outcomes = run_bulk_file_roots_gui(
-                    paths,
-                    threads,
-                    shred,
-                    allow_dangerous,
-                    sender.clone(),
-                );
+                outcomes =
+                    run_bulk_file_roots_gui(paths, threads, shred, allow_dangerous, sender.clone());
             } else {
                 for path in paths {
                     // Stop button: skip everything not yet started. The item
@@ -446,6 +448,7 @@ impl ZapApp {
                     }
                     stop::request_resume();
                     self.finished = Some(duration.saturating_sub(self.paused_total));
+                    self.finished_at = Some(Instant::now());
                     clear_receiver = true;
                 }
             }
@@ -460,6 +463,7 @@ impl ZapApp {
                 }
             }
             self.finished = Some(self.started_at.map(|s| s.elapsed()).unwrap_or_default());
+            self.finished_at = Some(Instant::now());
             clear_receiver = true;
         }
         if clear_receiver {
@@ -496,6 +500,34 @@ impl ZapApp {
         } else {
             taskbar.clear();
         }
+    }
+
+    /// Plain-text list of failed paths and their errors, for the clipboard.
+    pub fn failure_report(&self) -> String {
+        self.items
+            .iter()
+            .filter_map(|item| match &item.state {
+                ItemState::Failed(err) => Some(format!("{}\n  {}", item.path.display(), err)),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Remove one item from the selection before a run starts.
+    pub fn remove_item(&mut self, index: usize) {
+        if self.is_running() || index >= self.items.len() {
+            return;
+        }
+        self.items.remove(index);
+        self.finished = None;
+        self.finished_at = None;
+        self.started_at = None;
+        self.has_dangerous_paths = self
+            .items
+            .iter()
+            .any(|item| protect::is_dangerous_target(&item.path));
+        self.recalculate_total_size();
     }
 
     pub fn status_counts(&self) -> StatusCounts {
@@ -719,9 +751,8 @@ fn run_bulk_file_roots_gui(
         .num_threads(worker_count)
         .build()
     {
-        Ok(pool) => pool.install(|| {
-            delete::delete_file_roots_bulk(&paths, shred, allow_dangerous, Some(&bar))
-        }),
+        Ok(pool) => pool
+            .install(|| delete::delete_file_roots_bulk(&paths, shred, allow_dangerous, Some(&bar))),
         Err(err) => delete::BulkDeleteSummary {
             deleted: 0,
             errors: paths
@@ -795,16 +826,17 @@ fn spawn_size_calculation(
             Ok(pool) => pool,
             Err(_) => return,
         };
-        let per_root: std::collections::HashMap<PathBuf, u64> = pool.install(|| {
+        let per_root: std::collections::HashMap<PathBuf, size::TreeStats> = pool.install(|| {
             paths
                 .into_par_iter()
                 .map(|p| {
-                    let sz = size::dir_size_recursive(&p);
-                    (p, sz)
+                    let stats = size::tree_stats(&p);
+                    (p, stats)
                 })
                 .collect()
         });
-        let sum: u64 = per_root.values().sum();
+        let sum: u64 = per_root.values().map(|s| s.bytes).sum();
+        let entries: u64 = per_root.values().map(|s| s.entries).sum();
         if generation.load(Ordering::Acquire) != expected_generation {
             return;
         }
@@ -812,6 +844,7 @@ fn spawn_size_calculation(
             *guard = Some(SizeSnapshot {
                 by_path: per_root,
                 total: sum,
+                entries,
             });
         }
         if let Ok(mut guard) = total.lock() {
@@ -821,31 +854,19 @@ fn spawn_size_calculation(
 }
 
 /// Build treemap entries from the selected roots. For each directory root
-/// the *immediate children* are used (sizes already aggregated by
-/// `dir_size_tree`), so the rectangles partition the selection without
-/// double counting files inside their parent directories.
+/// the *immediate children* are used (sizes aggregated per subtree), so the
+/// rectangles partition the selection without double counting files inside
+/// their parent directories.
 fn collect_treemap_entries(roots: &[PathBuf]) -> Vec<(PathBuf, u64)> {
     let mut entries = Vec::new();
     for root in roots {
         match fs::symlink_metadata(root) {
-            Ok(meta) if meta.is_dir() => {
-                if let Ok(tree) = size::dir_size_tree(root) {
-                    let children: Vec<(PathBuf, u64)> = tree
-                        .iter()
-                        .filter(|(p, _)| p.parent() == Some(root.as_path()))
-                        .cloned()
-                        .collect();
-                    if children.is_empty() {
-                        // Empty dir or unreadable children — show the root itself.
-                        if let Some(total) = tree.iter().find(|(p, _)| p == root).map(|(_, sz)| *sz)
-                        {
-                            entries.push((root.clone(), total));
-                        }
-                    } else {
-                        entries.extend(children);
-                    }
-                }
-            }
+            Ok(meta) if meta.is_dir() => match size::child_sizes(root) {
+                // Empty dir — show the root itself.
+                Ok(children) if children.is_empty() => entries.push((root.clone(), 0)),
+                Ok(children) => entries.extend(children),
+                Err(_) => {}
+            },
             Ok(meta) => entries.push((root.clone(), meta.len())),
             Err(_) => {}
         }

@@ -25,6 +25,16 @@ pub fn worker_count(requested: Option<usize>) -> usize {
         .clamp(1, MAX_WORKERS)
 }
 
+/// Size Rayon's global pool to the default worker budget. Deletion is bound
+/// by per-entry kernel cost: past ~8 workers wall time stays flat while the
+/// extra threads only take CPU away from everything else on the machine.
+/// Call once at startup; later calls (or a pool already in use) are no-ops.
+pub fn init_global_pool() {
+    let _ = rayon::ThreadPoolBuilder::new()
+        .num_threads(worker_count(None))
+        .build_global();
+}
+
 /// A scan runs concurrently with deletion, so it receives only a portion of
 /// the shared budget. Four workers are enough to overlap directory reads on
 /// most disks without letting jwalk create an unbounded second pool.
@@ -44,7 +54,10 @@ pub fn delete_worker_count(total_workers: usize) -> usize {
 /// Number of in-flight entries retained by the streaming delete pipeline.
 #[inline]
 pub fn queue_capacity(workers: usize) -> usize {
-    workers.clamp(1, MAX_WORKERS).saturating_mul(256).clamp(512, 8192)
+    workers
+        .clamp(1, MAX_WORKERS)
+        .saturating_mul(256)
+        .clamp(512, 8192)
 }
 
 #[cfg(test)]

@@ -23,13 +23,15 @@ use app::{BatchReceiver, BatchSession, ZapApp};
 
 pub const APP_NAME: &str = "Zap";
 pub const MAX_THREADS: usize = zap::parallelism::MAX_WORKERS;
-pub const WINDOW_WIDTH: f32 = 420.0;
-pub const WINDOW_HEIGHT_NORMAL: f32 = 260.0;
-pub const WINDOW_HEIGHT_DANGEROUS: f32 = 304.0;
-pub const WINDOW_HEIGHT_TREEMAP: f32 = 520.0;
+pub const WINDOW_WIDTH: f32 = 460.0;
+/// Initial height; the UI then fits the window to its content.
+pub const WINDOW_HEIGHT_NORMAL: f32 = 280.0;
+pub const WINDOW_HEIGHT_MIN: f32 = 160.0;
+pub const WINDOW_HEIGHT_MAX: f32 = 760.0;
 
 fn main() -> eframe::Result<()> {
     let args = parse_args();
+    zap::parallelism::init_global_pool();
 
     // In batch mode: non-coordinators must exit silently without opening
     // a window. Only the process that wins the lock shows the GUI. The
@@ -51,8 +53,8 @@ fn main() -> eframe::Result<()> {
     let mut viewport = egui::ViewportBuilder::default()
         .with_title(APP_NAME)
         .with_inner_size([WINDOW_WIDTH, WINDOW_HEIGHT_NORMAL])
-        .with_min_inner_size([WINDOW_WIDTH, WINDOW_HEIGHT_NORMAL])
-        .with_max_inner_size([WINDOW_WIDTH, WINDOW_HEIGHT_TREEMAP])
+        .with_min_inner_size([WINDOW_WIDTH, WINDOW_HEIGHT_MIN])
+        .with_max_inner_size([WINDOW_WIDTH, WINDOW_HEIGHT_MAX])
         .with_resizable(false)
         .with_maximize_button(false);
 

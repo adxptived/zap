@@ -21,7 +21,7 @@ then pick the safe GUI confirmation flow or the silent immediate-delete action.
 - **Explorer-first GUI** — `Zap -> Delete...` opens a compact confirmation dialog.
 - **Windowless delete** — `Zap -> Zap Delete` deletes the selection without a GUI or terminal window.
 - **Multi-select support** — Explorer selections are batched into one coordinated operation.
-- **Fast deletion engine** — `jwalk` scans directories in parallel and `rayon` removes files concurrently.
+- **Fast deletion engine** — on Windows each worker lists a folder with `FindFirstFileExW`, deletes its files right away and recurses into subfolders in parallel (`rayon`); folders are removed as soon as they are empty.
 - **Safety guards** — filesystem roots are refused, protected paths are blocked, and symlinks/junctions are never traversed.
 - **Read-only recovery** — read-only attributes are cleared and deletion is retried when possible.
 - **Filter support** — glob pattern filtering, size filtering, and date-based filtering.

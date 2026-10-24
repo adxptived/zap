@@ -13,17 +13,18 @@ Source code is organized under `src/`:
 - `main.rs` — Entry point of the `zap` binary: arg parsing dispatch, timing, error summary, batch coordination (`run_batch`).
 - `cli.rs` — CLI argument parser (`parse_args`), help/version output, `CliOptions` / `CliAction` types.
 - `delete.rs` — Core deletion logic: parallel file/dir removal via Rayon, retry on `PermissionDenied` (files, dirs, and symlinks), dry-run, symlink handling, shred, only-empty, recycle dispatch.
-- `scan.rs` — Directory walking with `jwalk::WalkDir` and entry classification (`EntryKind`: `File`, `Dir { depth }`, `Symlink`). Caches metadata in `ScannedEntry`.
+- `scan.rs` — Directory walking with `jwalk::WalkDir` and entry classification (`EntryKind`: `File`, `Dir { depth }`, `Symlink`). Caches metadata in `ScannedEntry`. Used by filtered runs, dry-run and the non-Windows pipeline.
+- `tree_delete.rs` — Windows fast path for unfiltered directory deletion: each Rayon task lists one directory (`FindFirstFileExW`), deletes its files, recurses into subdirectories in parallel and removes the directory once empty. Reparse points are unlinked, never traversed; a failure is reported once (no cascade to ancestors).
 - `protect.rs` — Protected-path checks (`is_protected_path`), path sanitization (`sanitize_path`), filesystem-root detection.
 - `filter.rs` — Glob pattern filtering (`--include`/`--exclude`), min-size, newer-than/older-than metadata filtering.
 - `recycle.rs` — Windows Recycle Bin integration via `SHFileOperationW`.
 - `shred.rs` — Secure file deletion: overwrite with random data then remove.
-- `size.rs` — Directory size calculation (`dir_size_recursive` via jwalk, `dir_size_tree` for treemap).
+- `size.rs` — Size/entry counting (`tree_stats`, `dir_size_recursive`, `child_sizes` for the treemap). On Windows sizes come from directory listings: no per-file open, which costs about as much kernel time as deleting the file.
 - `stop.rs` — Global Ctrl+C signal handler (`install_handler`, `is_stop_requested`).
 - `path_utils.rs` — Path formatting helpers (`progress_name`, `compact_path`, `dedup_paths`).
 - `batch.rs` — Shared batch-coordination infrastructure for multi-process Explorer integration.
 - `treemap.rs` — Squarified treemap layout for GUI visualization.
-- `winapi.rs` — Windows API helpers (reparse point detection, force delete).
+- `winapi.rs` — Windows API helpers (directory enumeration, reparse point detection, POSIX force delete, long-path `\\?\` prefixing).
 - `bin/zapw.rs` — Entry point of the `zapw` (windowless) binary. Silent deletion without console window.
 - `bin/zapg.rs` — Entry point of the `zapg` (GUI dialog) binary. Provides an egui confirmation dialog for the **Delete...** context menu item.
 
@@ -154,7 +155,7 @@ The tool is destructive by default. Several guards are in place:
   Program Files, Users root, well-known profile subdirs, System Volume Information,
   Recovery). Non-Windows platforms return `false` (no protection).
 - **Filesystem root refused** — paths with no parent (e.g. `C:\`) are rejected.
-- **Symlink/junction safety** — `follow_links(false)` in jwalk; symlinks and
+- **Symlink/junction safety** — `follow_links(false)` in jwalk and the reparse-point attribute check in `tree_delete`; symlinks and
   Windows reparse points are classified as `EntryKind::Symlink` and removed as
   links only, never traversed.
 - **Permission recovery** — `remove_file_with_retry` / `remove_dir_with_retry`

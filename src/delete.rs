@@ -44,6 +44,15 @@ pub fn set_test_remove_file_failure(path: Option<PathBuf>) {
     *TEST_REMOVE_FILE_FAILURE.lock().unwrap() = path;
 }
 
+#[cfg(test)]
+pub(crate) fn is_injected_failure(path: &Path) -> bool {
+    TEST_REMOVE_FILE_FAILURE
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|p| p == path)
+}
+
 #[derive(Debug)]
 struct DeletionFailure {
     path: std::path::PathBuf,
@@ -134,11 +143,17 @@ fn retry_after_clearing_readonly(
     // milliseconds — retry briefly before the expensive force-delete fallback.
     for delay_ms in [10u64, 50] {
         if crate::stop::is_stop_requested() {
-            return Err(io::Error::new(io::ErrorKind::Interrupted, "deletion cancelled"));
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "deletion cancelled",
+            ));
         }
         std::thread::park_timeout(std::time::Duration::from_millis(delay_ms));
         if crate::stop::is_stop_requested() {
-            return Err(io::Error::new(io::ErrorKind::Interrupted, "deletion cancelled"));
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "deletion cancelled",
+            ));
         }
         if op(path).is_ok() {
             return Ok(());
@@ -149,12 +164,7 @@ fn retry_after_clearing_readonly(
 
 pub fn remove_file_with_retry(path: &Path) -> io::Result<()> {
     #[cfg(test)]
-    if TEST_REMOVE_FILE_FAILURE
-        .lock()
-        .unwrap()
-        .as_ref()
-        .is_some_and(|p| p == path)
-    {
+    if is_injected_failure(path) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "injected remove_file failure",
@@ -322,9 +332,66 @@ fn finalize(
 }
 
 // ---------------------------------------------------------------------------
-// Pipeline delete (no filter active)
+// Windows fast tree delete (no filter active)
 // ---------------------------------------------------------------------------
 
+#[cfg(windows)]
+struct CountingSink<'a> {
+    errors: &'a AtomicU64,
+    failures: &'a Mutex<Vec<DeletionFailure>>,
+}
+
+#[cfg(windows)]
+impl crate::tree_delete::FailureSink for CountingSink<'_> {
+    fn record(&self, path: &Path, err: &io::Error) {
+        self.errors.fetch_add(1, Ordering::Relaxed);
+        push_failure(self.failures, path, err);
+    }
+}
+
+/// Recursive parallel delete: see `tree_delete` for the design. The bar
+/// position counts removed entries; callers that know the tree size (the
+/// GUI's background size pass) turn it into a real percentage.
+#[cfg(windows)]
+fn delete_directory_fast(path: &Path, bar: Option<ProgressBar>, shred: bool) -> io::Result<()> {
+    // Absolute paths let the Win32 layer add the `\\?\` long-path prefix.
+    let root = std::path::absolute(path)?;
+    if let Some(ref b) = bar {
+        b.set_style(
+            ProgressStyle::default_spinner()
+                .template("{prefix} {spinner} {msg} {pos} entries ({per_sec})")
+                .unwrap(),
+        );
+        b.set_message("Deleting");
+        b.enable_steady_tick(std::time::Duration::from_millis(120));
+    }
+
+    let errors = AtomicU64::new(0);
+    let failures = Mutex::new(Vec::<DeletionFailure>::new());
+    let sink = CountingSink {
+        errors: &errors,
+        failures: &failures,
+    };
+    let progress_bar = bar.clone();
+    let on_progress = move |removed: u64| {
+        if let Some(ref b) = progress_bar {
+            b.set_position(removed);
+        }
+    };
+    let deleter = crate::tree_delete::TreeDeleter::new(shred, &sink, Some(&on_progress));
+    deleter.clear(&root);
+    if let Some(ref b) = bar {
+        b.set_position(deleter.removed.load(Ordering::Relaxed));
+    }
+
+    finalize(path, errors.load(Ordering::Relaxed), &failures, bar)
+}
+
+// ---------------------------------------------------------------------------
+// Pipeline delete (no filter active, non-Windows)
+// ---------------------------------------------------------------------------
+
+#[cfg_attr(windows, allow(dead_code))]
 fn delete_directory_pipeline(path: &Path, bar: Option<ProgressBar>, shred: bool) -> io::Result<()> {
     // Both queues derive from the common worker budget. This keeps memory
     // bounded even when a machine exposes hundreds of logical CPUs.
@@ -336,8 +403,7 @@ fn delete_directory_pipeline(path: &Path, bar: Option<ProgressBar>, shred: bool)
     // queue could retain the whole tree when scanning outran a slow disk or
     // locked-file retries, defeating the bounded scan channel above.
     let ready_batches = workers.saturating_mul(2).clamp(4, 32);
-    let (batch_tx, batch_rx) =
-        crossbeam_channel::bounded::<Vec<ScannedEntry>>(ready_batches);
+    let (batch_tx, batch_rx) = crossbeam_channel::bounded::<Vec<ScannedEntry>>(ready_batches);
 
     // ── thread A: jwalk scan ──────────────────────────────────────────────
     let scan_path = path.to_path_buf();
@@ -528,6 +594,9 @@ fn delete_directory_pool_inner(
     }
 
     if filter.is_empty() {
+        #[cfg(windows)]
+        return delete_directory_fast(path, bar, shred);
+        #[cfg(not(windows))]
         delete_directory_pipeline(path, bar, shred)
     } else {
         delete_directory_filtered(path, bar, filter, shred)
@@ -543,10 +612,16 @@ fn delete_directory_inner(
     shred: bool,
 ) -> io::Result<()> {
     if let Some(count) = threads {
+        let total = crate::parallelism::worker_count(Some(count));
+        // The Windows tree delete scans inside the pool itself; only the
+        // portable pipeline runs a separate scanner that needs a share.
+        let workers = if cfg!(windows) && filter.is_empty() {
+            total
+        } else {
+            crate::parallelism::delete_worker_count(total)
+        };
         let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(crate::parallelism::delete_worker_count(
-                crate::parallelism::worker_count(Some(count)),
-            ))
+            .num_threads(workers)
             .build()
             .map_err(|err| io::Error::other(err.to_string()))?;
         return pool
@@ -908,6 +983,8 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+    /// Serializes tests that use the process-global failure injection.
+    static INJECT_SERIAL: Mutex<()> = Mutex::new(());
 
     fn create_test_dir() -> PathBuf {
         let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -1005,6 +1082,7 @@ mod tests {
         let blocked = temp.join("blocked.txt");
         File::create(&ok).unwrap();
         File::create(&blocked).unwrap();
+        let _inject = INJECT_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
         set_test_remove_file_failure(Some(blocked.clone()));
 
         let summary = delete_file_roots_bulk(&[ok.clone(), blocked.clone()], false, false, None);
@@ -1025,12 +1103,7 @@ mod tests {
         fs::create_dir(&directory).unwrap();
         File::create(directory.join("must-survive.txt")).unwrap();
 
-        let summary = delete_file_roots_bulk(
-            std::slice::from_ref(&directory),
-            false,
-            false,
-            None,
-        );
+        let summary = delete_file_roots_bulk(std::slice::from_ref(&directory), false, false, None);
 
         assert_eq!(summary.deleted, 0);
         assert_eq!(summary.errors.len(), 1);
@@ -1187,12 +1260,97 @@ mod tests {
     }
 
     #[test]
+    fn test_delete_directory_handles_very_deep_tree() {
+        // Deeper than tree_delete's parallel depth limit: exercises the
+        // iterative fallback, and with 8-char names exceeds MAX_PATH.
+        let temp = create_test_dir();
+        let mut current = temp.clone();
+        for i in 0..120 {
+            current = current.join(format!("lvl{i:05}"));
+        }
+        fs::create_dir_all(&current).unwrap();
+        fs::write(current.join("leaf.txt"), b"x").unwrap();
+        assert!(current.as_os_str().len() > 260);
+        delete_directory(&temp, None).unwrap();
+        assert!(!temp.exists());
+    }
+
+    #[test]
+    fn test_delete_directory_large_flat_dir_and_readonly_subdirs() {
+        let temp = create_test_dir();
+        let flat = temp.join("flat");
+        fs::create_dir(&flat).unwrap();
+        for i in 0..1000 {
+            fs::write(flat.join(format!("f{i}.bin")), b"x").unwrap();
+        }
+        let ro_dir = temp.join("ro-dir");
+        fs::create_dir(&ro_dir).unwrap();
+        let ro_file = ro_dir.join("ro.txt");
+        fs::write(&ro_file, b"x").unwrap();
+        for p in [&ro_file, &ro_dir] {
+            let mut perms = fs::metadata(p).unwrap().permissions();
+            perms.set_readonly(true);
+            fs::set_permissions(p, perms).unwrap();
+        }
+        delete_directory(&temp, Some(4)).unwrap();
+        assert!(!temp.exists());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_delete_directory_does_not_follow_nested_junction() {
+        let temp = create_test_dir();
+        let delete_root = temp.join("delete-root");
+        let nested = delete_root.join("a").join("b");
+        let external_target = temp.join("external-target");
+        fs::create_dir_all(&nested).unwrap();
+        fs::create_dir(&external_target).unwrap();
+        File::create(external_target.join("keep.txt")).unwrap();
+        let junction = nested.join("junction");
+        let status = std::process::Command::new("cmd")
+            .args([
+                "/c",
+                "mklink",
+                "/J",
+                junction.to_str().unwrap(),
+                external_target.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(status.status.success());
+        delete_directory(&delete_root, None).unwrap();
+        assert!(!delete_root.exists());
+        assert!(external_target.join("keep.txt").exists());
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_delete_directory_failure_does_not_cascade_to_parents() {
+        // One locked file deep in the tree must yield exactly one reported
+        // failure, not one per ancestor directory.
+        let temp = create_test_dir();
+        let deep = temp.join("x").join("y");
+        fs::create_dir_all(&deep).unwrap();
+        let blocked = deep.join("locked.bin");
+        File::create(&blocked).unwrap();
+        let _inject = INJECT_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        set_test_remove_file_failure(Some(blocked.clone()));
+        let result = delete_directory(&temp, None);
+        set_test_remove_file_failure(None);
+        let err = result.unwrap_err().to_string();
+        assert!(err.starts_with("1 entries could not be deleted"), "{err}");
+        assert!(blocked.exists());
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
     fn test_delete_directory_reports_failed_entries_and_keeps_root() {
         let temp = create_test_dir();
         let file = temp.join("blocked.txt");
         let empty = temp.join("empty");
         File::create(&file).unwrap();
         fs::create_dir(&empty).unwrap();
+        let _inject = INJECT_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
         set_test_remove_file_failure(Some(file.clone()));
         let result = delete_directory(&temp, None);
         set_test_remove_file_failure(None);

@@ -367,6 +367,7 @@ mod tests {
         let lock_path = dir.join("lock");
         let mut lock = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&lock_path)

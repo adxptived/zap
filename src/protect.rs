@@ -88,8 +88,7 @@ pub fn is_dangerous_target(path: &Path) -> bool {
     if metadata.file_type().is_symlink() {
         return false;
     }
-    sanitize_path(path)
-        .is_ok_and(|canonical| is_protected_path(&canonical))
+    sanitize_path(path).is_ok_and(|canonical| is_protected_path(&canonical))
 }
 
 #[cfg(windows)]
