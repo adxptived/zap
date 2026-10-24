@@ -279,6 +279,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)] // Windows paths: `C:\work` is a single file name on Unix
     fn subtitle_uses_shared_parent() {
         let items: Vec<DeleteItem> = [r"C:\work\a", r"C:\work\b"]
             .iter()
